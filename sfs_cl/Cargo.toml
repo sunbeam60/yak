@@ -1,0 +1,12 @@
+[package]
+name = "sfs_cl"
+version = "0.1.0"
+edition = "2021"
+description = "Command line tool for the Stream File System"
+
+[[bin]]
+name = "sfs"
+path = "src/main.rs"
+
+[dependencies]
+stream_fs = { path = "../stream_fs" }

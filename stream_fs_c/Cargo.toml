@@ -1,0 +1,11 @@
+[package]
+name = "stream_fs_c"
+version = "0.1.0"
+edition = "2021"
+description = "C ABI wrapper for the Stream File System library"
+
+[lib]
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+stream_fs = { path = "../stream_fs" }

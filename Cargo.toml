@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "stream_fs",
+    "stream_fs_c",
+    "sfs_cl",
+]
+resolver = "2"

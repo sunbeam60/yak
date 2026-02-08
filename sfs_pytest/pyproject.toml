@@ -1,0 +1,11 @@
+[project]
+name = "sfs_pytest"
+version = "0.1.0"
+description = "Test harness for the Stream File System C ABI"
+requires-python = ">=3.10"
+dependencies = [
+    "pytest",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,139 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug CLI: sfs_cl --help",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/target/debug/sfs.exe",
+            "args": ["--help"],
+            "cwd": "${workspaceFolder}",
+            "preLaunchTask": "cargo-build-cli",
+            "sourceFileMap": {
+                "/rustc/*": "${env:USERPROFILE}/.rustup/toolchains/*/lib/rustlib/src/rust"
+            }
+        },
+        {
+            "name": "Debug CLI: create test.sfs",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/target/debug/sfs.exe",
+            "args": ["create", "test.sfs"],
+            "cwd": "${workspaceFolder}/temp",
+            "preLaunchTask": "cargo-build-cli",
+            "sourceFileMap": {
+                "/rustc/*": "${env:USERPROFILE}/.rustup/toolchains/*/lib/rustlib/src/rust"
+            }
+        },
+        {
+            "name": "Debug CLI: ls test.sfs",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/target/debug/sfs.exe",
+            "args": ["ls", "test.sfs"],
+            "cwd": "${workspaceFolder}/temp",
+            "preLaunchTask": "cargo-build-cli",
+            "sourceFileMap": {
+                "/rustc/*": "${env:USERPROFILE}/.rustup/toolchains/*/lib/rustlib/src/rust"
+            }
+        },
+        {
+            "name": "Debug CLI: custom args",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/target/debug/sfs.exe",
+            "args": [], // Add your custom arguments here
+            "cwd": "${workspaceFolder}",
+            "preLaunchTask": "cargo-build-cli",
+            "sourceFileMap": {
+                "/rustc/*": "${env:USERPROFILE}/.rustup/toolchains/*/lib/rustlib/src/rust"
+            }
+        },
+        {
+            "name": "Debug: Rust Tests (stream_fs)",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/target/debug/deps/stream_fs-*.exe",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "preLaunchTask": "cargo-test-build",
+            "sourceFileMap": {
+                "/rustc/*": "${env:USERPROFILE}/.rustup/toolchains/*/lib/rustlib/src/rust"
+            }
+        },
+        {
+            "name": "Python: Current Test File",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "pytest",
+            "args": [
+                "${file}",
+                "-v"
+            ],
+            "cwd": "${workspaceFolder}/sfs_pytest",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/sfs_pytest"
+            }
+        },
+        {
+            "name": "Python: All Tests",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "pytest",
+            "args": [
+                "tests/",
+                "-v"
+            ],
+            "cwd": "${workspaceFolder}/sfs_pytest",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/sfs_pytest"
+            }
+        },
+        {
+            "name": "Python: Locking Tests",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "pytest",
+            "args": [
+                "tests/test_locking.py",
+                "-v"
+            ],
+            "cwd": "${workspaceFolder}/sfs_pytest",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/sfs_pytest"
+            }
+        },
+        {
+            "name": "Python: Edge Cases Tests",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "pytest",
+            "args": [
+                "tests/test_edge_cases.py",
+                "-v"
+            ],
+            "cwd": "${workspaceFolder}/sfs_pytest",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/sfs_pytest"
+            }
+        },
+        {
+            "name": "Run Release: custom args",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/target/release/sfs.exe",
+            "args": [], // Add your custom arguments here
+            "cwd": "${workspaceFolder}/temp",
+            "preLaunchTask": "cargo-build-cli-release",
+            "console": "integratedTerminal"
+        }
+    ]
+}

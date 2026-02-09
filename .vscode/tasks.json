@@ -1,0 +1,218 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "cargo-build-cli",
+            "type": "shell",
+            "command": "cargo",
+            "args": [
+                "build",
+                "--package",
+                "sfs_cl"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "env": {
+                    "PATH": "${env:PATH};C:/Users/bjorn/.cargo/bin"
+                }
+            },
+            "problemMatcher": [
+                "$rustc"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared"
+            }
+        },
+        {
+            "label": "cargo-build-all",
+            "type": "shell",
+            "command": "cargo",
+            "args": [
+                "build",
+                "--workspace"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "env": {
+                    "PATH": "${env:PATH};C:/Users/bjorn/.cargo/bin"
+                }
+            },
+            "problemMatcher": [
+                "$rustc"
+            ],
+            "group": "build",
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared"
+            }
+        },
+        {
+            "label": "cargo-test-build",
+            "type": "shell",
+            "command": "cargo",
+            "args": [
+                "test",
+                "--no-run",
+                "--package",
+                "stream_fs"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "env": {
+                    "PATH": "${env:PATH};C:/Users/bjorn/.cargo/bin"
+                }
+            },
+            "problemMatcher": [
+                "$rustc"
+            ],
+            "group": "build",
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared"
+            }
+        },
+        {
+            "label": "cargo-clean",
+            "type": "shell",
+            "command": "cargo",
+            "args": [
+                "clean"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "env": {
+                    "PATH": "${env:PATH};C:/Users/bjorn/.cargo/bin"
+                }
+            },
+            "problemMatcher": [],
+            "group": "build",
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared"
+            }
+        },
+        {
+            "label": "run-pytest-all",
+            "type": "shell",
+            "command": "C:/Python311/python.exe",
+            "args": [
+                "-m",
+                "pytest",
+                "tests/",
+                "-v"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}/sfs_pytest"
+            },
+            "problemMatcher": [],
+            "group": "test",
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared"
+            }
+        },
+        {
+            "label": "rebuild-and-test",
+            "dependsOn": [
+                "cargo-build-all",
+                "run-pytest-all"
+            ],
+            "dependsOrder": "sequence",
+            "problemMatcher": [],
+            "group": "test",
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared"
+            }
+        },
+        {
+            "label": "cargo-build-cli-release",
+            "type": "shell",
+            "command": "cargo",
+            "args": [
+                "build",
+                "--release",
+                "--package",
+                "sfs_cl"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "env": {
+                    "PATH": "${env:PATH};C:/Users/bjorn/.cargo/bin"
+                }
+            },
+            "problemMatcher": [
+                "$rustc"
+            ],
+            "group": "build",
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared"
+            }
+        },
+        {
+            "label": "cargo-build-all-release",
+            "type": "shell",
+            "command": "cargo",
+            "args": [
+                "build",
+                "--release",
+                "--workspace"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "env": {
+                    "PATH": "${env:PATH};C:/Users/bjorn/.cargo/bin"
+                }
+            },
+            "problemMatcher": [
+                "$rustc"
+            ],
+            "group": "build",
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared"
+            }
+        },
+        {
+            "label": "copy-release-binaries",
+            "type": "shell",
+            "command": "powershell",
+            "args": [
+                "-Command",
+                "New-Item -ItemType Directory -Force -Path '${env:USERPROFILE}/bin'; Copy-Item '${workspaceFolder}/target/release/sfs.exe' '${env:USERPROFILE}/bin/sfs.exe' -Force; Copy-Item '${workspaceFolder}/target/release/stream_fs_c.dll' '${env:USERPROFILE}/bin/stream_fs_c.dll' -Force; Write-Host 'Release binaries copied to ~/bin/'"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "dependsOn": [
+                "cargo-build-all-release"
+            ],
+            "problemMatcher": [],
+            "group": "build",
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared"
+            }
+        },
+        {
+            "label": "test-release-build",
+            "dependsOn": [
+                "cargo-build-all-release",
+                "run-pytest-all"
+            ],
+            "dependsOrder": "sequence",
+            "problemMatcher": [],
+            "group": "test",
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared"
+            }
+        }
+    ]
+}

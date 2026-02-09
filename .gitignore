@@ -8,6 +8,12 @@ __pycache__/
 .pytest_cache/
 
 # IDE
-.vscode/
 .idea/
 *.swp
+
+# Local VSCode settings (keep shared configs in repo)
+.vscode/settings.local.json
+
+# Temp/test directories
+/temp/
+*.sfs/

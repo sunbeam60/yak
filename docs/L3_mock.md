@@ -27,6 +27,7 @@ When a caller creates an SFS file at path `foo.sfs`, L3 mock creates a directory
 
 ```
 foo.sfs/
+  meta            ← metadata file (block_index_width, block_size_shift, next_stream_id)
   0.stream        ← root directory stream (created automatically)
   1.stream        ← e.g. data stream for "image.png"
   2.stream        ← e.g. directory stream for "textures/"
@@ -41,53 +42,63 @@ This is inspectable with a regular file manager, though less intuitive than L4 m
 
 The L3 trait defines the contract that L4 uses. Based on the architecture doc (L3 API section).
 
-The trait is generic over two parameters that are forwarded from L2's concerns but must be visible at the L3 level:
-
-- **`BlockIndex`**: The type used for block indices (e.g. `u16`, `u32`, `u64`). This determines how many blocks an SFS file can address. In `StreamsFromFiles` this is academic (no actual blocks), but the parameter must be present for when `StreamsFromBlocks` is implemented later.
-- **`BLOCK_SIZE_SHIFT`**: A `u8` constant where the actual block size is `2^BLOCK_SIZE_SHIFT` bytes. For example, `12` means 4096-byte blocks (`2^12 = 4096`). Again academic for `StreamsFromFiles`, but required for the trait contract.
+`block_index_width` and `block_size_shift` are **runtime values** passed at creation time and stored in the meta file. They are read back at open time. Internally, all stream IDs use `u64`; on-disk serialization (in L4 directory entries) uses only `block_index_width` bytes.
 
 ```rust
-pub trait StreamLayer<BlockIndex, const BLOCK_SIZE_SHIFT: u8> {
-    type Handle;
+pub trait StreamLayer: Send + Sync {
+    /// Handle type for open streams. Must be Copy so L4 can extract handles
+    /// from its internal maps without borrow conflicts.
+    type Handle: Copy;
 
-    /// Initialise L3 for a new SFS file at the given path.
-    /// Creates the underlying storage (in StreamsFromFiles: a directory).
-    /// Returns the L3 instance ready for use.
-    fn create(path: &str) -> Result<Self, SfsError> where Self: Sized;
+    /// Create a new L3 storage at the given path.
+    /// `block_index_width` is the number of bytes used for block indices on
+    /// disk (e.g. 2, 4, or 8).
+    /// `block_size_shift` is the power-of-2 exponent for block size
+    /// (e.g. 12 → 4096 bytes).
+    fn create(path: &str, block_index_width: u8, block_size_shift: u8) -> Result<Self, SfsError>
+    where Self: Sized;
 
-    /// Open an existing SFS file's L3 layer.
-    fn open(path: &str) -> Result<Self, SfsError> where Self: Sized;
+    /// Open an existing L3 storage at the given path.
+    /// Reads `block_index_width` and `block_size_shift` from the stored metadata.
+    fn open(path: &str) -> Result<Self, SfsError>
+    where Self: Sized;
 
-    /// Create a new stream. Returns the stream identifier (a number).
-    fn create_stream(&mut self) -> Result<u32, SfsError>;
+    /// The number of bytes used for block indices on disk.
+    fn block_index_width(&self) -> u8;
+
+    /// Block size as a power of 2 (e.g. 12 → 4096 bytes).
+    fn block_size_shift(&self) -> u8;
+
+    /// Create a new stream. Returns the stream identifier.
+    fn create_stream(&self) -> Result<u64, SfsError>;
 
     /// Check whether a stream with the given identifier exists.
-    fn stream_exists(&self, id: u32) -> bool;
+    fn stream_exists(&self, id: u64) -> bool;
 
-    /// Open an existing stream by identifier, in the given mode.
-    /// Returns a handle for subsequent read/write operations.
-    fn open_stream(&mut self, id: u32, mode: OpenMode) -> Result<Self::Handle, SfsError>;
+    /// Open an existing stream by identifier.
+    /// Enforces locking: one writer OR many readers per stream.
+    fn open_stream(&self, id: u64, mode: OpenMode) -> Result<Self::Handle, SfsError>;
 
     /// Close a stream handle.
-    fn close_stream(&mut self, handle: Self::Handle) -> Result<(), SfsError>;
+    fn close_stream(&self, handle: Self::Handle) -> Result<(), SfsError>;
 
-    /// Delete a stream by identifier. Must not be currently open.
-    fn delete_stream(&mut self, id: u32) -> Result<(), SfsError>;
+    /// Delete a stream by identifier. Fails if the stream is currently open.
+    fn delete_stream(&self, id: u64) -> Result<(), SfsError>;
 
-    /// Read from a stream at the given position into buf.
+    /// Read from a stream at the given position.
     /// Returns the number of bytes actually read.
-    fn read(&mut self, handle: &Self::Handle, pos: u64, buf: &mut [u8]) -> Result<usize, SfsError>;
+    fn read(&self, handle: &Self::Handle, pos: u64, buf: &mut [u8]) -> Result<usize, SfsError>;
 
     /// Write to a stream at the given position.
     /// Extends the stream if writing past the end.
     /// Returns the number of bytes written.
-    fn write(&mut self, handle: &Self::Handle, pos: u64, buf: &[u8]) -> Result<usize, SfsError>;
+    fn write(&self, handle: &Self::Handle, pos: u64, buf: &[u8]) -> Result<usize, SfsError>;
 
-    /// Get the total length of a stream in bytes, by handle.
+    /// Get the total length of a stream in bytes.
     fn stream_length(&self, handle: &Self::Handle) -> Result<u64, SfsError>;
 
     /// Truncate a stream to the given length.
-    fn truncate(&mut self, handle: &Self::Handle, new_len: u64) -> Result<(), SfsError>;
+    fn truncate(&self, handle: &Self::Handle, new_len: u64) -> Result<(), SfsError>;
 }
 ```
 
@@ -95,12 +106,12 @@ pub trait StreamLayer<BlockIndex, const BLOCK_SIZE_SHIFT: u8> {
 
 | Decision | Choice | Rationale |
 |---|---|---|
-| Handle type | Associated type `Self::Handle` | Allows each L3 impl to use its own handle type. `StreamsFromFiles` can use a simple struct; `StreamsFromBlocks` will differ. |
+| Handle type | Associated type `Self::Handle: Copy` | Allows each L3 impl to use its own handle type. `Copy` bound avoids borrow conflicts when L4 copies handles out of its internal maps. |
 | Position in read/write | Caller passes `pos` explicitly | Architecture says L3 handles don't track head position -- that's L4's job. So read/write take a position parameter. |
-| Block index type | Generic parameter `BlockIndex` | Don't hardcode `u32`. Different implementations may use `u16`, `u32`, or `u64`. Academic for `StreamsFromFiles` but needed for the trait contract. |
-| Block size | Const generic `BLOCK_SIZE_SHIFT: u8` | Block size = `2^BLOCK_SIZE_SHIFT`. E.g. 12 → 4096 bytes. Academic for `StreamsFromFiles` but needed for the trait contract. |
-| Stream IDs | `u32` | Plenty of streams for any practical use. Could be made generic later if needed. |
-| Locking | Enforced inside L3 | One writer OR many readers per stream. L3 tracks this per stream ID internally. L4 does **not** duplicate locking -- see Locking Strategy below. |
+| Block parameters | Runtime values via `create()` params and getters | A single binary must be able to open SFS files with different block sizes. Compile-time generics would prevent this. |
+| Stream IDs | `u64` internally | Plenty of streams for any practical use. On-disk serialization uses only `block_index_width` bytes (e.g. 4 bytes for u32-equivalent). |
+| Locking | Enforced inside L3 | One writer OR many readers per stream. L3 tracks this per stream ID internally. L4 does **not** duplicate locking. |
+| Thread safety | `&self` on all methods, `Send + Sync` bound | L3 implementations use interior mutability (e.g. `Mutex`) to allow safe sharing across threads. |
 | create/open on trait | Associated functions returning `Self` | L3 is responsible for creating/opening the underlying storage. |
 
 ## L4 Changes: Filing System on Numbered Streams
@@ -118,11 +129,11 @@ This is the most significant change. L4 must now implement the filing system des
 A directory stream contains serialized **stream entries**. Each entry maps a name to a stream identifier:
 
 ```
-| length: u16 | identifier: u32 | name: [u8] |
+| length: u16 | identifier: [u8; block_index_width] | name: [u8] |
 ```
 
-- `length` (u16): Total size of this entry in bytes, including the length field itself. So: `2 + 4 + name_bytes.len()`.
-- `identifier` (u32): The L3 stream ID this entry points to.
+- `length` (u16): Total size of this entry in bytes, including the length field itself. So: `2 + block_index_width + name_bytes.len()`.
+- `identifier` ([u8; block_index_width]): The L3 stream ID this entry points to, serialized as the low `block_index_width` bytes of the u64 ID in little-endian order.
 - `name` (UTF-8 bytes): The entry name. If the name ends with `/`, this entry points to another directory stream. Otherwise, it points to a data stream.
 
 When listing a directory, L4 opens the directory stream via L3, reads all bytes, and parses the stream entries.
@@ -153,16 +164,20 @@ Data streams are unchanged from the caller's perspective. They contain raw bytes
 ### L4 Internal State
 
 ```rust
-pub struct Sfs<L3: StreamLayer<BlockIndex, BLOCK_SIZE_SHIFT>, BlockIndex, const BLOCK_SIZE_SHIFT: u8> {
+pub struct Sfs<L3: StreamLayer> {
     layer3: L3,
-    root_dir_stream_id: u32,
+    root_dir_stream_id: u64,
+    state: Mutex<SfsState<L3::Handle>>,
+}
+
+struct SfsState<H> {
     next_handle_id: u64,
-    open_streams: HashMap<u64, OpenStreamInfo<L3::Handle>>,
+    open_streams: HashMap<u64, OpenStreamInfo<H>>,
 }
 
 struct OpenStreamInfo<H> {
     path: String,
-    stream_id: u32,
+    stream_id: u64,
     l3_handle: H,
     position: u64,
     mode: OpenMode,
@@ -170,6 +185,8 @@ struct OpenStreamInfo<H> {
 ```
 
 L4 keeps its own handle system (returning `StreamHandle` to callers) and maps internally to L3 handles + position tracking. Note: **no `path_locks` map** -- L4 delegates all locking to L3 (see Locking Strategy below).
+
+All L4 state is protected by a `Mutex`, and all methods take `&self` (interior mutability), making `Sfs` thread-safe.
 
 ## Locking Strategy
 
@@ -181,7 +198,7 @@ L3 enforces per-stream locking by stream ID:
 - `open_stream(id, Read)` fails if a writer is already open on that stream.
 - `delete_stream(id)` fails if the stream is currently open (any readers or writer).
 
-L4 relies entirely on L3's locking. When L4 needs to check whether a stream is open (e.g. before deleting or renaming), it simply attempts the operation on L3 and propagates any `LockConflict` error.
+L4 relies entirely on L3's locking. When L4 needs to check whether a stream is open (e.g. before deleting or renaming), it checks its own `open_streams` map for matching stream IDs and propagates any `LockConflict` error from L3.
 
 This avoids duplicating lock state between layers. L3 is the single source of truth for lock state.
 
@@ -193,30 +210,30 @@ This avoids duplicating lock state between layers. L3 is the single source of tr
 
 - `StreamsFromFiles` struct holds:
   - `root: PathBuf` -- the directory on disk.
-  - `next_stream_id: u32` -- counter for allocating new stream IDs.
-  - `locks: HashMap<u32, LockState>` -- per-stream lock state (reader count + has_writer flag).
-  - `open_handles: HashMap<handle_id, OpenFileInfo>` -- tracking open file handles and their associated stream ID.
+  - `block_index_width: u8` -- stored from create, read back from meta on open.
+  - `block_size_shift: u8` -- stored from create, read back from meta on open.
+  - `state: Mutex<StreamsState>` -- all mutable bookkeeping behind a single mutex.
+
+- `StreamsState` contains:
+  - `next_stream_id: u64` -- counter for allocating new stream IDs.
+  - `next_handle_id: u64` -- counter for allocating handle IDs.
+  - `locks: HashMap<u64, LockState>` -- per-stream lock state (reader count + has_writer flag).
+  - `open_handles: HashMap<u64, HandleInfo>` -- tracking open handles and their associated stream ID.
 
 ### File naming
 
 - Stream files: `{id}.stream` (e.g. `0.stream`, `1.stream`, `42.stream`).
-- A `meta` file in the directory storing `next_stream_id` as a little-endian u32.
+- A `meta` file in the directory with format: `| block_index_width: u8 | block_size_shift: u8 | next_stream_id: u64 |` (10 bytes total, little-endian).
 
-### Thread safety for stream creation
+### Thread safety
 
-The `meta` file must be exclusively locked (OS file lock) during `create_stream()` to prevent race conditions where two threads both read the same `next_stream_id`, create the same stream file, and corrupt state. The sequence is:
-
-1. Open and exclusively lock the `meta` file.
-2. Read `next_stream_id`.
-3. Create the `{id}.stream` file.
-4. Write `next_stream_id + 1` back to the `meta` file.
-5. Release the lock.
+All bookkeeping state is behind a single `Mutex`. File I/O uses **ephemeral file handles** (opened and closed on each read/write/truncate operation) so no file descriptors are stored in state. This avoids file handle lifetime issues across threads.
 
 ### Create flow
 
-1. `StreamsFromFiles::create(path)`:
+1. `StreamsFromFiles::create(path, block_index_width, block_size_shift)`:
    - Create directory at `path`.
-   - Write `meta` file with `next_stream_id = 0`.
+   - Write `meta` file with the given params and `next_stream_id = 0`.
    - Return the instance.
 
 2. L4 calls `create_stream()` for the root directory stream → gets ID 0 → `0.stream` is created (empty).
@@ -225,65 +242,55 @@ The `meta` file must be exclusively locked (OS file lock) during `create_stream(
 
 1. `StreamsFromFiles::open(path)`:
    - Verify directory exists.
-   - Read `meta` file to get `next_stream_id`.
+   - Read `meta` file to get `block_index_width`, `block_size_shift`, and `next_stream_id`.
    - Return the instance.
 
 ### Stream operations
 
-- `create_stream()`: Exclusively lock `meta`, allocate next ID, create `{id}.stream` file, increment and persist `next_stream_id`, unlock.
-- `open_stream(id, mode)`: Open `{id}.stream`, check/update lock state, return handle.
-- `close_stream(handle)`: Close file handle, update lock state.
+- `create_stream()`: Lock mutex, allocate next ID, create `{id}.stream` file, increment and persist `next_stream_id`, unlock.
+- `open_stream(id, mode)`: Check `{id}.stream` exists, check/update lock state, allocate handle, return handle.
+- `close_stream(handle)`: Look up handle info, update lock state, remove handle.
 - `delete_stream(id)`: Verify not open (check lock state), remove `{id}.stream` file. ID is not reused.
-- `read(handle, pos, buf)`: Seek to `pos` in the file, read into `buf`.
-- `write(handle, pos, buf)`: Seek to `pos` in the file, write from `buf`.
-- `stream_length(handle)`: Return file size.
-- `truncate(handle, new_len)`: Truncate the file.
+- `read(handle, pos, buf)`: Open file ephemerally, seek to `pos`, read into `buf`, close file.
+- `write(handle, pos, buf)`: Open file ephemerally, seek to `pos`, write from `buf`, close file.
+- `stream_length(handle)`: Query file metadata for size.
+- `truncate(handle, new_len)`: Open file ephemerally, truncate, close file.
 
 ## C ABI Impact
 
-The C ABI layer (`stream_fs_c`) should remain largely unchanged from the caller's perspective. The public API signatures stay the same. Internally:
+The C ABI layer (`stream_fs_c`) uses `SfsDefault` (which is `Sfs<StreamsFromFiles>`).
 
-- `sfs_create` / `sfs_open` will instantiate `Sfs<StreamsFromFiles>` instead of `Sfs`.
+- `sfs_create(path, block_index_width, block_size_shift)` takes the runtime params.
+- `sfs_open(path)` reads params from the meta file.
 - All other functions continue to work through opaque handles.
 
-The C ABI will need to be compiled against a specific L3 type (monomorphized). For now, that's `StreamsFromFiles`.
+## Python Wrapper
 
-## Python Wrapper / Test Impact
+The Python wrapper wraps the C ABI into a Pythonic API:
 
-- The Python wrapper (`sfs_pytest/sfs/`) should require **no changes** -- it talks to the C ABI, which hasn't changed its public interface.
-- **All 46 existing tests should continue to pass** after the refactor. This is our key validation: same behavior, different internal architecture.
-- Additional tests may be added to verify L3-specific behavior (e.g. that `.stream` files appear on disk with expected numbering).
+```python
+class Sfs:
+    @staticmethod
+    def create(path: str, block_index_width: int = 4, block_size_shift: int = 12) -> "Sfs"
 
-## Implementation Order
+    @staticmethod
+    def open(path: str) -> "Sfs"
+```
 
-### Phase 1: L3 Trait Definition
-1. Define the `StreamLayer` trait in a new file `stream_fs/src/stream_layer.rs`.
-2. Export it from `lib.rs`.
+Default values (4, 12) give u32-equivalent block indices and 4096-byte blocks.
 
-### Phase 2: StreamsFromFiles Implementation
-3. Implement `StreamsFromFiles` in `stream_fs/src/streams_from_files.rs`.
-4. Unit test `StreamsFromFiles` directly in Rust (basic create/open/read/write/locking).
+## Test Suite
 
-### Phase 3: Refactor L4 to Use L3
-5. Make `Sfs` generic: `Sfs<L3: StreamLayer>`.
-6. Implement directory stream entry serialization/deserialization in L4.
-7. Implement path resolution by walking directory streams.
-8. Rewrite all L4 operations (mkdir, rmdir, list, create_stream, open_stream, etc.) to use L3 instead of direct filesystem calls.
-9. This is the biggest phase -- L4 is essentially rewritten, though the public API stays the same.
-
-### Phase 4: Update C ABI
-10. Update `stream_fs_c` to use `Sfs<StreamsFromFiles>`.
-11. Verify it compiles and the public C API is unchanged.
-
-### Phase 5: Run Existing Tests
-12. Build the full stack (Rust → C ABI → Python).
-13. Run all 46 existing pytest tests. They must all pass.
-14. Fix any issues until green.
-
-### Phase 6: Additional Tests (Optional)
-15. Add tests verifying `.stream` files exist on disk with expected naming.
-16. Add tests verifying directory stream content (stream entry format).
-17. Add tests for concurrent stream creation (meta file locking).
+- **49/49 tests passing (100%)** across all phases
+- Phase 1 (Lifecycle): 5 tests - create, open, close
+- Phase 2 (Directories): 12 tests - mkdir, rmdir, list, rename
+- Phase 3 (Streams): 6 tests - create, delete, rename
+- Phase 4 (Stream I/O): 11 tests - read, write, seek, tell, truncate
+- Phase 5 (Locking): 7 tests - multi-reader, reader/writer blocking
+- Phase 6 (Edge Cases): 5 tests - empty streams, deep nesting, spaces
+- Phase 7 (Thread Safety): 2 tests - concurrent reads, shared-instance concurrent writes
+  - Configurable burn duration via `--burn-seconds` (default 10s)
+  - 40 threads per test, each looping for the burn duration
 
 ## Resolved Questions
 
@@ -291,9 +298,13 @@ The C ABI will need to be compiled against a specific L3 type (monomorphized). F
 
 2. **Root directory stream ID**: Yes, assume it's always 0 for now. The first `create_stream()` call returns 0. We will revisit this when implementing headers (L3 header contains the "Streams stream descriptor").
 
-3. **Meta file format**: Minimal -- just `next_stream_id` as a little-endian u32. Can be extended later if needed.
+3. **Meta file format**: `| block_index_width: u8 | block_size_shift: u8 | next_stream_id: u64 |` (10 bytes, little-endian). Extended from original 4 bytes to include runtime block parameters.
 
 4. **Error propagation**: Pass through and enrich. `SfsError` is used by both L3 and L4. L4 adds context where useful (e.g. "while resolving path 'textures/skin.png'") via the error message strings, but does not map error types.
+
+5. **Block parameters as runtime values**: `block_index_width` and `block_size_shift` cannot be compile-time generics because a single binary must open SFS files with different parameters. They are stored in the meta file and passed as runtime values to `create()`, read back via getters after `open()`.
+
+6. **Internal stream ID width**: All stream IDs are `u64` internally. On-disk serialization in directory entries uses only `block_index_width` bytes (zero-extending on read). This gives maximum flexibility without penalizing disk space.
 
 ---
 
@@ -304,34 +315,47 @@ The C ABI will need to be compiled against a specific L3 type (monomorphized). F
 **All components implemented and tested:**
 
 1. **L3 Trait** (`stream_fs/src/stream_layer.rs`)
-   - `StreamLayer<BlockIndex, BLOCK_SIZE_SHIFT>` trait with associated `Handle: Copy` type
-   - Generic over block index type and block size (2^BLOCK_SIZE_SHIFT)
+   - `StreamLayer` trait (no generics) with associated `Handle: Copy` type
+   - `Send + Sync` bound for thread safety
+   - Runtime `block_index_width` and `block_size_shift` via `create()` params and getters
+   - All stream IDs are `u64`
    - Position-based read/write (L3 handles have no head position)
+   - All methods take `&self` (interior mutability)
    - Locking enforced inside L3 (one writer OR many readers per stream)
 
 2. **StreamsFromFiles** (`stream_fs/src/streams_from_files.rs`)
    - Each stream stored as `{id}.stream` file in a directory
-   - `meta` file tracks next available stream ID (little-endian u32)
+   - `meta` file: `| block_index_width: u8 | block_size_shift: u8 | next_stream_id: u64 |` (10 bytes)
    - Per-stream lock state tracking (reader count + has_writer flag)
-   - Implements `StreamLayer` for any `BlockIndex` and `BLOCK_SIZE_SHIFT`
+   - Ephemeral file handles (open/close on each operation) for thread safety
+   - All bookkeeping behind a single `Mutex`
 
 3. **L4 Rewrite** (`stream_fs/src/sfs.rs`)
-   - `Sfs<L3, BlockIndex, BLOCK_SIZE_SHIFT>` — fully generic over L3
-   - Directory streams with serialized stream entries: `| length: u16 | identifier: u32 | name: [u8] |`
+   - `Sfs<L3: StreamLayer>` — generic over L3
+   - Directory entry format: `| length: u16 | identifier: [u8; block_index_width] | name: [u8] |`
+   - Variable-width serialization: writes `block_index_width` bytes per identifier
    - Path resolution by walking directory stream hierarchy
    - Root directory stream (ID 0) created automatically on `Sfs::create`
    - No path-level lock tracking — all locking delegated to L3
-   - `SfsDefault` type alias: `Sfs<StreamsFromFiles, u32, 12>`
+   - `SfsDefault` type alias: `Sfs<StreamsFromFiles>`
+   - Thread-safe: `Mutex<SfsState>`, all methods take `&self`
 
 4. **C ABI** (`stream_fs_c/src/lib.rs`)
-   - Updated to use `SfsDefault as Sfs`
-   - Public C API unchanged — callers see no difference
-   - Directory operations now use `&mut` internally (transparent to C callers)
+   - `sfs_create(path, block_index_width, block_size_shift)` takes runtime params
+   - All other C API functions unchanged
+   - Uses `SfsDefault as Sfs`
 
 5. **CLI** (`sfs_cl/src/main.rs`)
    - Updated to use `SfsDefault as Sfs`
+   - `create` command uses defaults (4, 12)
    - All commands working as before
+   - Recursive listing with `-r` flag
 
-6. **Test Suite**
-   - **47/47 tests passing (100%)** — all existing tests pass unchanged
-   - Python wrapper required no changes (C ABI interface unchanged)
+6. **Python Bindings** (`sfs_pytest/sfs/`)
+   - `Sfs.create(path, block_index_width=4, block_size_shift=12)` with defaults
+   - Updated ctypes signature for `sfs_create`
+
+7. **Test Suite**
+   - **49/49 tests passing (100%)**
+   - All existing L4 Mock tests pass unchanged through the L3 layer
+   - Thread safety burn-in tests (40 threads, configurable `--burn-seconds`)

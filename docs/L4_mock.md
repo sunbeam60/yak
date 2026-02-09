@@ -1,5 +1,7 @@
 # L4 Mock: Design & Decisions
 
+> **Note:** This document is historical — it captures the design decisions from the L4 Mock phase, which has been superseded by the [L3 Mock phase](L3_mock.md). The L4 public API defined here remains the same, but L4 is now generic over an L3 trait rather than using direct filesystem operations.
+
 This document captures the design decisions and implementation plan for the L4 Mock phase of SFS.
 
 ## Goal
@@ -420,4 +422,4 @@ test_reopen_after_close       - close and reopen a stream, data persists
 - **100% test coverage across all planned phases (46/46 tests)**
 - Edge cases thoroughly tested (empty streams, deep nesting, spaces in names)
 
-**Next Phase:** L3 Mock - Implement L3 layer (stream abstraction) and make L4 generic over it. L3 will mock streams with real files, replacing L4's direct filesystem usage.
+**Next Phase:** L3 Mock — ✅ COMPLETE. See [L3 Mock](L3_mock.md) for the current implementation.

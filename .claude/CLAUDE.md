@@ -36,20 +36,23 @@ It is critical that the four layers in SFS are kept as decoupled as possible: L4
 ### Current project phase
 **L3 Mock: ✅ COMPLETE** - See [L3 mock](./../docs/L3_mock.md) for full documentation.
 
-All 47 tests passing. Ready to proceed to L2 Mock phase when you're ready.
+All 49 tests passing (including thread safety burn-in). Ready to proceed to L2 Mock phase when you're ready.
 
 ### Implementation Status Summary
 
 | Phase     | Component                          | Status         | Tests     |
 | --------- | ---------------------------------- | -------------- | --------- |
-| L4 Mock   | All components                     | ✅ Complete     | 47/47     |
-| L3 Mock   | `StreamLayer` trait                | ✅ Complete     | -         |
+| L4 Mock   | All components                     | ✅ Complete     | -         |
+| L3 Mock   | `StreamLayer` trait (no generics)  | ✅ Complete     | -         |
 | L3 Mock   | `StreamsFromFiles` (L3 impl)      | ✅ Complete     | -         |
 | L3 Mock   | L4 rewrite (generic over L3)      | ✅ Complete     | -         |
+| L3 Mock   | Runtime block params refactor      | ✅ Complete     | -         |
+| L3 Mock   | Thread safety (`&self` + Mutex)    | ✅ Complete     | -         |
 | L3 Mock   | C FFI (`stream_fs_c`)             | ✅ Complete     | -         |
 | L3 Mock   | CLI tool (`sfs_cl`)               | ✅ Complete     | -         |
-| L3 Mock   | Test suite                         | ✅ Complete     | 47/47     |
-| **Total** | **L3 Mock**                        | **✅ COMPLETE** | **47/47** |
+| L3 Mock   | Thread safety burn-in tests        | ✅ Complete     | -         |
+| L3 Mock   | Full test suite                    | ✅ Complete     | 49/49     |
+| **Total** | **L3 Mock**                        | **✅ COMPLETE** | **49/49** |
 
 ### Next Steps (L2 Mock Phase)
 When ready to proceed:

@@ -60,6 +60,10 @@ impl StreamsFromFiles {
         self.root.join("meta")
     }
 
+    fn header_path(&self) -> PathBuf {
+        self.root.join("header")
+    }
+
     /// Meta format: | block_index_width: u8 | block_size_shift: u8 | next_stream_id: u64 |
     fn persist_meta(&self, next_id: u64) -> Result<(), SfsError> {
         let mut buf = Vec::with_capacity(10);
@@ -339,5 +343,60 @@ impl StreamLayer for StreamsFromFiles {
         file.set_len(new_len)
             .map_err(|e| SfsError::IoError(e.to_string()))?;
         Ok(())
+    }
+
+    fn store_header(&self, upper_layers: &[u8]) -> Result<(), SfsError> {
+        let next_stream_id = {
+            let state = self.state.lock().unwrap();
+            state.next_stream_id
+        };
+
+        let mut header = Vec::new();
+        // Magic
+        header.extend_from_slice(b"stream_fs");
+        header.push(0); // layout version 0
+        // L3 section: | length: u16 | "strfil" | version: u8 | next_stream_id: u64 |
+        let l3_len: u16 = 2 + 6 + 1 + 8; // = 17
+        header.extend_from_slice(&l3_len.to_le_bytes());
+        header.extend_from_slice(b"strfil");
+        header.push(0); // version
+        header.extend_from_slice(&next_stream_id.to_le_bytes());
+        // Upper layer sections (L4)
+        header.extend_from_slice(upper_layers);
+
+        fs::write(self.header_path(), &header)
+            .map_err(|e| SfsError::IoError(format!("failed to write header: {}", e)))
+    }
+
+    fn load_header(&self) -> Result<Vec<u8>, SfsError> {
+        let path = self.header_path();
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let data = fs::read(&path)
+            .map_err(|e| SfsError::IoError(format!("failed to read header: {}", e)))?;
+
+        // Verify magic (bytes 0..9 == "stream_fs", byte 9 == 0)
+        if data.len() < 10 || &data[0..9] != b"stream_fs" || data[9] != 0 {
+            return Err(SfsError::IoError("invalid SFS header magic".to_string()));
+        }
+
+        // Read L3 section length at offset 10, verify "strfil" identifier
+        if data.len() < 12 {
+            return Err(SfsError::IoError("header too short for L3 section".to_string()));
+        }
+        let l3_len = u16::from_le_bytes([data[10], data[11]]) as usize;
+        if data.len() < 10 + l3_len {
+            return Err(SfsError::IoError("header too short for L3 data".to_string()));
+        }
+        if &data[12..18] != b"strfil" {
+            return Err(SfsError::IoError(format!(
+                "expected L3 identifier 'strfil', got '{}'",
+                String::from_utf8_lossy(&data[12..18])
+            )));
+        }
+
+        // Return remainder (L4 section and above)
+        Ok(data[10 + l3_len..].to_vec())
     }
 }

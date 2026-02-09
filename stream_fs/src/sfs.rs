@@ -212,6 +212,11 @@ impl<L3: StreamLayer> Sfs<L3> {
     ) -> Result<Self, SfsError> {
         let layer3 = L3::create(path, block_index_width, block_size_shift)?;
         let root_id = layer3.create_stream()?;
+
+        // Persist L4 header section via the header chain
+        let l4_section = build_l4_section(root_id);
+        layer3.store_header(&l4_section)?;
+
         Ok(Sfs {
             layer3,
             root_dir_stream_id: root_id,
@@ -225,9 +230,14 @@ impl<L3: StreamLayer> Sfs<L3> {
     /// Open an existing SFS file.
     pub fn open(path: &str) -> Result<Self, SfsError> {
         let layer3 = L3::open(path)?;
+
+        // Restore L4 header from L3
+        let l4_section = layer3.load_header()?;
+        let root_id = parse_l4_section(&l4_section)?;
+
         Ok(Sfs {
             layer3,
-            root_dir_stream_id: 0,
+            root_dir_stream_id: root_id,
             state: Mutex::new(SfsState {
                 next_handle_id: 0,
                 open_streams: HashMap::new(),
@@ -974,4 +984,45 @@ impl<L3: StreamLayer> Sfs<L3> {
         self.layer3.read(handle, 0, &mut buf)?;
         parse_entries(&buf, self.layer3.block_index_width())
     }
+}
+
+// ---------------------------------------------------------------------------
+// L4 header section helpers
+// ---------------------------------------------------------------------------
+
+/// Build the L4 header section: | length: u16 | "filing" | version: u8 | root_dir_stream_id: u64 |
+fn build_l4_section(root_dir_stream_id: u64) -> Vec<u8> {
+    let data_len: u16 = 8; // root_dir_stream_id
+    let total_len: u16 = 2 + 6 + 1 + data_len; // = 17
+    let mut buf = Vec::with_capacity(total_len as usize);
+    buf.extend_from_slice(&total_len.to_le_bytes());
+    buf.extend_from_slice(b"filing");
+    buf.push(0); // version
+    buf.extend_from_slice(&root_dir_stream_id.to_le_bytes());
+    buf
+}
+
+/// Parse the L4 header section, returning root_dir_stream_id.
+fn parse_l4_section(data: &[u8]) -> Result<u64, SfsError> {
+    if data.is_empty() {
+        // No L4 header stored yet (legacy files) — fall back to root ID 0
+        return Ok(0);
+    }
+    if data.len() < 17 {
+        return Err(SfsError::IoError("L4 header section too short".to_string()));
+    }
+    // Verify identifier
+    if &data[2..8] != b"filing" {
+        return Err(SfsError::IoError(format!(
+            "expected L4 identifier 'filing', got '{}'",
+            String::from_utf8_lossy(&data[2..8])
+        )));
+    }
+    // Skip length (2) + identifier (6) + version (1) = 9 bytes, then read root_dir_stream_id
+    let root_id = u64::from_le_bytes(
+        data[9..17]
+            .try_into()
+            .map_err(|_| SfsError::IoError("failed to parse root_dir_stream_id".to_string()))?,
+    );
+    Ok(root_id)
 }

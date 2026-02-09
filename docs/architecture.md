@@ -342,7 +342,7 @@ One possible optimization is to maintain a free list of streams. For now, a sequ
 
 Streams must be opened and closed like regular files before they can written to and read from, including the Streams stream. This is to track that there is at most one active writer (with no readers) or many active readers (with no writer). The list of active readers and writers per stream, which is not exposed directly to L4, but kept internally and found from the stream handle that L3 exposes to L4, must be guarded with mutex to avoid the multi-threaded creation of simultaneous readers and writer.
 
-Since the Streams stream will be accessed by multiple threads (for example, to create a writable stream in two separate threads), the Streams stream must by opened using a writer so that the a new Stream Descriptor can be written into this stream from one thread without collision with another thread.
+Since the Streams stream will be accessed by multiple threads (for example, to create a writable stream in two separate threads, ie.e two writers, one in each thread), the Streams stream must be protected. We cannot do this using a regular writer handle, as that will fail, rather than wait, if other threads have got readers on the Streams stream. So instead we must separate the concern of having a cursor into a stream (which is used to walk the block hierarchy of redirectors - if any - until arriving at a data block) and protecting this stream by either a reader/writer or a RWLock, where the calling thread awaits access to the Streams stream. In other words, it is now the handle to the stream that knows how to walk the block hierarchy, because we need similar functionality in the Streams stream (which we will access "raw", using the RWLock).
 
 ## L2: Blocks
 

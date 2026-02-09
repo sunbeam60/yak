@@ -422,4 +422,5 @@ test_reopen_after_close       - close and reopen a stream, data persists
 - **100% test coverage across all planned phases (46/46 tests)**
 - Edge cases thoroughly tested (empty streams, deep nesting, spaces in names)
 
-**Next Phase:** L3 Mock — ✅ COMPLETE. See [L3 Mock](L3_mock.md) for the current implementation.
+**Next Phase:** L3 Mock — ✅ COMPLETE. See [L3 Mock](L3_mock.md).
+**Current Phase:** L2 Mock — ✅ COMPLETE. See [L2 Mock](L2_mock.md) for the current implementation.

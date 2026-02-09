@@ -70,4 +70,18 @@ pub trait StreamLayer: Send + Sync {
 
     /// Truncate a stream to the given length.
     fn truncate(&self, handle: &Self::Handle, new_len: u64) -> Result<(), SfsError>;
+
+    /// Store header sections for this layer and all layers above.
+    ///
+    /// `upper_layers` contains the already-formatted header sections from
+    /// the layer(s) above (each with their own length/identifier prefix).
+    /// The implementation prepends its own section and passes everything
+    /// down to the layer below (or writes to disk if this is the bottom layer).
+    fn store_header(&self, upper_layers: &[u8]) -> Result<(), SfsError>;
+
+    /// Load header sections for the layers above this one.
+    ///
+    /// Returns the concatenated header sections that were passed to
+    /// `store_header()` — i.e. everything except this layer's own section.
+    fn load_header(&self) -> Result<Vec<u8>, SfsError>;
 }

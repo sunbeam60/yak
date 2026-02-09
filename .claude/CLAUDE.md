@@ -34,9 +34,9 @@ It is critical that the four layers in SFS are kept as decoupled as possible: L4
 4. L1 Mock: Implement L1 and plug it into L2.
 
 ### Current project phase
-**L3 Mock: ✅ COMPLETE** - See [L3 mock](./../docs/L3_mock.md) for full documentation.
+**L2 Mock: ✅ COMPLETE** - See [L2 mock](./../docs/L2_mock.md) for full documentation.
 
-All 49 tests passing (including thread safety burn-in). Ready to proceed to L2 Mock phase when you're ready.
+All 68 tests passing (including thread safety burn-in and Phase 8 multi-block tests). Ready to proceed to L1 Mock phase when you're ready.
 
 ### Implementation Status Summary
 
@@ -52,12 +52,19 @@ All 49 tests passing (including thread safety burn-in). Ready to proceed to L2 M
 | L3 Mock   | CLI tool (`sfs_cl`)               | ✅ Complete     | -         |
 | L3 Mock   | Thread safety burn-in tests        | ✅ Complete     | -         |
 | L3 Mock   | Full test suite                    | ✅ Complete     | 49/49     |
-| **Total** | **L3 Mock**                        | **✅ COMPLETE** | **49/49** |
+| L2 Mock   | `BlockLayer` trait                 | ✅ Complete     | -         |
+| L2 Mock   | `BlocksFromFiles` (L2 impl)       | ✅ Complete     | -         |
+| L2 Mock   | `StreamsFromBlocks` (real L3)      | ✅ Complete     | -         |
+| L2 Mock   | Header chain (L4→L3→L2→disk)      | ✅ Complete     | -         |
+| L2 Mock   | `SfsDefault` updated               | ✅ Complete     | -         |
+| L2 Mock   | Phase 8 multi-block tests          | ✅ Complete     | 19/19     |
+| L2 Mock   | Thread safety burn-in              | ✅ Complete     | -         |
+| L2 Mock   | Full test suite                    | ✅ Complete     | 68/68     |
+| **Total** | **L2 Mock**                        | **✅ COMPLETE** | **68/68** |
 
-### Next Steps (L2 Mock Phase)
+### Next Steps (L1 Mock Phase)
 When ready to proceed:
-1. Define L2 trait for block storage abstraction
-2. Make L3 generic over L2 trait
-3. Implement L2 mock that stores each block as a numbered file on disk
-4. Implement real L3 (`StreamsFromBlocks`) that links blocks into streams
-5. Update/extend tests to validate L2 layer separation
+1. Define L1 trait for raw file I/O abstraction
+2. Make L2 generic over L1 trait
+3. Implement L1 mock that stores the entire SFS in a single file
+4. Update/extend tests to validate L1 layer separation

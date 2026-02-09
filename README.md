@@ -4,15 +4,18 @@ A layered file system implementation in Rust that provides a "file system in a f
 
 ## Project Status
 
-**L3 Mock: ✅ COMPLETE** (49/49 tests passing)
+**L2 Mock: ✅ COMPLETE** (68/68 tests passing)
 
 All core components implemented and tested:
-- ✅ Rust library (`stream_fs`) — L4 generic over L3 trait
-- ✅ L3 implementation (`StreamsFromFiles`) — numbered `.stream` files on disk
+- ✅ Rust library (`stream_fs`) — L4 generic over L3 trait, L3 generic over L2 trait
+- ✅ Real L3 implementation (`StreamsFromBlocks`) — pyramid block linking
+- ✅ L2 mock (`BlocksFromFiles`) — numbered `.block` files on disk
+- ✅ L3 mock (`StreamsFromFiles`) — kept as debugging tool
+- ✅ Header chain (L4 → L3 → L2 → disk)
 - ✅ C FFI wrapper (`stream_fs_c`)
 - ✅ Python bindings (`sfs_pytest/sfs`)
 - ✅ Command-line tool (`sfs_cl`)
-- ✅ Comprehensive test suite including thread safety burn-in tests
+- ✅ Comprehensive test suite including multi-block and thread safety burn-in tests
 
 ## Quick Start
 
@@ -63,7 +66,7 @@ sfs --help
 ## Project Structure
 
 ```
-stream_fs/       - Core Rust library (L4 API + L3 trait + StreamsFromFiles)
+stream_fs/       - Core Rust library (L4 + L3 + L2 traits and implementations)
 stream_fs_c/     - C FFI wrapper for language interop
 sfs_cl/          - Command-line tool
 sfs_pytest/      - Python bindings and test suite
@@ -73,47 +76,48 @@ docs/            - Architecture and design documentation
 ## Documentation
 
 - [Architecture Overview](docs/architecture.md) - Complete 4-layer architecture
-- [L3 Mock Design](docs/L3_mock.md) - Current implementation phase details
-- [L4 Mock Design](docs/L4_mock.md) - Previous phase design decisions
+- [L2 Mock Design](docs/L2_mock.md) - Current implementation phase details
+- [L3 Mock Design](docs/L3_mock.md) - Previous phase design decisions
+- [L4 Mock Design](docs/L4_mock.md) - Initial phase design decisions
 - [Project Instructions](.claude/CLAUDE.md) - Development guidelines
 
 ## Architecture Layers
 
 SFS is built in 4 layers, implemented bottom-up using a "mock first" approach:
 
-1. **L1 - File System Abstraction** - Wraps OS file operations
-2. **L2 - Block Storage** - Manages fixed-size blocks
-3. **L3 - Stream Abstraction** - Links blocks into streams (✅ current — mocked with files)
+1. **L1 - File System Abstraction** - Wraps OS file operations (planned)
+2. **L2 - Block Storage** - Manages fixed-size blocks (✅ complete — mocked with files)
+3. **L3 - Stream Abstraction** - Links blocks into streams via pyramid structure (✅ complete)
 4. **L4 - Filing Abstraction** - Provides directories and named streams (✅ complete)
 
-## Current Implementation (L3 Mock)
+## Current Implementation (L2 Mock)
 
-L4 is a real filing system built on numbered streams from L3:
-- SFS "files" are directories on disk containing numbered `.stream` files
-- L4 manages directory streams (serialized stream entries) and data streams
-- Path resolution walks the directory stream hierarchy
-- `block_index_width` and `block_size_shift` are runtime values stored in metadata
-- All stream IDs are u64 internally; on-disk serialization uses `block_index_width` bytes
-- Thread-safe: all methods take `&self` with interior mutability via `Mutex`
+L3 is a real stream layer built on numbered blocks from L2:
+- SFS "files" are directories on disk containing numbered `.block` files
+- L3 (`StreamsFromBlocks`) links blocks into streams using pyramid block linking
+- Stream descriptors stored in a "Streams stream" with out-of-band descriptor in the header chain
+- Header chain: L4 → L3 → L2 → disk, each layer with its own header section
+- `block_index_width` and `block_size_shift` are runtime values stored in the header
+- Thread-safe: RWLock on Streams stream + Mutex for bookkeeping + per-stream locking
 
 ## Features
 
-### Current (L3 Mock)
+### Current (L2 Mock)
 - Create/open/close SFS files with configurable block parameters
 - Directory operations (mkdir, rmdir, rename, list)
 - Stream operations (create, delete, rename)
 - Stream I/O (read, write, seek, tell, truncate)
+- Multi-block streams with pyramid block linking (depth 0, 1, 2+)
 - Proper locking (one writer OR many readers per stream)
 - Thread safety with interior mutability
 - Full C ABI for language interop
 - Python bindings with Pythonic API
 - Command-line tool for manual operations
 - Thread safety burn-in tests (configurable duration)
+- Header chain with per-layer metadata persistence
 
-### Planned (L2/L1)
-- Real block-based storage
-- Space-efficient stream linking
-- Cross-platform file abstraction
+### Planned (L1)
+- Cross-platform file abstraction (single-file SFS)
 - Crash recovery
 - Process-level locking
 

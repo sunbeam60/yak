@@ -48,7 +48,7 @@ class TestThreadSafety:
 
     def test_concurrent_reads(self, sfs_path, burn_seconds):
         """One Sfs instance shared across 40 threads, each reading all streams in a loop."""
-        f = sfs.Sfs.open(sfs_path)
+        f = sfs.Sfs.open(sfs_path, sfs.OpenMode.WRITE)
         errors = []
         barrier = threading.Barrier(NUM_THREADS)
 
@@ -117,7 +117,7 @@ class TestThreadSafety:
 
     def test_shared_instance_concurrent_writes(self, sfs_path, burn_seconds):
         """One Sfs instance shared across 40 threads, each writing its own stream in a loop."""
-        f = sfs.Sfs.open(sfs_path)
+        f = sfs.Sfs.open(sfs_path, sfs.OpenMode.WRITE)
 
         # Create all streams upfront (directory writes are serialized by design)
         for i in range(NUM_THREADS):

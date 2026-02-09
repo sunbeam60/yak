@@ -1,4 +1,4 @@
-use crate::SfsError;
+use crate::{OpenMode, SfsError};
 
 /// L1 trait: File system abstraction.
 ///
@@ -28,8 +28,9 @@ pub trait FileLayer: Send + Sync {
     /// length-prefixed header sections, pops its own (L1) section, validates
     /// it, and caches the remainder for `load_header()`.
     ///
-    /// Acquires an exclusive process lock.
-    fn open(path: &str) -> Result<Self, SfsError>
+    /// Acquires a shared process lock for `Read` mode or an exclusive lock
+    /// for `Write` mode.
+    fn open(path: &str, mode: OpenMode) -> Result<Self, SfsError>
     where
         Self: Sized;
 

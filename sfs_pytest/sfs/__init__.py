@@ -56,9 +56,12 @@ class Sfs:
         return Sfs(handle)
 
     @staticmethod
-    def open(path: str) -> "Sfs":
-        """Open an existing SFS file at the given path."""
-        handle = _lib.sfs_open(path.encode("utf-8"))
+    def open(path: str, mode: OpenMode) -> "Sfs":
+        """Open an existing SFS file at the given path.
+
+        mode: OpenMode.READ for shared read access, OpenMode.WRITE for exclusive write access.
+        """
+        handle = _lib.sfs_open(path.encode("utf-8"), int(mode))
         if handle is None:
             _check_error()
         return Sfs(handle)

@@ -94,13 +94,22 @@ pub extern "C" fn sfs_create(
     }
 }
 
+/// Open an existing SFS file. mode: 0=READ, 1=WRITE.
 #[no_mangle]
-pub extern "C" fn sfs_open(path: *const c_char) -> *mut c_void {
+pub extern "C" fn sfs_open(path: *const c_char, mode: c_int) -> *mut c_void {
     let path = match cstr_to_str(path) {
         Some(s) => s,
         None => return std::ptr::null_mut(),
     };
-    match Sfs::open(path) {
+    let mode = match mode {
+        0 => OpenMode::Read,
+        1 => OpenMode::Write,
+        _ => {
+            set_last_error("invalid open mode");
+            return std::ptr::null_mut();
+        }
+    };
+    match Sfs::open(path, mode) {
         Ok(sfs) => Box::into_raw(Box::new(sfs)) as *mut c_void,
         Err(e) => {
             set_last_error(&e.to_string());

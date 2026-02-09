@@ -26,14 +26,14 @@ class TestSfsLifecycle:
         sfs_path = str(tmp_path / "test.sfs")
         fs = sfs.Sfs.create(sfs_path)
         fs.close()
-        fs = sfs.Sfs.open(sfs_path)
+        fs = sfs.Sfs.open(sfs_path, sfs.OpenMode.WRITE)
         fs.close()
 
     def test_open_nonexistent(self, tmp_path):
         """Opening a non-existent path fails."""
         sfs_path = str(tmp_path / "nonexistent.sfs")
         with pytest.raises(sfs.SfsError):
-            sfs.Sfs.open(sfs_path)
+            sfs.Sfs.open(sfs_path, sfs.OpenMode.WRITE)
 
     def test_close(self, tmp_path):
         """Close an SFS file without error."""

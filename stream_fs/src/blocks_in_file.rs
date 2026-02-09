@@ -2,7 +2,7 @@ use std::sync::Mutex;
 
 use crate::block_layer::BlockLayer;
 use crate::file_layer::FileLayer;
-use crate::SfsError;
+use crate::{OpenMode, SfsError};
 
 // L2 header section layout (offsets chained so inserting a field auto-adjusts all successors):
 // | length: u16 | "blocks": [u8;6] | version: u8 | bss: u8 | biw: u8 | total_blocks: u64 | free_list_head: u64 |
@@ -138,8 +138,8 @@ impl<L1: FileLayer> BlockLayer for BlocksInFile<L1> {
         })
     }
 
-    fn open(path: &str) -> Result<Self, SfsError> {
-        let file = L1::open(path)?;
+    fn open(path: &str, mode: OpenMode) -> Result<Self, SfsError> {
+        let file = L1::open(path, mode)?;
         let l2_section_offset = file.upper_layers_offset();
 
         // Read the upper layers header data from L1

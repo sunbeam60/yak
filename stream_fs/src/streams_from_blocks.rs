@@ -769,11 +769,11 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
         Ok(instance)
     }
 
-    fn open(path: &str) -> Result<Self, SfsError>
+    fn open(path: &str, mode: OpenMode) -> Result<Self, SfsError>
     where
         Self: Sized,
     {
-        let layer2 = L2::open(path)?;
+        let layer2 = L2::open(path, mode)?;
         let upper_sections = layer2.load_header()?;
 
         // Parse L3 section

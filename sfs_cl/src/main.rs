@@ -92,7 +92,7 @@ fn cmd_ls(args: &[String]) -> Result<(), ()> {
     let sfs_path = &rest[0];
     let dir = if rest.len() == 2 { &rest[1] } else { "" };
 
-    let sfs = match Sfs::open(sfs_path) {
+    let sfs = match Sfs::open(sfs_path, OpenMode::Read) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Error opening SFS file: {}", e);
@@ -173,7 +173,7 @@ fn cmd_mkdir(args: &[String]) -> Result<(), ()> {
         return Err(());
     }
 
-    let sfs = match Sfs::open(&args[0]) {
+    let sfs = match Sfs::open(&args[0], OpenMode::Write) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Error opening SFS file: {}", e);
@@ -200,7 +200,7 @@ fn cmd_rmdir(args: &[String]) -> Result<(), ()> {
         return Err(());
     }
 
-    let sfs = match Sfs::open(&args[0]) {
+    let sfs = match Sfs::open(&args[0], OpenMode::Write) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Error opening SFS file: {}", e);
@@ -227,7 +227,7 @@ fn cmd_mv_dir(args: &[String]) -> Result<(), ()> {
         return Err(());
     }
 
-    let sfs = match Sfs::open(&args[0]) {
+    let sfs = match Sfs::open(&args[0], OpenMode::Write) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Error opening SFS file: {}", e);
@@ -266,7 +266,7 @@ fn cmd_put(args: &[String]) -> Result<(), ()> {
         }
     };
 
-    let sfs = match Sfs::open(&args[0]) {
+    let sfs = match Sfs::open(&args[0], OpenMode::Write) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Error opening SFS file: {}", e);
@@ -317,7 +317,7 @@ fn cmd_get(args: &[String]) -> Result<(), ()> {
     let stream_path = &args[1];
     let local_file = &args[2];
 
-    let sfs = match Sfs::open(&args[0]) {
+    let sfs = match Sfs::open(&args[0], OpenMode::Read) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Error opening SFS file: {}", e);
@@ -380,7 +380,7 @@ fn cmd_cat(args: &[String]) -> Result<(), ()> {
         return Err(());
     }
 
-    let sfs = match Sfs::open(&args[0]) {
+    let sfs = match Sfs::open(&args[0], OpenMode::Read) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Error opening SFS file: {}", e);
@@ -436,7 +436,7 @@ fn cmd_rm(args: &[String]) -> Result<(), ()> {
         return Err(());
     }
 
-    let sfs = match Sfs::open(&args[0]) {
+    let sfs = match Sfs::open(&args[0], OpenMode::Write) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Error opening SFS file: {}", e);
@@ -463,7 +463,7 @@ fn cmd_mv(args: &[String]) -> Result<(), ()> {
         return Err(());
     }
 
-    let sfs = match Sfs::open(&args[0]) {
+    let sfs = match Sfs::open(&args[0], OpenMode::Write) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Error opening SFS file: {}", e);
@@ -490,7 +490,7 @@ fn cmd_info(args: &[String]) -> Result<(), ()> {
         return Err(());
     }
 
-    let sfs = match Sfs::open(&args[0]) {
+    let sfs = match Sfs::open(&args[0], OpenMode::Read) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Error opening SFS file: {}", e);

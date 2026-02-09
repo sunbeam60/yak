@@ -123,7 +123,7 @@ impl StreamLayer for StreamsFromFiles {
         Ok(instance)
     }
 
-    fn open(path: &str) -> Result<Self, SfsError> {
+    fn open(path: &str, _mode: OpenMode) -> Result<Self, SfsError> {
         let root = PathBuf::from(path);
         if !root.is_dir() {
             return Err(SfsError::NotFound(root.display().to_string()));

@@ -51,7 +51,7 @@ def _load_library():
     lib.sfs_create.argtypes = [ctypes.c_char_p, ctypes.c_uint8, ctypes.c_uint8]
 
     lib.sfs_open.restype = ctypes.c_void_p
-    lib.sfs_open.argtypes = [ctypes.c_char_p]
+    lib.sfs_open.argtypes = [ctypes.c_char_p, ctypes.c_int]
 
     lib.sfs_close.restype = None
     lib.sfs_close.argtypes = [ctypes.c_void_p]

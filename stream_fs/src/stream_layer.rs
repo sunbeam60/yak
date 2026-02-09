@@ -38,7 +38,8 @@ pub trait StreamLayer: Send + Sync {
 
     /// Open an existing L3 storage at the given path.
     /// Reads `block_index_width` and `block_size_shift` from the stored metadata.
-    fn open(path: &str) -> Result<Self, SfsError>
+    /// `mode` is forwarded to L2/L1 for file-level locking.
+    fn open(path: &str, mode: OpenMode) -> Result<Self, SfsError>
     where
         Self: Sized;
 

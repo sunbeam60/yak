@@ -248,7 +248,7 @@ class TestMultiBlockPersistence:
         fs.close()
 
         # Reopen and read
-        fs = sfs.Sfs.open(sfs_path)
+        fs = sfs.Sfs.open(sfs_path, sfs.OpenMode.WRITE)
         handle = fs.open_stream("data.bin", sfs.OpenMode.READ)
         result = fs.read(handle, 200)
         assert result == data
@@ -271,7 +271,7 @@ class TestMultiBlockPersistence:
         fs.close()
 
         # Reopen and read
-        fs = sfs.Sfs.open(sfs_path)
+        fs = sfs.Sfs.open(sfs_path, sfs.OpenMode.WRITE)
         handle = fs.open_stream("big.bin", sfs.OpenMode.READ)
         result = fs.read(handle, size)
         assert result == data
@@ -296,7 +296,7 @@ class TestMultiBlockPersistence:
         fs.close()
 
         # Reopen and verify both
-        fs = sfs.Sfs.open(sfs_path)
+        fs = sfs.Sfs.open(sfs_path, sfs.OpenMode.WRITE)
         h1 = fs.open_stream("a.bin", sfs.OpenMode.READ)
         assert fs.read(h1, 150) == data_a
         fs.close_stream(h1)

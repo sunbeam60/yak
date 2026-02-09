@@ -1,4 +1,4 @@
-use crate::SfsError;
+use crate::{OpenMode, SfsError};
 
 /// L2 trait: Block storage abstraction.
 ///
@@ -32,7 +32,8 @@ pub trait BlockLayer: Send + Sync {
         Self: Sized;
 
     /// Open an existing L2 storage at the given path.
-    fn open(path: &str) -> Result<Self, SfsError>
+    /// `mode` is forwarded to L1 for file-level locking.
+    fn open(path: &str, mode: OpenMode) -> Result<Self, SfsError>
     where
         Self: Sized;
 

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use crate::block_layer::BlockLayer;
-use crate::SfsError;
+use crate::{OpenMode, SfsError};
 
 /// Bookkeeping state protected by a Mutex.
 struct BlocksState {
@@ -111,7 +111,7 @@ impl BlockLayer for BlocksFromFiles {
         Ok(instance)
     }
 
-    fn open(path: &str) -> Result<Self, SfsError> {
+    fn open(path: &str, _mode: OpenMode) -> Result<Self, SfsError> {
         let root = PathBuf::from(path);
         if !root.is_dir() {
             return Err(SfsError::NotFound(root.display().to_string()));

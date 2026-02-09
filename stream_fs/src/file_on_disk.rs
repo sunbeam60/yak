@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use fs2::FileExt;
 
 use crate::file_layer::FileLayer;
-use crate::SfsError;
+use crate::{OpenMode, SfsError};
 
 /// Magic bytes at the start of every SFS file.
 const MAGIC: &[u8; 9] = b"stream_fs";
@@ -163,20 +163,31 @@ impl FileLayer for FileOnDisk {
         })
     }
 
-    fn open(path: &str) -> Result<Self, SfsError>
+    fn open(path: &str, mode: OpenMode) -> Result<Self, SfsError>
     where
         Self: Sized,
     {
-        let mut file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-            .map_err(|e| SfsError::IoError(format!("failed to open SFS file: {}", e)))?;
+        let mut file = match mode {
+            OpenMode::Read => fs::OpenOptions::new()
+                .read(true)
+                .open(path)
+                .map_err(|e| SfsError::IoError(format!("failed to open SFS file: {}", e)))?,
+            OpenMode::Write => fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .map_err(|e| SfsError::IoError(format!("failed to open SFS file: {}", e)))?,
+        };
 
-        // Acquire exclusive process lock
-        file.try_lock_exclusive().map_err(|e| {
-            SfsError::IoError(format!("SFS file is locked by another process: {}", e))
-        })?;
+        // Acquire process lock: shared for readers, exclusive for writers
+        match mode {
+            OpenMode::Read => file.try_lock_shared().map_err(|e| {
+                SfsError::IoError(format!("SFS file is locked by another process: {}", e))
+            })?,
+            OpenMode::Write => file.try_lock_exclusive().map_err(|e| {
+                SfsError::IoError(format!("SFS file is locked by another process: {}", e))
+            })?,
+        };
 
         let (upper_layers_offset, data_offset, upper_layers_data) =
             Self::parse_header(&mut file)?;

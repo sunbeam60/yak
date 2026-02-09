@@ -13,6 +13,7 @@ pub enum SfsError {
     LockConflict(String),
     SeekOutOfBounds(String),
     IoError(String),
+    ReadOnly(String),
 }
 
 impl fmt::Display for SfsError {
@@ -25,6 +26,7 @@ impl fmt::Display for SfsError {
             SfsError::LockConflict(msg) => write!(f, "lock conflict: {}", msg),
             SfsError::SeekOutOfBounds(msg) => write!(f, "seek out of bounds: {}", msg),
             SfsError::IoError(msg) => write!(f, "I/O error: {}", msg),
+            SfsError::ReadOnly(msg) => write!(f, "read-only: {}", msg),
         }
     }
 }
@@ -191,6 +193,7 @@ struct SfsState<H: Copy> {
 pub struct Sfs<L3: StreamLayer> {
     layer3: L3,
     root_dir_stream_id: u64,
+    mode: OpenMode,
     state: Mutex<SfsState<L3::Handle>>,
 }
 
@@ -224,6 +227,7 @@ impl<L3: StreamLayer> Sfs<L3> {
         Ok(Sfs {
             layer3,
             root_dir_stream_id: root_id,
+            mode: OpenMode::Write,
             state: Mutex::new(SfsState {
                 next_handle_id: 0,
                 open_streams: HashMap::new(),
@@ -232,8 +236,12 @@ impl<L3: StreamLayer> Sfs<L3> {
     }
 
     /// Open an existing SFS file.
-    pub fn open(path: &str) -> Result<Self, SfsError> {
-        let layer3 = L3::open(path)?;
+    ///
+    /// `mode` controls file-level access:
+    /// - `OpenMode::Read`: shared process lock, write operations are rejected
+    /// - `OpenMode::Write`: exclusive process lock, all operations allowed
+    pub fn open(path: &str, mode: OpenMode) -> Result<Self, SfsError> {
+        let layer3 = L3::open(path, mode)?;
 
         // Restore L4 header from L3
         let l4_section = layer3.load_header()?;
@@ -242,11 +250,22 @@ impl<L3: StreamLayer> Sfs<L3> {
         Ok(Sfs {
             layer3,
             root_dir_stream_id: root_id,
+            mode,
             state: Mutex::new(SfsState {
                 next_handle_id: 0,
                 open_streams: HashMap::new(),
             }),
         })
+    }
+
+    /// Check that the SFS file is opened for writing; return `ReadOnly` error if not.
+    fn require_write(&self) -> Result<(), SfsError> {
+        if self.mode == OpenMode::Read {
+            return Err(SfsError::ReadOnly(
+                "SFS file is opened for reading".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Close the SFS file. Consumes self.
@@ -270,6 +289,7 @@ impl<L3: StreamLayer> Sfs<L3> {
 
     /// Create a directory. Parent directories must already exist.
     pub fn mkdir(&self, path: &str) -> Result<(), SfsError> {
+        self.require_write()?;
         if path.is_empty() {
             return Err(SfsError::InvalidPath(
                 "cannot create root directory".to_string(),
@@ -313,6 +333,7 @@ impl<L3: StreamLayer> Sfs<L3> {
 
     /// Delete an empty directory. Fails if not empty or not found.
     pub fn rmdir(&self, path: &str) -> Result<(), SfsError> {
+        self.require_write()?;
         if path.is_empty() {
             return Err(SfsError::InvalidPath(
                 "cannot remove root directory".to_string(),
@@ -399,6 +420,7 @@ impl<L3: StreamLayer> Sfs<L3> {
 
     /// Rename/move a directory. Fails if destination already exists.
     pub fn rename_dir(&self, old_path: &str, new_path: &str) -> Result<(), SfsError> {
+        self.require_write()?;
         if old_path.is_empty() || new_path.is_empty() {
             return Err(SfsError::InvalidPath(
                 "cannot rename root directory".to_string(),
@@ -507,6 +529,7 @@ impl<L3: StreamLayer> Sfs<L3> {
     /// Create a new stream and open it for writing.
     /// Returns a handle positioned at byte 0.
     pub fn create_stream(&self, path: &str) -> Result<StreamHandle, SfsError> {
+        self.require_write()?;
         if path.is_empty() {
             return Err(SfsError::InvalidPath(
                 "stream path cannot be empty".to_string(),
@@ -572,6 +595,9 @@ impl<L3: StreamLayer> Sfs<L3> {
         path: &str,
         mode: OpenMode,
     ) -> Result<StreamHandle, SfsError> {
+        if mode == OpenMode::Write {
+            self.require_write()?;
+        }
         if path.is_empty() {
             return Err(SfsError::InvalidPath(
                 "stream path cannot be empty".to_string(),
@@ -630,6 +656,7 @@ impl<L3: StreamLayer> Sfs<L3> {
 
     /// Delete a stream. Must not be currently open.
     pub fn delete_stream(&self, path: &str) -> Result<(), SfsError> {
+        self.require_write()?;
         if path.is_empty() {
             return Err(SfsError::InvalidPath(
                 "stream path cannot be empty".to_string(),
@@ -687,6 +714,7 @@ impl<L3: StreamLayer> Sfs<L3> {
 
     /// Rename/move a stream. Must not be currently open.
     pub fn rename_stream(&self, old_path: &str, new_path: &str) -> Result<(), SfsError> {
+        self.require_write()?;
         if old_path.is_empty() || new_path.is_empty() {
             return Err(SfsError::InvalidPath(
                 "stream path cannot be empty".to_string(),

@@ -58,7 +58,7 @@ mod tests {
 
         // Reopen and verify
         {
-            let sfs = SfsDefault::open(path_str).unwrap();
+            let sfs = SfsDefault::open(path_str, OpenMode::Write).unwrap();
             let sh = sfs.open_stream("hello.txt", OpenMode::Read).unwrap();
             let mut buf = vec![0u8; 13];
             let n = sfs.read(&sh, &mut buf).unwrap();

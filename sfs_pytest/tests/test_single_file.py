@@ -32,7 +32,7 @@ class TestSingleFile:
         f.close()
         initial_size = os.path.getsize(sfs_path)
 
-        f = sfs.Sfs.open(sfs_path)
+        f = sfs.Sfs.open(sfs_path, sfs.OpenMode.WRITE)
         h = f.create_stream("bigfile")
         f.write(h, b"X" * 100_000)
         f.close_stream(h)
@@ -62,7 +62,7 @@ class TestSingleFilePersistence:
         f.close_stream(h)
         f.close()
 
-        f = sfs.Sfs.open(sfs_path)
+        f = sfs.Sfs.open(sfs_path, sfs.OpenMode.WRITE)
         root = {e.name for e in f.list()}
         assert "docs" in root
         assert "readme" in root
@@ -86,7 +86,7 @@ class TestSingleFilePersistence:
         f.close()
 
         for i in range(1, 6):
-            f = sfs.Sfs.open(sfs_path)
+            f = sfs.Sfs.open(sfs_path, sfs.OpenMode.WRITE)
             h = f.open_stream("counter", sfs.OpenMode.READ)
             data = f.read(h, 1)
             assert data == bytes([i - 1]), f"cycle {i}: expected {i-1}, got {data}"
@@ -99,7 +99,7 @@ class TestSingleFilePersistence:
             f.close()
 
         # Final check
-        f = sfs.Sfs.open(sfs_path)
+        f = sfs.Sfs.open(sfs_path, sfs.OpenMode.WRITE)
         h = f.open_stream("counter", sfs.OpenMode.READ)
         assert f.read(h, 1) == b"\x05"
         f.close_stream(h)
@@ -117,7 +117,7 @@ class TestSingleFilePersistence:
         f.close_stream(h)
         f.close()
 
-        f = sfs.Sfs.open(sfs_path)
+        f = sfs.Sfs.open(sfs_path, sfs.OpenMode.WRITE)
         h = f.open_stream("big", sfs.OpenMode.READ)
         length = f.stream_length(h)
         assert length == len(data)
@@ -142,7 +142,7 @@ class TestBlockParameters:
         f.close_stream(h)
         f.close()
 
-        f = sfs.Sfs.open(sfs_path)
+        f = sfs.Sfs.open(sfs_path, sfs.OpenMode.WRITE)
         h = f.open_stream("data/test", sfs.OpenMode.READ)
         readback = f.read(h, f.stream_length(h))
         assert readback == content
@@ -163,7 +163,7 @@ class TestBlockParameters:
         f.close_stream(h)
         f.close()
 
-        f = sfs.Sfs.open(sfs_path)
+        f = sfs.Sfs.open(sfs_path, sfs.OpenMode.WRITE)
         h = f.open_stream("test", sfs.OpenMode.READ)
         readback = f.read(h, f.stream_length(h))
         assert readback == content
@@ -180,9 +180,9 @@ class TestProcessLocking:
         f = sfs.Sfs.create(sfs_path)
         f.close()
 
-        f1 = sfs.Sfs.open(sfs_path)
+        f1 = sfs.Sfs.open(sfs_path, sfs.OpenMode.WRITE)
         with pytest.raises(sfs.SfsError, match="locked"):
-            sfs.Sfs.open(sfs_path)
+            sfs.Sfs.open(sfs_path, sfs.OpenMode.WRITE)
         f1.close()
 
     def test_reopen_after_close_succeeds(self, tmp_path):
@@ -191,10 +191,10 @@ class TestProcessLocking:
         f = sfs.Sfs.create(sfs_path)
         f.close()
 
-        f = sfs.Sfs.open(sfs_path)
+        f = sfs.Sfs.open(sfs_path, sfs.OpenMode.WRITE)
         f.close()
 
-        f = sfs.Sfs.open(sfs_path)
+        f = sfs.Sfs.open(sfs_path, sfs.OpenMode.WRITE)
         f.close()
 
     def test_create_on_existing_file_fails(self, tmp_path):

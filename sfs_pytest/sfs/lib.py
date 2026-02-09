@@ -48,7 +48,7 @@ def _load_library():
 
     # --- SFS file lifecycle ---
     lib.sfs_create.restype = ctypes.c_void_p
-    lib.sfs_create.argtypes = [ctypes.c_char_p]
+    lib.sfs_create.argtypes = [ctypes.c_char_p, ctypes.c_uint8, ctypes.c_uint8]
 
     lib.sfs_open.restype = ctypes.c_void_p
     lib.sfs_open.argtypes = [ctypes.c_char_p]

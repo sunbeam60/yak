@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::fmt;
-use std::fs;
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::sync::Mutex;
+
+use crate::stream_layer::StreamLayer;
 
 #[derive(Debug)]
 pub enum SfsError {
@@ -63,68 +63,196 @@ impl StreamHandle {
     }
 }
 
-/// Internal state for an open stream.
-struct OpenStream {
-    path: String,
-    file: fs::File,
+// ---------------------------------------------------------------------------
+// Directory stream entry serialization
+// ---------------------------------------------------------------------------
+
+/// An entry inside a directory stream.
+struct StreamEntry {
+    id: u64,
+    name: String,
+}
+
+/// Serialize a single stream entry to bytes.
+/// Format: | length: u16 | identifier: [u8; block_index_width] | name: [u8] |
+fn serialize_entry(entry: &StreamEntry, block_index_width: u8) -> Vec<u8> {
+    let biw = block_index_width as usize;
+    let name_bytes = entry.name.as_bytes();
+    let length: u16 = (2 + biw + name_bytes.len()) as u16;
+    let mut buf = Vec::with_capacity(length as usize);
+    buf.extend_from_slice(&length.to_le_bytes());
+    let id_bytes = entry.id.to_le_bytes();
+    buf.extend_from_slice(&id_bytes[..biw]);
+    buf.extend_from_slice(name_bytes);
+    buf
+}
+
+/// Serialize a list of stream entries to bytes.
+fn serialize_entries(entries: &[StreamEntry], block_index_width: u8) -> Vec<u8> {
+    let mut buf = Vec::new();
+    for entry in entries {
+        buf.extend_from_slice(&serialize_entry(entry, block_index_width));
+    }
+    buf
+}
+
+/// Parse stream entries from a byte buffer.
+fn parse_entries(data: &[u8], block_index_width: u8) -> Result<Vec<StreamEntry>, SfsError> {
+    let biw = block_index_width as usize;
+    let min_entry_len = 2 + biw;
+    let mut entries = Vec::new();
+    let mut pos = 0;
+    while pos < data.len() {
+        if pos + 2 > data.len() {
+            return Err(SfsError::IoError(
+                "truncated entry length in directory stream".to_string(),
+            ));
+        }
+        let length = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+        if length < min_entry_len {
+            return Err(SfsError::IoError(
+                "invalid entry length in directory stream".to_string(),
+            ));
+        }
+        if pos + length > data.len() {
+            return Err(SfsError::IoError(
+                "truncated entry in directory stream".to_string(),
+            ));
+        }
+        // Read identifier as u64, zero-extending from block_index_width bytes
+        let mut id_bytes = [0u8; 8];
+        id_bytes[..biw].copy_from_slice(&data[pos + 2..pos + 2 + biw]);
+        let id = u64::from_le_bytes(id_bytes);
+        let name = std::str::from_utf8(&data[pos + 2 + biw..pos + length])
+            .map_err(|e| SfsError::IoError(format!("invalid UTF-8 in entry name: {}", e)))?
+            .to_string();
+        entries.push(StreamEntry { id, name });
+        pos += length;
+    }
+    Ok(entries)
+}
+
+// ---------------------------------------------------------------------------
+// Path utilities
+// ---------------------------------------------------------------------------
+
+fn validate_path(path: &str) -> Result<(), SfsError> {
+    if path.starts_with('/') || path.ends_with('/') {
+        return Err(SfsError::InvalidPath(
+            "path must not start or end with /".to_string(),
+        ));
+    }
+    for component in path.split('/') {
+        if component.is_empty() {
+            return Err(SfsError::InvalidPath(
+                "path contains empty component".to_string(),
+            ));
+        }
+        if component == "." || component == ".." {
+            return Err(SfsError::InvalidPath(
+                "path cannot contain . or ..".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Split "a/b/c" into ("a/b", "c"). Split "c" into ("", "c").
+fn split_parent_leaf(path: &str) -> (String, String) {
+    match path.rsplit_once('/') {
+        Some((parent, leaf)) => (parent.to_string(), leaf.to_string()),
+        None => (String::new(), path.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// L4 internal state
+// ---------------------------------------------------------------------------
+
+/// Internal state for an open stream at the L4 level.
+struct OpenStreamInfo<H: Copy> {
+    _path: String,
+    stream_id: u64,
+    l3_handle: H,
     position: u64,
     mode: OpenMode,
 }
 
-/// Per-stream lock state tracking.
-#[derive(Default)]
-struct LockState {
-    readers: u32,
-    has_writer: bool,
-}
-
-/// Represents an open SFS file (L4 mock backed by real filesystem).
-pub struct Sfs {
-    root: PathBuf,
+/// L4 bookkeeping state protected by a Mutex.
+struct SfsState<H: Copy> {
     next_handle_id: u64,
-    open_streams: HashMap<u64, OpenStream>,
-    locks: HashMap<String, LockState>,
+    open_streams: HashMap<u64, OpenStreamInfo<H>>,
 }
 
-impl Sfs {
-    /// Create a new SFS file. The path is used directly as the directory name.
-    /// For example, `create("mydata.sfs")` creates a directory called `mydata.sfs/`.
-    pub fn create(path: &str) -> Result<Sfs, SfsError> {
-        let sfs_path = PathBuf::from(path);
-        if sfs_path.exists() {
-            return Err(SfsError::AlreadyExists(sfs_path.display().to_string()));
-        }
-        fs::create_dir(&sfs_path).map_err(|e| SfsError::IoError(e.to_string()))?;
+/// Represents an open SFS file. Generic over the L3 stream layer.
+///
+/// Thread-safe: L3 is accessed via `&self`, and L4 bookkeeping is behind
+/// a `Mutex`. All public methods take `&self`.
+pub struct Sfs<L3: StreamLayer> {
+    layer3: L3,
+    root_dir_stream_id: u64,
+    state: Mutex<SfsState<L3::Handle>>,
+}
+
+impl<L3: StreamLayer> Sfs<L3> {
+    // -------------------------------------------------------------------
+    // SFS file lifecycle
+    // -------------------------------------------------------------------
+
+    /// Create a new SFS file. The path is used directly as the storage name.
+    ///
+    /// `block_index_width` is the number of bytes used for block indices
+    /// on disk (e.g. 2, 4, or 8).
+    /// `block_size_shift` is the power-of-2 exponent for block size
+    /// (e.g. 12 → 4096 bytes).
+    pub fn create(
+        path: &str,
+        block_index_width: u8,
+        block_size_shift: u8,
+    ) -> Result<Self, SfsError> {
+        let layer3 = L3::create(path, block_index_width, block_size_shift)?;
+        let root_id = layer3.create_stream()?;
         Ok(Sfs {
-            root: sfs_path,
-            next_handle_id: 0,
-            open_streams: HashMap::new(),
-            locks: HashMap::new(),
+            layer3,
+            root_dir_stream_id: root_id,
+            state: Mutex::new(SfsState {
+                next_handle_id: 0,
+                open_streams: HashMap::new(),
+            }),
         })
     }
 
     /// Open an existing SFS file.
-    pub fn open(path: &str) -> Result<Sfs, SfsError> {
-        let sfs_path = PathBuf::from(path);
-        if !sfs_path.is_dir() {
-            return Err(SfsError::NotFound(sfs_path.display().to_string()));
-        }
+    pub fn open(path: &str) -> Result<Self, SfsError> {
+        let layer3 = L3::open(path)?;
         Ok(Sfs {
-            root: sfs_path,
-            next_handle_id: 0,
-            open_streams: HashMap::new(),
-            locks: HashMap::new(),
+            layer3,
+            root_dir_stream_id: 0,
+            state: Mutex::new(SfsState {
+                next_handle_id: 0,
+                open_streams: HashMap::new(),
+            }),
         })
     }
 
     /// Close the SFS file. Consumes self.
     pub fn close(self) {
-        // Mock: dropping self closes all file handles via HashMap drop.
+        // Dropping self closes all handles via HashMap drop.
     }
 
-    // -----------------------------------------------------------------------
+    /// The number of bytes used for block indices on disk.
+    pub fn block_index_width(&self) -> u8 {
+        self.layer3.block_index_width()
+    }
+
+    /// Block size as a power of 2 (e.g. 12 → 4096 bytes).
+    pub fn block_size_shift(&self) -> u8 {
+        self.layer3.block_size_shift()
+    }
+
+    // -------------------------------------------------------------------
     // Directory operations
-    // -----------------------------------------------------------------------
+    // -------------------------------------------------------------------
 
     /// Create a directory. Parent directories must already exist.
     pub fn mkdir(&self, path: &str) -> Result<(), SfsError> {
@@ -133,18 +261,39 @@ impl Sfs {
                 "cannot create root directory".to_string(),
             ));
         }
-        let full_path = self.resolve_path(path)?;
-        if full_path.exists() {
+        validate_path(path)?;
+
+        let biw = self.layer3.block_index_width();
+        let (parent_path, leaf) = split_parent_leaf(path);
+        let parent_id = self.resolve_dir_stream_id(&parent_path)?;
+        let dir_entry_name = format!("{}/", leaf);
+
+        // Open parent dir stream for writing (exclusive)
+        let parent_handle = self.layer3.open_stream(parent_id, OpenMode::Write)?;
+
+        // Read existing entries and check for duplicates
+        let entries = self.read_entries_from_handle(&parent_handle)?;
+        if entries
+            .iter()
+            .any(|e| e.name == dir_entry_name || e.name == leaf)
+        {
+            self.layer3.close_stream(parent_handle)?;
             return Err(SfsError::AlreadyExists(path.to_string()));
         }
-        if let Some(parent) = full_path.parent() {
-            if !parent.exists() {
-                return Err(SfsError::NotFound(
-                    "parent directory does not exist".to_string(),
-                ));
-            }
-        }
-        fs::create_dir(&full_path).map_err(|e| SfsError::IoError(e.to_string()))?;
+
+        // Create new empty directory stream
+        let new_dir_id = self.layer3.create_stream()?;
+
+        // Append entry to parent
+        let entry = StreamEntry {
+            id: new_dir_id,
+            name: dir_entry_name,
+        };
+        let entry_buf = serialize_entry(&entry, biw);
+        let len = self.layer3.stream_length(&parent_handle)?;
+        self.layer3.write(&parent_handle, len, &entry_buf)?;
+
+        self.layer3.close_stream(parent_handle)?;
         Ok(())
     }
 
@@ -155,55 +304,83 @@ impl Sfs {
                 "cannot remove root directory".to_string(),
             ));
         }
-        let full_path = self.resolve_path(path)?;
-        if !full_path.is_dir() {
+        validate_path(path)?;
+
+        let biw = self.layer3.block_index_width();
+        let (parent_path, leaf) = split_parent_leaf(path);
+        let parent_id = self.resolve_dir_stream_id(&parent_path)?;
+        let dir_entry_name = format!("{}/", leaf);
+
+        // Open parent for writing
+        let parent_handle = self.layer3.open_stream(parent_id, OpenMode::Write)?;
+        let entries = self.read_entries_from_handle(&parent_handle)?;
+
+        let entry = entries.iter().find(|e| e.name == dir_entry_name);
+        if entry.is_none() {
+            self.layer3.close_stream(parent_handle)?;
             return Err(SfsError::NotFound(path.to_string()));
         }
-        let has_entries = fs::read_dir(&full_path)
-            .map_err(|e| SfsError::IoError(e.to_string()))?
-            .next()
-            .is_some();
-        if has_entries {
+        let dir_stream_id = entry.unwrap().id;
+
+        // Check that directory is empty (different stream, no lock conflict)
+        let child_handle = self.layer3.open_stream(dir_stream_id, OpenMode::Read)?;
+        let child_len = self.layer3.stream_length(&child_handle)?;
+        self.layer3.close_stream(child_handle)?;
+
+        if child_len > 0 {
+            self.layer3.close_stream(parent_handle)?;
             return Err(SfsError::NotEmpty(path.to_string()));
         }
-        fs::remove_dir(&full_path).map_err(|e| SfsError::IoError(e.to_string()))?;
+
+        // Remove entry from parent
+        let remaining: Vec<StreamEntry> = entries
+            .into_iter()
+            .filter(|e| e.name != dir_entry_name)
+            .collect();
+        let new_buf = serialize_entries(&remaining, biw);
+        self.layer3.truncate(&parent_handle, 0)?;
+        if !new_buf.is_empty() {
+            self.layer3.write(&parent_handle, 0, &new_buf)?;
+        }
+        self.layer3.close_stream(parent_handle)?;
+
+        // Delete the directory stream
+        self.layer3.delete_stream(dir_stream_id)?;
         Ok(())
     }
 
     /// List the contents of a directory. Use "" for root.
     pub fn list(&self, path: &str) -> Result<Vec<DirEntry>, SfsError> {
-        let full_path = if path.is_empty() {
-            self.root.clone()
+        let dir_id = if path.is_empty() {
+            self.root_dir_stream_id
         } else {
-            self.resolve_path(path)?
+            validate_path(path)?;
+            self.resolve_dir_stream_id(path)?
         };
 
-        if !full_path.is_dir() {
-            return Err(SfsError::NotFound(
-                if path.is_empty() {
-                    "root".to_string()
-                } else {
-                    path.to_string()
-                },
-            ));
-        }
+        let handle = self.layer3.open_stream(dir_id, OpenMode::Read)?;
+        let entries = self.read_entries_from_handle(&handle)?;
+        self.layer3.close_stream(handle)?;
 
-        let mut entries = Vec::new();
-        for entry in fs::read_dir(&full_path).map_err(|e| SfsError::IoError(e.to_string()))? {
-            let entry = entry.map_err(|e| SfsError::IoError(e.to_string()))?;
-            let file_type = entry
-                .file_type()
-                .map_err(|e| SfsError::IoError(e.to_string()))?;
-            let name = entry.file_name().to_string_lossy().to_string();
-            let entry_type = if file_type.is_dir() {
-                EntryType::Directory
-            } else {
-                EntryType::Stream
-            };
-            entries.push(DirEntry { name, entry_type });
-        }
-        entries.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(entries)
+        let mut result: Vec<DirEntry> = entries
+            .iter()
+            .map(|e| {
+                if e.name.ends_with('/') {
+                    DirEntry {
+                        name: e.name[..e.name.len() - 1].to_string(),
+                        entry_type: EntryType::Directory,
+                    }
+                } else {
+                    DirEntry {
+                        name: e.name.clone(),
+                        entry_type: EntryType::Stream,
+                    }
+                }
+            })
+            .collect();
+
+        result.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(result)
     }
 
     /// Rename/move a directory. Fails if destination already exists.
@@ -213,67 +390,159 @@ impl Sfs {
                 "cannot rename root directory".to_string(),
             ));
         }
-        let old_full = self.resolve_path(old_path)?;
-        let new_full = self.resolve_path(new_path)?;
-        if !old_full.is_dir() {
-            return Err(SfsError::NotFound(old_path.to_string()));
-        }
-        if new_full.exists() {
-            return Err(SfsError::AlreadyExists(new_path.to_string()));
-        }
-        if let Some(parent) = new_full.parent() {
-            if !parent.exists() {
-                return Err(SfsError::NotFound(
-                    "destination parent directory does not exist".to_string(),
-                ));
+        validate_path(old_path)?;
+        validate_path(new_path)?;
+
+        let biw = self.layer3.block_index_width();
+        let (old_parent_path, old_leaf) = split_parent_leaf(old_path);
+        let (new_parent_path, new_leaf) = split_parent_leaf(new_path);
+        let old_dir_name = format!("{}/", old_leaf);
+        let new_dir_name = format!("{}/", new_leaf);
+
+        let old_parent_id = self.resolve_dir_stream_id(&old_parent_path)?;
+        let new_parent_id = self.resolve_dir_stream_id(&new_parent_path)?;
+
+        if old_parent_id == new_parent_id {
+            // Same parent: rename entry in place
+            let handle = self.layer3.open_stream(old_parent_id, OpenMode::Write)?;
+            let entries = self.read_entries_from_handle(&handle)?;
+
+            let old_entry = entries.iter().find(|e| e.name == old_dir_name);
+            if old_entry.is_none() {
+                self.layer3.close_stream(handle)?;
+                return Err(SfsError::NotFound(old_path.to_string()));
             }
+            let stream_id = old_entry.unwrap().id;
+
+            if entries
+                .iter()
+                .any(|e| e.name == new_dir_name || e.name == new_leaf)
+            {
+                self.layer3.close_stream(handle)?;
+                return Err(SfsError::AlreadyExists(new_path.to_string()));
+            }
+
+            // Per architecture: rename = delete old + re-add at end
+            let mut remaining: Vec<StreamEntry> = entries
+                .into_iter()
+                .filter(|e| e.name != old_dir_name)
+                .collect();
+            remaining.push(StreamEntry {
+                id: stream_id,
+                name: new_dir_name,
+            });
+
+            let buf = serialize_entries(&remaining, biw);
+            self.layer3.truncate(&handle, 0)?;
+            if !buf.is_empty() {
+                self.layer3.write(&handle, 0, &buf)?;
+            }
+            self.layer3.close_stream(handle)?;
+        } else {
+            // Different parents: remove from old, add to new
+            let old_handle = self.layer3.open_stream(old_parent_id, OpenMode::Write)?;
+            let old_entries = self.read_entries_from_handle(&old_handle)?;
+
+            let old_entry = old_entries.iter().find(|e| e.name == old_dir_name);
+            if old_entry.is_none() {
+                self.layer3.close_stream(old_handle)?;
+                return Err(SfsError::NotFound(old_path.to_string()));
+            }
+            let stream_id = old_entry.unwrap().id;
+
+            let remaining: Vec<StreamEntry> = old_entries
+                .into_iter()
+                .filter(|e| e.name != old_dir_name)
+                .collect();
+            let buf = serialize_entries(&remaining, biw);
+            self.layer3.truncate(&old_handle, 0)?;
+            if !buf.is_empty() {
+                self.layer3.write(&old_handle, 0, &buf)?;
+            }
+            self.layer3.close_stream(old_handle)?;
+
+            // Add to new parent
+            let new_handle = self.layer3.open_stream(new_parent_id, OpenMode::Write)?;
+            let new_entries = self.read_entries_from_handle(&new_handle)?;
+
+            if new_entries
+                .iter()
+                .any(|e| e.name == new_dir_name || e.name == new_leaf)
+            {
+                self.layer3.close_stream(new_handle)?;
+                return Err(SfsError::AlreadyExists(new_path.to_string()));
+            }
+
+            let entry = StreamEntry {
+                id: stream_id,
+                name: new_dir_name,
+            };
+            let entry_buf = serialize_entry(&entry, biw);
+            let len = self.layer3.stream_length(&new_handle)?;
+            self.layer3.write(&new_handle, len, &entry_buf)?;
+            self.layer3.close_stream(new_handle)?;
         }
-        fs::rename(&old_full, &new_full).map_err(|e| SfsError::IoError(e.to_string()))?;
+
         Ok(())
     }
 
-    // -----------------------------------------------------------------------
+    // -------------------------------------------------------------------
     // Stream lifecycle
-    // -----------------------------------------------------------------------
+    // -------------------------------------------------------------------
 
     /// Create a new stream and open it for writing.
     /// Returns a handle positioned at byte 0.
-    pub fn create_stream(&mut self, path: &str) -> Result<StreamHandle, SfsError> {
+    pub fn create_stream(&self, path: &str) -> Result<StreamHandle, SfsError> {
         if path.is_empty() {
             return Err(SfsError::InvalidPath(
                 "stream path cannot be empty".to_string(),
             ));
         }
-        let full_path = self.resolve_path(path)?;
-        if full_path.exists() {
+        validate_path(path)?;
+
+        let biw = self.layer3.block_index_width();
+        let (parent_path, leaf) = split_parent_leaf(path);
+        let parent_id = self.resolve_dir_stream_id(&parent_path)?;
+        let dir_entry_name = format!("{}/", leaf);
+
+        // Open parent dir stream for writing
+        let parent_handle = self.layer3.open_stream(parent_id, OpenMode::Write)?;
+        let entries = self.read_entries_from_handle(&parent_handle)?;
+
+        // Check for duplicates (stream or directory with same name)
+        if entries
+            .iter()
+            .any(|e| e.name == leaf || e.name == dir_entry_name)
+        {
+            self.layer3.close_stream(parent_handle)?;
             return Err(SfsError::AlreadyExists(path.to_string()));
         }
-        if let Some(parent) = full_path.parent() {
-            if !parent.exists() {
-                return Err(SfsError::NotFound(
-                    "parent directory does not exist".to_string(),
-                ));
-            }
-        }
 
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&full_path)
-            .map_err(|e| SfsError::IoError(e.to_string()))?;
+        // Create new data stream in L3
+        let new_stream_id = self.layer3.create_stream()?;
 
-        let handle_id = self.next_handle_id;
-        self.next_handle_id += 1;
+        // Add entry to parent directory stream
+        let entry = StreamEntry {
+            id: new_stream_id,
+            name: leaf.to_string(),
+        };
+        let entry_buf = serialize_entry(&entry, biw);
+        let len = self.layer3.stream_length(&parent_handle)?;
+        self.layer3.write(&parent_handle, len, &entry_buf)?;
+        self.layer3.close_stream(parent_handle)?;
 
-        let lock = self.locks.entry(path.to_string()).or_default();
-        lock.has_writer = true;
+        // Open the new data stream for writing
+        let l3_handle = self.layer3.open_stream(new_stream_id, OpenMode::Write)?;
 
-        self.open_streams.insert(
+        let mut state = self.state.lock().unwrap();
+        let handle_id = state.next_handle_id;
+        state.next_handle_id += 1;
+        state.open_streams.insert(
             handle_id,
-            OpenStream {
-                path: path.to_string(),
-                file,
+            OpenStreamInfo {
+                _path: path.to_string(),
+                stream_id: new_stream_id,
+                l3_handle,
                 position: 0,
                 mode: OpenMode::Write,
             },
@@ -285,7 +554,7 @@ impl Sfs {
     /// Open an existing stream for reading or writing.
     /// Returns a handle positioned at byte 0.
     pub fn open_stream(
-        &mut self,
+        &self,
         path: &str,
         mode: OpenMode,
     ) -> Result<StreamHandle, SfsError> {
@@ -294,55 +563,34 @@ impl Sfs {
                 "stream path cannot be empty".to_string(),
             ));
         }
-        let full_path = self.resolve_path(path)?;
-        if !full_path.is_file() {
-            return Err(SfsError::NotFound(path.to_string()));
-        }
+        validate_path(path)?;
 
-        // Check locking
-        let lock = self.locks.entry(path.to_string()).or_default();
-        match mode {
-            OpenMode::Read => {
-                if lock.has_writer {
-                    return Err(SfsError::LockConflict(
-                        "stream is opened for writing".to_string(),
-                    ));
-                }
-                lock.readers += 1;
-            }
-            OpenMode::Write => {
-                if lock.has_writer {
-                    return Err(SfsError::LockConflict(
-                        "stream is already opened for writing".to_string(),
-                    ));
-                }
-                if lock.readers > 0 {
-                    return Err(SfsError::LockConflict(
-                        "stream has active readers".to_string(),
-                    ));
-                }
-                lock.has_writer = true;
-            }
-        }
+        let (parent_path, leaf) = split_parent_leaf(path);
+        let parent_id = self.resolve_dir_stream_id(&parent_path)?;
 
-        let file = match mode {
-            OpenMode::Read => fs::File::open(&full_path)
-                .map_err(|e| SfsError::IoError(e.to_string()))?,
-            OpenMode::Write => fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&full_path)
-                .map_err(|e| SfsError::IoError(e.to_string()))?,
-        };
+        // Read parent dir to find the stream ID
+        let parent_handle = self.layer3.open_stream(parent_id, OpenMode::Read)?;
+        let entries = self.read_entries_from_handle(&parent_handle)?;
+        self.layer3.close_stream(parent_handle)?;
 
-        let handle_id = self.next_handle_id;
-        self.next_handle_id += 1;
+        let entry = entries
+            .iter()
+            .find(|e| e.name == leaf)
+            .ok_or_else(|| SfsError::NotFound(path.to_string()))?;
+        let stream_id = entry.id;
 
-        self.open_streams.insert(
+        // Open via L3 (L3 handles locking)
+        let l3_handle = self.layer3.open_stream(stream_id, mode)?;
+
+        let mut state = self.state.lock().unwrap();
+        let handle_id = state.next_handle_id;
+        state.next_handle_id += 1;
+        state.open_streams.insert(
             handle_id,
-            OpenStream {
-                path: path.to_string(),
-                file,
+            OpenStreamInfo {
+                _path: path.to_string(),
+                stream_id,
+                l3_handle,
                 position: 0,
                 mode,
             },
@@ -352,156 +600,273 @@ impl Sfs {
     }
 
     /// Close a stream handle.
-    pub fn close_stream(&mut self, handle: StreamHandle) -> Result<(), SfsError> {
-        let stream = self
-            .open_streams
-            .remove(&handle.0)
-            .ok_or_else(|| SfsError::NotFound("invalid stream handle".to_string()))?;
+    pub fn close_stream(&self, handle: StreamHandle) -> Result<(), SfsError> {
+        let l3_handle = {
+            let mut state = self.state.lock().unwrap();
+            let info = state
+                .open_streams
+                .remove(&handle.0)
+                .ok_or_else(|| SfsError::NotFound("invalid stream handle".to_string()))?;
+            info.l3_handle
+        };
 
-        if let Some(lock) = self.locks.get_mut(&stream.path) {
-            match stream.mode {
-                OpenMode::Read => {
-                    lock.readers = lock.readers.saturating_sub(1);
-                }
-                OpenMode::Write => {
-                    lock.has_writer = false;
-                }
-            }
-            if lock.readers == 0 && !lock.has_writer {
-                self.locks.remove(&stream.path);
-            }
-        }
-
+        self.layer3.close_stream(l3_handle)?;
         Ok(())
     }
 
     /// Delete a stream. Must not be currently open.
-    pub fn delete_stream(&mut self, path: &str) -> Result<(), SfsError> {
+    pub fn delete_stream(&self, path: &str) -> Result<(), SfsError> {
         if path.is_empty() {
             return Err(SfsError::InvalidPath(
                 "stream path cannot be empty".to_string(),
             ));
         }
-        let full_path = self.resolve_path(path)?;
-        if !full_path.is_file() {
+        validate_path(path)?;
+
+        let biw = self.layer3.block_index_width();
+        let (parent_path, leaf) = split_parent_leaf(path);
+        let parent_id = self.resolve_dir_stream_id(&parent_path)?;
+
+        // Open parent for writing
+        let parent_handle = self.layer3.open_stream(parent_id, OpenMode::Write)?;
+        let entries = self.read_entries_from_handle(&parent_handle)?;
+
+        let entry = entries.iter().find(|e| e.name == leaf);
+        if entry.is_none() {
+            self.layer3.close_stream(parent_handle)?;
             return Err(SfsError::NotFound(path.to_string()));
         }
+        let stream_id = entry.unwrap().id;
 
-        if let Some(lock) = self.locks.get(path) {
-            if lock.has_writer || lock.readers > 0 {
+        // Check if stream is currently open at L4 level
+        {
+            let state = self.state.lock().unwrap();
+            if state
+                .open_streams
+                .values()
+                .any(|s| s.stream_id == stream_id)
+            {
+                drop(state);
+                self.layer3.close_stream(parent_handle)?;
                 return Err(SfsError::LockConflict(
                     "cannot delete an open stream".to_string(),
                 ));
             }
         }
 
-        fs::remove_file(&full_path).map_err(|e| SfsError::IoError(e.to_string()))?;
+        // Remove entry from parent
+        let remaining: Vec<StreamEntry> = entries
+            .into_iter()
+            .filter(|e| e.name != leaf)
+            .collect();
+        let buf = serialize_entries(&remaining, biw);
+        self.layer3.truncate(&parent_handle, 0)?;
+        if !buf.is_empty() {
+            self.layer3.write(&parent_handle, 0, &buf)?;
+        }
+        self.layer3.close_stream(parent_handle)?;
+
+        // Delete the stream in L3
+        self.layer3.delete_stream(stream_id)?;
         Ok(())
     }
 
     /// Rename/move a stream. Must not be currently open.
-    pub fn rename_stream(&mut self, old_path: &str, new_path: &str) -> Result<(), SfsError> {
+    pub fn rename_stream(&self, old_path: &str, new_path: &str) -> Result<(), SfsError> {
         if old_path.is_empty() || new_path.is_empty() {
             return Err(SfsError::InvalidPath(
                 "stream path cannot be empty".to_string(),
             ));
         }
-        let old_full = self.resolve_path(old_path)?;
-        let new_full = self.resolve_path(new_path)?;
-        if !old_full.is_file() {
-            return Err(SfsError::NotFound(old_path.to_string()));
-        }
-        if new_full.exists() {
-            return Err(SfsError::AlreadyExists(new_path.to_string()));
-        }
+        validate_path(old_path)?;
+        validate_path(new_path)?;
 
-        if let Some(lock) = self.locks.get(old_path) {
-            if lock.has_writer || lock.readers > 0 {
-                return Err(SfsError::LockConflict(
-                    "cannot rename an open stream".to_string(),
-                ));
+        let biw = self.layer3.block_index_width();
+        let (old_parent_path, old_leaf) = split_parent_leaf(old_path);
+        let (new_parent_path, new_leaf) = split_parent_leaf(new_path);
+
+        let old_parent_id = self.resolve_dir_stream_id(&old_parent_path)?;
+        let new_parent_id = self.resolve_dir_stream_id(&new_parent_path)?;
+
+        if old_parent_id == new_parent_id {
+            // Same parent
+            let handle = self.layer3.open_stream(old_parent_id, OpenMode::Write)?;
+            let entries = self.read_entries_from_handle(&handle)?;
+
+            let old_entry = entries.iter().find(|e| e.name == old_leaf);
+            if old_entry.is_none() {
+                self.layer3.close_stream(handle)?;
+                return Err(SfsError::NotFound(old_path.to_string()));
             }
-        }
+            let stream_id = old_entry.unwrap().id;
 
-        if let Some(parent) = new_full.parent() {
-            if !parent.exists() {
-                return Err(SfsError::NotFound(
-                    "destination parent directory does not exist".to_string(),
-                ));
+            // Check if stream is currently open
+            {
+                let state = self.state.lock().unwrap();
+                if state
+                    .open_streams
+                    .values()
+                    .any(|s| s.stream_id == stream_id)
+                {
+                    drop(state);
+                    self.layer3.close_stream(handle)?;
+                    return Err(SfsError::LockConflict(
+                        "cannot rename an open stream".to_string(),
+                    ));
+                }
             }
+
+            let new_dir_name = format!("{}/", new_leaf);
+            if entries
+                .iter()
+                .any(|e| e.name == new_leaf || e.name == new_dir_name)
+            {
+                self.layer3.close_stream(handle)?;
+                return Err(SfsError::AlreadyExists(new_path.to_string()));
+            }
+
+            let mut remaining: Vec<StreamEntry> = entries
+                .into_iter()
+                .filter(|e| e.name != old_leaf)
+                .collect();
+            remaining.push(StreamEntry {
+                id: stream_id,
+                name: new_leaf.to_string(),
+            });
+
+            let buf = serialize_entries(&remaining, biw);
+            self.layer3.truncate(&handle, 0)?;
+            if !buf.is_empty() {
+                self.layer3.write(&handle, 0, &buf)?;
+            }
+            self.layer3.close_stream(handle)?;
+        } else {
+            // Different parents
+            let old_handle = self.layer3.open_stream(old_parent_id, OpenMode::Write)?;
+            let old_entries = self.read_entries_from_handle(&old_handle)?;
+
+            let old_entry = old_entries.iter().find(|e| e.name == old_leaf);
+            if old_entry.is_none() {
+                self.layer3.close_stream(old_handle)?;
+                return Err(SfsError::NotFound(old_path.to_string()));
+            }
+            let stream_id = old_entry.unwrap().id;
+
+            {
+                let state = self.state.lock().unwrap();
+                if state
+                    .open_streams
+                    .values()
+                    .any(|s| s.stream_id == stream_id)
+                {
+                    drop(state);
+                    self.layer3.close_stream(old_handle)?;
+                    return Err(SfsError::LockConflict(
+                        "cannot rename an open stream".to_string(),
+                    ));
+                }
+            }
+
+            let remaining: Vec<StreamEntry> = old_entries
+                .into_iter()
+                .filter(|e| e.name != old_leaf)
+                .collect();
+            let buf = serialize_entries(&remaining, biw);
+            self.layer3.truncate(&old_handle, 0)?;
+            if !buf.is_empty() {
+                self.layer3.write(&old_handle, 0, &buf)?;
+            }
+            self.layer3.close_stream(old_handle)?;
+
+            let new_handle = self.layer3.open_stream(new_parent_id, OpenMode::Write)?;
+            let new_entries = self.read_entries_from_handle(&new_handle)?;
+
+            let new_dir_name = format!("{}/", new_leaf);
+            if new_entries
+                .iter()
+                .any(|e| e.name == new_leaf || e.name == new_dir_name)
+            {
+                self.layer3.close_stream(new_handle)?;
+                return Err(SfsError::AlreadyExists(new_path.to_string()));
+            }
+
+            let entry = StreamEntry {
+                id: stream_id,
+                name: new_leaf.to_string(),
+            };
+            let entry_buf = serialize_entry(&entry, biw);
+            let len = self.layer3.stream_length(&new_handle)?;
+            self.layer3.write(&new_handle, len, &entry_buf)?;
+            self.layer3.close_stream(new_handle)?;
         }
 
-        fs::rename(&old_full, &new_full).map_err(|e| SfsError::IoError(e.to_string()))?;
         Ok(())
     }
 
-    // -----------------------------------------------------------------------
+    // -------------------------------------------------------------------
     // Stream I/O
-    // -----------------------------------------------------------------------
+    // -------------------------------------------------------------------
 
     /// Read up to buf.len() bytes from the current head position.
     /// Advances the head position by the number of bytes read.
-    pub fn read(&mut self, handle: &StreamHandle, buf: &mut [u8]) -> Result<usize, SfsError> {
-        let stream = self
-            .open_streams
-            .get_mut(&handle.0)
-            .ok_or_else(|| SfsError::NotFound("invalid stream handle".to_string()))?;
+    pub fn read(&self, handle: &StreamHandle, buf: &mut [u8]) -> Result<usize, SfsError> {
+        let (l3_handle, pos) = {
+            let state = self.state.lock().unwrap();
+            let info = state
+                .open_streams
+                .get(&handle.0)
+                .ok_or_else(|| SfsError::NotFound("invalid stream handle".to_string()))?;
+            (info.l3_handle, info.position)
+        };
 
-        stream
-            .file
-            .seek(SeekFrom::Start(stream.position))
-            .map_err(|e| SfsError::IoError(e.to_string()))?;
+        let n = self.layer3.read(&l3_handle, pos, buf)?;
 
-        let n = stream
-            .file
-            .read(buf)
-            .map_err(|e| SfsError::IoError(e.to_string()))?;
-
-        stream.position += n as u64;
+        {
+            let mut state = self.state.lock().unwrap();
+            state.open_streams.get_mut(&handle.0).unwrap().position += n as u64;
+        }
         Ok(n)
     }
 
     /// Write buf to the stream at the current head position.
     /// Extends the stream if writing past the current end.
-    pub fn write(&mut self, handle: &StreamHandle, buf: &[u8]) -> Result<usize, SfsError> {
-        let stream = self
-            .open_streams
-            .get_mut(&handle.0)
-            .ok_or_else(|| SfsError::NotFound("invalid stream handle".to_string()))?;
+    pub fn write(&self, handle: &StreamHandle, buf: &[u8]) -> Result<usize, SfsError> {
+        let (l3_handle, pos, mode) = {
+            let state = self.state.lock().unwrap();
+            let info = state
+                .open_streams
+                .get(&handle.0)
+                .ok_or_else(|| SfsError::NotFound("invalid stream handle".to_string()))?;
+            (info.l3_handle, info.position, info.mode)
+        };
 
-        if stream.mode != OpenMode::Write {
+        if mode != OpenMode::Write {
             return Err(SfsError::LockConflict(
                 "stream is not opened for writing".to_string(),
             ));
         }
 
-        stream
-            .file
-            .seek(SeekFrom::Start(stream.position))
-            .map_err(|e| SfsError::IoError(e.to_string()))?;
+        let n = self.layer3.write(&l3_handle, pos, buf)?;
 
-        let n = stream
-            .file
-            .write(buf)
-            .map_err(|e| SfsError::IoError(e.to_string()))?;
-
-        stream.position += n as u64;
+        {
+            let mut state = self.state.lock().unwrap();
+            state.open_streams.get_mut(&handle.0).unwrap().position += n as u64;
+        }
         Ok(n)
     }
 
     /// Set the head position. Fails if pos > stream length.
-    pub fn seek(&mut self, handle: &StreamHandle, pos: u64) -> Result<(), SfsError> {
-        let stream = self
-            .open_streams
-            .get_mut(&handle.0)
-            .ok_or_else(|| SfsError::NotFound("invalid stream handle".to_string()))?;
+    pub fn seek(&self, handle: &StreamHandle, pos: u64) -> Result<(), SfsError> {
+        let l3_handle = {
+            let state = self.state.lock().unwrap();
+            let info = state
+                .open_streams
+                .get(&handle.0)
+                .ok_or_else(|| SfsError::NotFound("invalid stream handle".to_string()))?;
+            info.l3_handle
+        };
 
-        let len = stream
-            .file
-            .metadata()
-            .map_err(|e| SfsError::IoError(e.to_string()))?
-            .len();
-
+        let len = self.layer3.stream_length(&l3_handle)?;
         if pos > len {
             return Err(SfsError::SeekOutOfBounds(format!(
                 "position {} exceeds stream length {}",
@@ -509,84 +874,104 @@ impl Sfs {
             )));
         }
 
-        stream.position = pos;
+        {
+            let mut state = self.state.lock().unwrap();
+            state.open_streams.get_mut(&handle.0).unwrap().position = pos;
+        }
         Ok(())
     }
 
     /// Get the current head position.
     pub fn tell(&self, handle: &StreamHandle) -> Result<u64, SfsError> {
-        let stream = self
+        let state = self.state.lock().unwrap();
+        let info = state
             .open_streams
             .get(&handle.0)
             .ok_or_else(|| SfsError::NotFound("invalid stream handle".to_string()))?;
-        Ok(stream.position)
+        Ok(info.position)
     }
 
     /// Get the total length of the stream in bytes.
     pub fn stream_length(&self, handle: &StreamHandle) -> Result<u64, SfsError> {
-        let stream = self
-            .open_streams
-            .get(&handle.0)
-            .ok_or_else(|| SfsError::NotFound("invalid stream handle".to_string()))?;
-        let len = stream
-            .file
-            .metadata()
-            .map_err(|e| SfsError::IoError(e.to_string()))?
-            .len();
-        Ok(len)
+        let l3_handle = {
+            let state = self.state.lock().unwrap();
+            let info = state
+                .open_streams
+                .get(&handle.0)
+                .ok_or_else(|| SfsError::NotFound("invalid stream handle".to_string()))?;
+            info.l3_handle
+        };
+        self.layer3.stream_length(&l3_handle)
     }
 
     /// Truncate the stream to the given length.
     /// If head position > new_len, the position is moved to new_len.
-    pub fn truncate(&mut self, handle: &StreamHandle, new_len: u64) -> Result<(), SfsError> {
-        let stream = self
-            .open_streams
-            .get_mut(&handle.0)
-            .ok_or_else(|| SfsError::NotFound("invalid stream handle".to_string()))?;
+    pub fn truncate(&self, handle: &StreamHandle, new_len: u64) -> Result<(), SfsError> {
+        let (l3_handle, mode) = {
+            let state = self.state.lock().unwrap();
+            let info = state
+                .open_streams
+                .get(&handle.0)
+                .ok_or_else(|| SfsError::NotFound("invalid stream handle".to_string()))?;
+            (info.l3_handle, info.mode)
+        };
 
-        if stream.mode != OpenMode::Write {
+        if mode != OpenMode::Write {
             return Err(SfsError::LockConflict(
                 "stream is not opened for writing".to_string(),
             ));
         }
 
-        stream
-            .file
-            .set_len(new_len)
-            .map_err(|e| SfsError::IoError(e.to_string()))?;
+        self.layer3.truncate(&l3_handle, new_len)?;
 
-        if stream.position > new_len {
-            stream.position = new_len;
+        {
+            let mut state = self.state.lock().unwrap();
+            let info = state.open_streams.get_mut(&handle.0).unwrap();
+            if info.position > new_len {
+                info.position = new_len;
+            }
         }
-
         Ok(())
     }
 
-    // -----------------------------------------------------------------------
+    // -------------------------------------------------------------------
     // Internal helpers
-    // -----------------------------------------------------------------------
+    // -------------------------------------------------------------------
 
-    fn resolve_path(&self, path: &str) -> Result<PathBuf, SfsError> {
+    /// Walk directory streams to resolve a directory path to its stream ID.
+    /// Returns root_dir_stream_id for empty path.
+    fn resolve_dir_stream_id(&self, path: &str) -> Result<u64, SfsError> {
         if path.is_empty() {
-            return Ok(self.root.clone());
+            return Ok(self.root_dir_stream_id);
         }
-        if path.starts_with('/') || path.ends_with('/') {
-            return Err(SfsError::InvalidPath(
-                "path must not start or end with /".to_string(),
-            ));
-        }
+
+        let mut current_id = self.root_dir_stream_id;
         for component in path.split('/') {
-            if component.is_empty() {
-                return Err(SfsError::InvalidPath(
-                    "path contains empty component".to_string(),
-                ));
-            }
-            if component == "." || component == ".." {
-                return Err(SfsError::InvalidPath(
-                    "path cannot contain . or ..".to_string(),
-                ));
-            }
+            let dir_name = format!("{}/", component);
+            let handle = self.layer3.open_stream(current_id, OpenMode::Read)?;
+            let entries = self.read_entries_from_handle(&handle)?;
+            self.layer3.close_stream(handle)?;
+
+            let entry = entries.iter().find(|e| e.name == dir_name).ok_or_else(|| {
+                SfsError::NotFound(format!("parent directory does not exist"))
+            })?;
+            current_id = entry.id;
         }
-        Ok(self.root.join(path))
+
+        Ok(current_id)
+    }
+
+    /// Read and parse all directory stream entries from an already-open handle.
+    fn read_entries_from_handle(
+        &self,
+        handle: &L3::Handle,
+    ) -> Result<Vec<StreamEntry>, SfsError> {
+        let len = self.layer3.stream_length(handle)?;
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        let mut buf = vec![0u8; len as usize];
+        self.layer3.read(handle, 0, &mut buf)?;
+        parse_entries(&buf, self.layer3.block_index_width())
     }
 }

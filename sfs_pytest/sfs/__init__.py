@@ -48,9 +48,9 @@ class Sfs:
         self._handle = handle
 
     @staticmethod
-    def create(path: str) -> "Sfs":
+    def create(path: str, block_index_width: int = 4, block_size_shift: int = 12) -> "Sfs":
         """Create a new SFS file at the given path."""
-        handle = _lib.sfs_create(path.encode("utf-8"))
+        handle = _lib.sfs_create(path.encode("utf-8"), block_index_width, block_size_shift)
         if handle is None:
             _check_error()
         return Sfs(handle)

@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 
-use stream_fs::{EntryType, OpenMode, Sfs, StreamHandle};
+use stream_fs::{EntryType, OpenMode, SfsDefault as Sfs, StreamHandle};
 
 // ---------------------------------------------------------------------------
 // Thread-local error handling
@@ -76,12 +76,16 @@ pub unsafe extern "C" fn sfs_free_string(s: *mut c_char) {
 // ---------------------------------------------------------------------------
 
 #[no_mangle]
-pub extern "C" fn sfs_create(path: *const c_char) -> *mut c_void {
+pub extern "C" fn sfs_create(
+    path: *const c_char,
+    block_index_width: u8,
+    block_size_shift: u8,
+) -> *mut c_void {
     let path = match cstr_to_str(path) {
         Some(s) => s,
         None => return std::ptr::null_mut(),
     };
-    match Sfs::create(path) {
+    match Sfs::create(path, block_index_width, block_size_shift) {
         Ok(sfs) => Box::into_raw(Box::new(sfs)) as *mut c_void,
         Err(e) => {
             set_last_error(&e.to_string());
@@ -122,7 +126,7 @@ pub extern "C" fn sfs_close(handle: *mut c_void) {
 
 #[no_mangle]
 pub extern "C" fn sfs_mkdir(handle: *mut c_void, path: *const c_char) -> c_int {
-    let sfs = unsafe { &*(handle as *mut Sfs) };
+    let sfs = unsafe { &*(handle as *const Sfs) };
     let path = match cstr_to_str(path) {
         Some(s) => s,
         None => return -1,
@@ -138,7 +142,7 @@ pub extern "C" fn sfs_mkdir(handle: *mut c_void, path: *const c_char) -> c_int {
 
 #[no_mangle]
 pub extern "C" fn sfs_rmdir(handle: *mut c_void, path: *const c_char) -> c_int {
-    let sfs = unsafe { &*(handle as *mut Sfs) };
+    let sfs = unsafe { &*(handle as *const Sfs) };
     let path = match cstr_to_str(path) {
         Some(s) => s,
         None => return -1,
@@ -158,7 +162,7 @@ pub extern "C" fn sfs_rename_dir(
     old_path: *const c_char,
     new_path: *const c_char,
 ) -> c_int {
-    let sfs = unsafe { &*(handle as *mut Sfs) };
+    let sfs = unsafe { &*(handle as *const Sfs) };
     let old_path = match cstr_to_str(old_path) {
         Some(s) => s,
         None => return -1,
@@ -186,7 +190,7 @@ struct SfsList {
 
 #[no_mangle]
 pub extern "C" fn sfs_list(handle: *mut c_void, path: *const c_char) -> *mut c_void {
-    let sfs = unsafe { &*(handle as *mut Sfs) };
+    let sfs = unsafe { &*(handle as *const Sfs) };
     let path = match cstr_to_str(path) {
         Some(s) => s,
         None => return std::ptr::null_mut(),
@@ -259,7 +263,7 @@ pub extern "C" fn sfs_list_free(list: *mut c_void) {
 /// Create a new stream and open it for writing. Returns handle ID or -1.
 #[no_mangle]
 pub extern "C" fn sfs_create_stream(handle: *mut c_void, path: *const c_char) -> i64 {
-    let sfs = unsafe { &mut *(handle as *mut Sfs) };
+    let sfs = unsafe { &*(handle as *const Sfs) };
     let path = match cstr_to_str(path) {
         Some(s) => s,
         None => return -1,
@@ -280,7 +284,7 @@ pub extern "C" fn sfs_open_stream(
     path: *const c_char,
     mode: c_int,
 ) -> i64 {
-    let sfs = unsafe { &mut *(handle as *mut Sfs) };
+    let sfs = unsafe { &*(handle as *const Sfs) };
     let path = match cstr_to_str(path) {
         Some(s) => s,
         None => return -1,
@@ -305,7 +309,7 @@ pub extern "C" fn sfs_open_stream(
 /// Close a stream handle.
 #[no_mangle]
 pub extern "C" fn sfs_close_stream(handle: *mut c_void, stream: i64) -> c_int {
-    let sfs = unsafe { &mut *(handle as *mut Sfs) };
+    let sfs = unsafe { &*(handle as *const Sfs) };
     match sfs.close_stream(StreamHandle::from_id(stream as u64)) {
         Ok(()) => 0,
         Err(e) => {
@@ -318,7 +322,7 @@ pub extern "C" fn sfs_close_stream(handle: *mut c_void, stream: i64) -> c_int {
 /// Delete a stream by path. Must not be currently open.
 #[no_mangle]
 pub extern "C" fn sfs_delete_stream(handle: *mut c_void, path: *const c_char) -> c_int {
-    let sfs = unsafe { &mut *(handle as *mut Sfs) };
+    let sfs = unsafe { &*(handle as *const Sfs) };
     let path = match cstr_to_str(path) {
         Some(s) => s,
         None => return -1,
@@ -339,7 +343,7 @@ pub extern "C" fn sfs_rename_stream(
     old_path: *const c_char,
     new_path: *const c_char,
 ) -> c_int {
-    let sfs = unsafe { &mut *(handle as *mut Sfs) };
+    let sfs = unsafe { &*(handle as *const Sfs) };
     let old_path = match cstr_to_str(old_path) {
         Some(s) => s,
         None => return -1,
@@ -369,7 +373,7 @@ pub extern "C" fn sfs_read(
     buf: *mut c_void,
     len: u64,
 ) -> i64 {
-    let sfs = unsafe { &mut *(handle as *mut Sfs) };
+    let sfs = unsafe { &*(handle as *const Sfs) };
     let sh = StreamHandle::from_id(stream as u64);
     let buf = unsafe { std::slice::from_raw_parts_mut(buf as *mut u8, len as usize) };
     match sfs.read(&sh, buf) {
@@ -389,7 +393,7 @@ pub extern "C" fn sfs_write(
     buf: *const c_void,
     len: u64,
 ) -> i64 {
-    let sfs = unsafe { &mut *(handle as *mut Sfs) };
+    let sfs = unsafe { &*(handle as *const Sfs) };
     let sh = StreamHandle::from_id(stream as u64);
     let buf = unsafe { std::slice::from_raw_parts(buf as *const u8, len as usize) };
     match sfs.write(&sh, buf) {
@@ -404,7 +408,7 @@ pub extern "C" fn sfs_write(
 /// Set the head position. Returns 0 or -1.
 #[no_mangle]
 pub extern "C" fn sfs_seek(handle: *mut c_void, stream: i64, pos: u64) -> c_int {
-    let sfs = unsafe { &mut *(handle as *mut Sfs) };
+    let sfs = unsafe { &*(handle as *const Sfs) };
     let sh = StreamHandle::from_id(stream as u64);
     match sfs.seek(&sh, pos) {
         Ok(()) => 0,
@@ -418,7 +422,7 @@ pub extern "C" fn sfs_seek(handle: *mut c_void, stream: i64, pos: u64) -> c_int 
 /// Get the current head position. Returns position or -1 on error.
 #[no_mangle]
 pub extern "C" fn sfs_tell(handle: *mut c_void, stream: i64) -> i64 {
-    let sfs = unsafe { &*(handle as *mut Sfs) };
+    let sfs = unsafe { &*(handle as *const Sfs) };
     let sh = StreamHandle::from_id(stream as u64);
     match sfs.tell(&sh) {
         Ok(pos) => pos as i64,
@@ -432,7 +436,7 @@ pub extern "C" fn sfs_tell(handle: *mut c_void, stream: i64) -> i64 {
 /// Get the stream length. Returns length or -1 on error.
 #[no_mangle]
 pub extern "C" fn sfs_stream_length(handle: *mut c_void, stream: i64) -> i64 {
-    let sfs = unsafe { &*(handle as *mut Sfs) };
+    let sfs = unsafe { &*(handle as *const Sfs) };
     let sh = StreamHandle::from_id(stream as u64);
     match sfs.stream_length(&sh) {
         Ok(len) => len as i64,
@@ -446,7 +450,7 @@ pub extern "C" fn sfs_stream_length(handle: *mut c_void, stream: i64) -> i64 {
 /// Truncate a stream. Returns 0 or -1.
 #[no_mangle]
 pub extern "C" fn sfs_truncate(handle: *mut c_void, stream: i64, new_len: u64) -> c_int {
-    let sfs = unsafe { &mut *(handle as *mut Sfs) };
+    let sfs = unsafe { &*(handle as *const Sfs) };
     let sh = StreamHandle::from_id(stream as u64);
     match sfs.truncate(&sh, new_len) {
         Ok(()) => 0,

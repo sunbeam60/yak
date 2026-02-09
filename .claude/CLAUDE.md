@@ -6,6 +6,9 @@
 - L3                = Layer 3
 - L4                = Layer 4
 
+## Human & AI, working together
+Before committing, at all times present & allow edits to the commit message to the user. Do not include "co-authored by Claude" message.
+
 ## Architecture
 Please read the [architecture](./../docs/architecture.md) for a comprehensive overview of SFS. This architecture must be respected - if it cannot, please stop, inform and ask for directions.
 
@@ -31,25 +34,27 @@ It is critical that the four layers in SFS are kept as decoupled as possible: L4
 4. L1 Mock: Implement L1 and plug it into L2.
 
 ### Current project phase
-**L4 Mock: ✅ COMPLETE** - See [L4 mock](./../docs/L4_mock.md) for full documentation.
+**L3 Mock: ✅ COMPLETE** - See [L3 mock](./../docs/L3_mock.md) for full documentation.
 
-All 35 tests passing. Ready to proceed to L3 Mock phase when you're ready.
+All 47 tests passing. Ready to proceed to L2 Mock phase when you're ready.
 
 ### Implementation Status Summary
 
-| Phase | Component | Status | Tests |
-|-------|-----------|--------|-------|
-| L4 Mock | Rust core (`stream_fs`) | ✅ Complete | - |
-| L4 Mock | C FFI (`stream_fs_c`) | ✅ Complete | - |
-| L4 Mock | Python bindings (`sfs_pytest/sfs`) | ✅ Complete | - |
-| L4 Mock | CLI tool (`sfs_cl`) | ✅ Complete | - |
-| L4 Mock | Test suite | ✅ Complete | 35/35 |
-| **Total** | **L4 Mock** | **✅ COMPLETE** | **35/35** |
+| Phase     | Component                          | Status         | Tests     |
+| --------- | ---------------------------------- | -------------- | --------- |
+| L4 Mock   | All components                     | ✅ Complete     | 47/47     |
+| L3 Mock   | `StreamLayer` trait                | ✅ Complete     | -         |
+| L3 Mock   | `StreamsFromFiles` (L3 impl)      | ✅ Complete     | -         |
+| L3 Mock   | L4 rewrite (generic over L3)      | ✅ Complete     | -         |
+| L3 Mock   | C FFI (`stream_fs_c`)             | ✅ Complete     | -         |
+| L3 Mock   | CLI tool (`sfs_cl`)               | ✅ Complete     | -         |
+| L3 Mock   | Test suite                         | ✅ Complete     | 47/47     |
+| **Total** | **L3 Mock**                        | **✅ COMPLETE** | **47/47** |
 
-### Next Steps (L3 Mock Phase)
+### Next Steps (L2 Mock Phase)
 When ready to proceed:
-1. Define L3 trait for stream abstraction
-2. Make L4 generic over L3 trait
-3. Implement L3 mock that uses real files for each stream (one file per stream)
-4. Update/extend tests to validate L3 layer separation
-5. Update CLI to work with L3-backed L4
+1. Define L2 trait for block storage abstraction
+2. Make L3 generic over L2 trait
+3. Implement L2 mock that stores each block as a numbered file on disk
+4. Implement real L3 (`StreamsFromBlocks`) that links blocks into streams
+5. Update/extend tests to validate L2 layer separation

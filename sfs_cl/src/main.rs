@@ -2,7 +2,7 @@ use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::process;
-use stream_fs::{EntryType, OpenMode, Sfs};
+use stream_fs::{EntryType, OpenMode, SfsDefault as Sfs};
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -45,7 +45,7 @@ fn print_usage() {
     eprintln!();
     eprintln!("Commands:");
     eprintln!("  create <sfs-file>                      Create a new SFS file");
-    eprintln!("  ls <sfs-file> [dir]                    List directory contents");
+    eprintln!("  ls [-r] <sfs-file> [dir]               List directory contents (-r for recursive)");
     eprintln!("  mkdir <sfs-file> <dir>                 Create a directory");
     eprintln!("  rmdir <sfs-file> <dir>                 Remove an empty directory");
     eprintln!("  mv-dir <sfs-file> <old> <new>          Rename/move a directory");
@@ -64,7 +64,7 @@ fn cmd_create(args: &[String]) -> Result<(), ()> {
         return Err(());
     }
 
-    match Sfs::create(&args[0]) {
+    match Sfs::create(&args[0], 4, 12) {
         Ok(sfs) => {
             sfs.close();
             println!("Created SFS file: {}", args[0]);
@@ -78,13 +78,19 @@ fn cmd_create(args: &[String]) -> Result<(), ()> {
 }
 
 fn cmd_ls(args: &[String]) -> Result<(), ()> {
-    if args.is_empty() || args.len() > 2 {
-        eprintln!("Usage: sfs ls <sfs-file> [dir]");
+    let (recursive, rest) = if args.first().map(|s| s.as_str()) == Some("-r") {
+        (true, &args[1..])
+    } else {
+        (false, args)
+    };
+
+    if rest.is_empty() || rest.len() > 2 {
+        eprintln!("Usage: sfs ls [-r] <sfs-file> [dir]");
         return Err(());
     }
 
-    let sfs_path = &args[0];
-    let dir = if args.len() == 2 { &args[1] } else { "" };
+    let sfs_path = &rest[0];
+    let dir = if rest.len() == 2 { &rest[1] } else { "" };
 
     let sfs = match Sfs::open(sfs_path) {
         Ok(s) => s,
@@ -94,6 +100,17 @@ fn cmd_ls(args: &[String]) -> Result<(), ()> {
         }
     };
 
+    let result = if recursive {
+        ls_recursive(&sfs, dir, dir)
+    } else {
+        ls_flat(&sfs, dir)
+    };
+
+    sfs.close();
+    result
+}
+
+fn ls_flat(sfs: &Sfs, dir: &str) -> Result<(), ()> {
     match sfs.list(dir) {
         Ok(entries) => {
             if entries.is_empty() {
@@ -107,7 +124,6 @@ fn cmd_ls(args: &[String]) -> Result<(), ()> {
                     println!("{} {}", type_str, entry.name);
                 }
             }
-            sfs.close();
             Ok(())
         }
         Err(e) => {
@@ -115,6 +131,40 @@ fn cmd_ls(args: &[String]) -> Result<(), ()> {
             Err(())
         }
     }
+}
+
+fn ls_recursive(sfs: &Sfs, dir: &str, display_prefix: &str) -> Result<(), ()> {
+    let entries = match sfs.list(dir) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("Error listing directory: {}", e);
+            return Err(());
+        }
+    };
+
+    for entry in &entries {
+        let display_path = if display_prefix.is_empty() {
+            entry.name.clone()
+        } else {
+            format!("{}/{}", display_prefix, entry.name)
+        };
+        let type_str = match entry.entry_type {
+            EntryType::Directory => "DIR   ",
+            EntryType::Stream => "STREAM",
+        };
+        println!("{} {}", type_str, display_path);
+
+        if entry.entry_type == EntryType::Directory {
+            let child_dir = if dir.is_empty() {
+                entry.name.clone()
+            } else {
+                format!("{}/{}", dir, entry.name)
+            };
+            ls_recursive(sfs, &child_dir, &display_path)?;
+        }
+    }
+
+    Ok(())
 }
 
 fn cmd_mkdir(args: &[String]) -> Result<(), ()> {
@@ -216,7 +266,7 @@ fn cmd_put(args: &[String]) -> Result<(), ()> {
         }
     };
 
-    let mut sfs = match Sfs::open(&args[0]) {
+    let sfs = match Sfs::open(&args[0]) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Error opening SFS file: {}", e);
@@ -267,7 +317,7 @@ fn cmd_get(args: &[String]) -> Result<(), ()> {
     let stream_path = &args[1];
     let local_file = &args[2];
 
-    let mut sfs = match Sfs::open(&args[0]) {
+    let sfs = match Sfs::open(&args[0]) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Error opening SFS file: {}", e);
@@ -330,7 +380,7 @@ fn cmd_cat(args: &[String]) -> Result<(), ()> {
         return Err(());
     }
 
-    let mut sfs = match Sfs::open(&args[0]) {
+    let sfs = match Sfs::open(&args[0]) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Error opening SFS file: {}", e);
@@ -386,7 +436,7 @@ fn cmd_rm(args: &[String]) -> Result<(), ()> {
         return Err(());
     }
 
-    let mut sfs = match Sfs::open(&args[0]) {
+    let sfs = match Sfs::open(&args[0]) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Error opening SFS file: {}", e);
@@ -413,7 +463,7 @@ fn cmd_mv(args: &[String]) -> Result<(), ()> {
         return Err(());
     }
 
-    let mut sfs = match Sfs::open(&args[0]) {
+    let sfs = match Sfs::open(&args[0]) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Error opening SFS file: {}", e);
@@ -440,7 +490,7 @@ fn cmd_info(args: &[String]) -> Result<(), ()> {
         return Err(());
     }
 
-    let mut sfs = match Sfs::open(&args[0]) {
+    let sfs = match Sfs::open(&args[0]) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Error opening SFS file: {}", e);

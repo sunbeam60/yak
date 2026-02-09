@@ -35,13 +35,87 @@ def _load_library():
     path = _find_library()
     lib = ctypes.CDLL(str(path))
 
-    # Use c_void_p so we get the raw pointer back (c_char_p auto-converts
-    # to bytes and loses the pointer needed for freeing).
+    # --- Hello (legacy) ---
     lib.sfs_hello.restype = ctypes.c_void_p
     lib.sfs_hello.argtypes = []
 
     lib.sfs_free_string.restype = None
     lib.sfs_free_string.argtypes = [ctypes.c_void_p]
+
+    # --- Error handling ---
+    lib.sfs_last_error_message.restype = ctypes.c_char_p
+    lib.sfs_last_error_message.argtypes = []
+
+    # --- SFS file lifecycle ---
+    lib.sfs_create.restype = ctypes.c_void_p
+    lib.sfs_create.argtypes = [ctypes.c_char_p]
+
+    lib.sfs_open.restype = ctypes.c_void_p
+    lib.sfs_open.argtypes = [ctypes.c_char_p]
+
+    lib.sfs_close.restype = None
+    lib.sfs_close.argtypes = [ctypes.c_void_p]
+
+    # --- Directory operations ---
+    lib.sfs_mkdir.restype = ctypes.c_int
+    lib.sfs_mkdir.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+
+    lib.sfs_rmdir.restype = ctypes.c_int
+    lib.sfs_rmdir.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+
+    lib.sfs_rename_dir.restype = ctypes.c_int
+    lib.sfs_rename_dir.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p]
+
+    # --- Listing ---
+    lib.sfs_list.restype = ctypes.c_void_p
+    lib.sfs_list.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+
+    lib.sfs_list_count.restype = ctypes.c_int
+    lib.sfs_list_count.argtypes = [ctypes.c_void_p]
+
+    lib.sfs_list_entry_name.restype = ctypes.c_char_p
+    lib.sfs_list_entry_name.argtypes = [ctypes.c_void_p, ctypes.c_int]
+
+    lib.sfs_list_entry_type.restype = ctypes.c_int
+    lib.sfs_list_entry_type.argtypes = [ctypes.c_void_p, ctypes.c_int]
+
+    lib.sfs_list_free.restype = None
+    lib.sfs_list_free.argtypes = [ctypes.c_void_p]
+
+    # --- Stream lifecycle ---
+    lib.sfs_create_stream.restype = ctypes.c_int64
+    lib.sfs_create_stream.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+
+    lib.sfs_open_stream.restype = ctypes.c_int64
+    lib.sfs_open_stream.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+
+    lib.sfs_close_stream.restype = ctypes.c_int
+    lib.sfs_close_stream.argtypes = [ctypes.c_void_p, ctypes.c_int64]
+
+    lib.sfs_delete_stream.restype = ctypes.c_int
+    lib.sfs_delete_stream.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+
+    lib.sfs_rename_stream.restype = ctypes.c_int
+    lib.sfs_rename_stream.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p]
+
+    # --- Stream I/O ---
+    lib.sfs_read.restype = ctypes.c_int64
+    lib.sfs_read.argtypes = [ctypes.c_void_p, ctypes.c_int64, ctypes.c_void_p, ctypes.c_uint64]
+
+    lib.sfs_write.restype = ctypes.c_int64
+    lib.sfs_write.argtypes = [ctypes.c_void_p, ctypes.c_int64, ctypes.c_char_p, ctypes.c_uint64]
+
+    lib.sfs_seek.restype = ctypes.c_int
+    lib.sfs_seek.argtypes = [ctypes.c_void_p, ctypes.c_int64, ctypes.c_uint64]
+
+    lib.sfs_tell.restype = ctypes.c_int64
+    lib.sfs_tell.argtypes = [ctypes.c_void_p, ctypes.c_int64]
+
+    lib.sfs_stream_length.restype = ctypes.c_int64
+    lib.sfs_stream_length.argtypes = [ctypes.c_void_p, ctypes.c_int64]
+
+    lib.sfs_truncate.restype = ctypes.c_int
+    lib.sfs_truncate.argtypes = [ctypes.c_void_p, ctypes.c_int64, ctypes.c_uint64]
 
     return lib
 

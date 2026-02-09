@@ -1,3 +1,7 @@
+mod sfs;
+
+pub use sfs::{DirEntry, EntryType, OpenMode, Sfs, SfsError, StreamHandle};
+
 /// Returns a hello world greeting from the Stream File System library.
 pub fn hello() -> String {
     "Hello from Stream File System!".to_string()

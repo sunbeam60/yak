@@ -4,7 +4,7 @@ This documentation provides a high level overview of the Stream File System (SFS
 
 ## SFS Purpose
 
-The SFS lib is a statically linkable library that provides an API and implementation for library users to create, manage and use SFS storage files. An SFS storage file is a "file system in a file" meant for users to create a file wherein there is 0..n data streams, addressable by a string name. Each data stream can be read and written similar to how an actual file can be read and written, meaning after a data stream has been opened, it returns a handle from which the user can obtain the length, a position (where reads and writes happen from) and the contents of the data stream itself. After such a data stream has been opened, there are functions to read and write data from and to the data stream. 
+The SFS lib is a Rust module that provides an API and implementation for library users to create, manage and use SFS storage files. An SFS storage file is a "file system in a file" meant for users to create a file wherein there is 0..n data streams, addressable by a string name. Each data stream can be read and written similar to how an actual file can be read and written, meaning after a data stream has been opened, it returns a handle from which the user can obtain the length, a position (where reads and writes happen from) and the contents of the data stream itself. After such a data stream has been opened, there are functions to read and write data from and to the data stream. 
 
 ## Data streams
 

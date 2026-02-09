@@ -9,7 +9,19 @@
       "Bash(python -m pytest:*)",
       "Bash(git init:*)",
       "Bash(git add:*)",
-      "Bash(git commit -m \"$\\(cat <<''EOF''\nInitial project skeleton with hello world across all four modules\n\nSet up Cargo workspace with stream_fs \\(core Rust lib\\), stream_fs_c \\(C ABI wrapper\\),\nsfs_cl \\(CLI tool\\), and sfs_pytest \\(Python test harness\\). All modules are wired\ntogether end-to-end through a hello\\(\\) function.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\nEOF\n\\)\")"
+      "Bash(git commit -m \"$\\(cat <<''EOF''\nInitial project skeleton with hello world across all four modules\n\nSet up Cargo workspace with stream_fs \\(core Rust lib\\), stream_fs_c \\(C ABI wrapper\\),\nsfs_cl \\(CLI tool\\), and sfs_pytest \\(Python test harness\\). All modules are wired\ntogether end-to-end through a hello\\(\\) function.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\nEOF\n\\)\")",
+      "Bash(code --install-extension:*)",
+      "Bash(where:*)",
+      "Bash(cmd /c \"where cargo\")",
+      "Bash(cmd /c \"where cargo 2>&1\")",
+      "Bash(powershell -Command:*)",
+      "Bash(C:Python311python.exe -m pytest tests/test_streams.py -v)",
+      "Bash(/c/Python311/python.exe -m pytest:*)",
+      "Bash(ls:*)",
+      "Bash(/c/Users/bjorn/.cargo/bin/cargo.exe build:*)",
+      "Bash(/c/Users/bjorn/Code/SFS/target/debug/sfs.exe create:*)",
+      "Bash(/c/Users/bjorn/Code/SFS/target/debug/sfs.exe:*)",
+      "Bash(git commit:*)"
     ]
   }
 }

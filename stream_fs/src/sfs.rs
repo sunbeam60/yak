@@ -210,10 +210,14 @@ impl<L3: StreamLayer> Sfs<L3> {
         block_index_width: u8,
         block_size_shift: u8,
     ) -> Result<Self, SfsError> {
-        let layer3 = L3::create(path, block_index_width, block_size_shift)?;
+        // Build L4 placeholder header section (correct size, placeholder values)
+        let l4_placeholder = build_l4_section(0);
+
+        // Pass placeholder down through the layer chain so L1 can calculate data_offset
+        let layer3 = L3::create(path, block_index_width, block_size_shift, &l4_placeholder)?;
         let root_id = layer3.create_stream()?;
 
-        // Persist L4 header section via the header chain
+        // Now rewrite L4 header with real root_dir_stream_id
         let l4_section = build_l4_section(root_id);
         layer3.store_header(&l4_section)?;
 

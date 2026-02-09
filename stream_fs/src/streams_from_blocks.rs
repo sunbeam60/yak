@@ -735,29 +735,36 @@ impl<L2: BlockLayer> StreamsFromBlocks<L2> {
 impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
     type Handle = BlockStreamHandle;
 
-    fn create(path: &str, block_index_width: u8, block_size_shift: u8) -> Result<Self, SfsError>
+    fn create(
+        path: &str,
+        block_index_width: u8,
+        block_size_shift: u8,
+        upper_layers: &[u8],
+    ) -> Result<Self, SfsError>
     where
         Self: Sized,
     {
-        let layer2 = L2::create(path, block_size_shift, block_index_width)?;
+        // Build L3 placeholder section and prepend to upper_layers
         let streams_desc = StreamDescriptor {
             size: 0,
             top_block: 0,
         };
+        let l3_section = Self::build_l3_section(&streams_desc);
+        let mut combined = l3_section;
+        combined.extend_from_slice(upper_layers);
+
+        let layer2 = L2::create(path, block_size_shift, block_index_width, &combined)?;
 
         let instance = StreamsFromBlocks {
             layer2,
             streams_lock: RwLock::new(streams_desc),
-            l4_header_cache: Mutex::new(Vec::new()),
+            l4_header_cache: Mutex::new(upper_layers.to_vec()),
             state: Mutex::new(StreamsFromBlocksState {
                 next_handle_id: 0,
                 locks: HashMap::new(),
                 open_handles: HashMap::new(),
             }),
         };
-
-        // Persist initial header
-        instance.persist_header(&streams_desc)?;
 
         Ok(instance)
     }

@@ -85,7 +85,12 @@ impl BlocksFromFiles {
 }
 
 impl BlockLayer for BlocksFromFiles {
-    fn create(path: &str, block_size_shift: u8, block_index_width: u8) -> Result<Self, SfsError> {
+    fn create(
+        path: &str,
+        block_size_shift: u8,
+        block_index_width: u8,
+        upper_layers: &[u8],
+    ) -> Result<Self, SfsError> {
         let root = PathBuf::from(path);
         if root.exists() {
             return Err(SfsError::AlreadyExists(root.display().to_string()));
@@ -99,6 +104,10 @@ impl BlockLayer for BlocksFromFiles {
             state: Mutex::new(BlocksState { next_block_id: 0 }),
         };
         instance.persist_meta(0)?;
+
+        // Write the initial header (L2 section + upper_layers)
+        instance.store_header(upper_layers)?;
+
         Ok(instance)
     }
 

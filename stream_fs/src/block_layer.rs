@@ -19,7 +19,15 @@ pub trait BlockLayer: Send + Sync {
     /// (e.g. 12 -> 4096 bytes).
     /// `block_index_width` is the number of bytes used for block indices
     /// on disk (e.g. 2, 4, or 8).
-    fn create(path: &str, block_size_shift: u8, block_index_width: u8) -> Result<Self, SfsError>
+    /// `upper_layers` contains the accumulated header sections from L3+L4
+    /// (possibly with placeholder values). L2 prepends its own section
+    /// and passes everything down to L1 (or writes to disk).
+    fn create(
+        path: &str,
+        block_size_shift: u8,
+        block_index_width: u8,
+        upper_layers: &[u8],
+    ) -> Result<Self, SfsError>
     where
         Self: Sized;
 

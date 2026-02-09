@@ -34,9 +34,9 @@ It is critical that the four layers in SFS are kept as decoupled as possible: L4
 4. L1 Mock: Implement L1 and plug it into L2.
 
 ### Current project phase
-**L2 Mock: ✅ COMPLETE** - See [L2 mock](./../docs/L2_mock.md) for full documentation.
+**L1: ✅ COMPLETE** - See [L1](./../docs/L1.md) for full documentation.
 
-All 68 tests passing (including thread safety burn-in and Phase 8 multi-block tests). Ready to proceed to L1 Mock phase when you're ready.
+All 85 tests passing (68 original + 17 L1-specific), plus 3 cargo tests. SFS now operates as a true single-file filesystem.
 
 ### Implementation Status Summary
 
@@ -61,10 +61,13 @@ All 68 tests passing (including thread safety burn-in and Phase 8 multi-block te
 | L2 Mock   | Thread safety burn-in              | ✅ Complete     | -         |
 | L2 Mock   | Full test suite                    | ✅ Complete     | 68/68     |
 | **Total** | **L2 Mock**                        | **✅ COMPLETE** | **68/68** |
-
-### Next Steps (L1 Mock Phase)
-When ready to proceed:
-1. Define L1 trait for raw file I/O abstraction
-2. Make L2 generic over L1 trait
-3. Implement L1 mock that stores the entire SFS in a single file
-4. Update/extend tests to validate L1 layer separation
+| L1        | `FileLayer` trait (L1 contract)    | ✅ Complete     | -         |
+| L1        | `FileOnDisk` (L1 impl)             | ✅ Complete     | -         |
+| L1        | `BlocksInFile` (real L2)           | ✅ Complete     | -         |
+| L1        | Header chain (L4→L3→L2→L1→disk)   | ✅ Complete     | -         |
+| L1        | Two-pass create with `upper_layers`| ✅ Complete     | -         |
+| L1        | `SfsDefault` = single-file backend | ✅ Complete     | -         |
+| L1        | Process-level locking (`fs2`)      | ✅ Complete     | -         |
+| L1        | L1-specific test suite             | ✅ Complete     | 17/17     |
+| L1        | Full test suite                    | ✅ Complete     | 85/85     |
+| **Total** | **L1**                             | **✅ COMPLETE** | **85/85** |

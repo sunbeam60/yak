@@ -7,10 +7,10 @@ import sfs
 
 class TestSfsLifecycle:
     def test_create_new_sfs(self, tmp_path):
-        """Create an SFS file, verify directory exists on disk."""
+        """Create an SFS file, verify it exists on disk."""
         sfs_path = str(tmp_path / "test.sfs")
         fs = sfs.Sfs.create(sfs_path)
-        assert Path(sfs_path).is_dir()
+        assert Path(sfs_path).exists()
         fs.close()
 
     def test_create_already_exists(self, tmp_path):

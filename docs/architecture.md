@@ -150,21 +150,23 @@ An API is also provided to open an existing SFS file, also taking in L3, L2 and 
 When the four layers instantiate for creation, they each pass down a header (in layer order 4, 3, 2 and 1) as a byte array. Ultimately, on L1, the file is created writing out the byte arrays in the oppositive order (1, 2, 3 and then 4). What these headers contain is up to each layer, but all layer headers must start with a length descriptor. In a normal SFS file, the layout is as follows:
 
 ```
-Magic: File magic header | header layout version 
-L1: length | L1 identifier | L1 version
+Magic: File magic header | header layout version
+L1: length | L1 identifier | L1 version | data offset
 L2: length | L2 identifier | L2 version | block size (bytes) | block index size (bytes)
 L3: length | L3 identifier | L3 version | Streams stream descriptor
 L4: length | L4 identifier | L4 version | root directory stream index
 ```
+
+The `data offset` in L1's header records where block data begins in the file (immediately after L4's section). L1 needs this because it has no knowledge of how many upper layer sections exist or how large they are — `data offset` provides the definitive boundary between headers and data.
 
 When a SFS file is opened, L1 (as it opens the file) checks the file magic header and the header layout version to ensure it can read the headers. This ensures that:
 
 * This is indeed an SFS file, and
 * The layout of the headers follows a form that the code can read (in this version it's simply "each layer header is preceded by a length")
 
-Assuming that it can, it reads each segment of the header into a stack of byte arrays (the length for each layer's header is indicated in the front and is the total size of the header including the length field) and then pops the first header (its own header, L1). 
+Assuming that it can, it reads the L1 header section (whose length is encoded in the section's length field) and validates the L1 identifier. It then reads the `data offset` from the L1 section — this tells L1 exactly how many bytes of upper layer header sections follow. L1 reads that exact range and passes it up the call stack.
 
-It verifies that it can handle this file at L1, then returns the stack - now less one header buffer - up the call stack. Each layer pops a header from the stack and compares it to what this layer expects to find, reading in the necessary information from the header to initialise this layer.
+Each layer pops a header from the stack and compares it to what this layer expects to find, reading in the necessary information from the header to initialise this layer.
 
 If all layers have found a header they are capable of handling, the file has successfully opened.
 

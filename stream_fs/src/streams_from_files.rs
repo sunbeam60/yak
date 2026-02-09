@@ -92,7 +92,12 @@ impl StreamsFromFiles {
 impl StreamLayer for StreamsFromFiles {
     type Handle = FileStreamHandle;
 
-    fn create(path: &str, block_index_width: u8, block_size_shift: u8) -> Result<Self, SfsError> {
+    fn create(
+        path: &str,
+        block_index_width: u8,
+        block_size_shift: u8,
+        upper_layers: &[u8],
+    ) -> Result<Self, SfsError> {
         let root = PathBuf::from(path);
         if root.exists() {
             return Err(SfsError::AlreadyExists(root.display().to_string()));
@@ -111,6 +116,10 @@ impl StreamLayer for StreamsFromFiles {
             }),
         };
         instance.persist_meta(0)?;
+
+        // Write the initial header (L3 section + upper_layers)
+        instance.store_header(upper_layers)?;
+
         Ok(instance)
     }
 

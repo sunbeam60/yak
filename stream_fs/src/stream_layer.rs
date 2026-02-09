@@ -24,7 +24,15 @@ pub trait StreamLayer: Send + Sync {
     /// disk (e.g. 2, 4, or 8).
     /// `block_size_shift` is the power-of-2 exponent for block size
     /// (e.g. 12 → 4096 bytes).
-    fn create(path: &str, block_index_width: u8, block_size_shift: u8) -> Result<Self, SfsError>
+    /// `upper_layers` contains the accumulated header sections from L4
+    /// (possibly with placeholder values). L3 prepends its own section
+    /// and passes everything down to L2.
+    fn create(
+        path: &str,
+        block_index_width: u8,
+        block_size_shift: u8,
+        upper_layers: &[u8],
+    ) -> Result<Self, SfsError>
     where
         Self: Sized;
 

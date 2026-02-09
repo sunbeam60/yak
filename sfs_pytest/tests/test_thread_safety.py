@@ -47,7 +47,8 @@ class TestThreadSafety:
         return path
 
     def test_concurrent_reads(self, sfs_path, burn_seconds):
-        """40 threads each open the SFS file and read all streams in a loop."""
+        """One Sfs instance shared across 40 threads, each reading all streams in a loop."""
+        f = sfs.Sfs.open(sfs_path)
         errors = []
         barrier = threading.Barrier(NUM_THREADS)
 
@@ -58,8 +59,6 @@ class TestThreadSafety:
                 rounds = 0
 
                 while time.monotonic() < deadline:
-                    f = sfs.Sfs.open(sfs_path)
-
                     # List root
                     root_entries = f.list()
                     names = {e.name for e in root_entries}
@@ -98,7 +97,6 @@ class TestThreadSafety:
                     assert data == b"PNG-FAKE-DATA" * 100, f"T{thread_id}: logo mismatch"
                     f.close_stream(h)
 
-                    f.close()
                     rounds += 1
                     time.sleep(0.01)
 
@@ -114,6 +112,7 @@ class TestThreadSafety:
         for t in threads:
             t.join(timeout=burn_seconds + 30)
 
+        f.close()
         assert not errors, "Thread errors:\n" + "\n".join(errors)
 
     def test_shared_instance_concurrent_writes(self, sfs_path, burn_seconds):

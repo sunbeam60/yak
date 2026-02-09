@@ -360,4 +360,5 @@ Default values (4, 12) give u32-equivalent block indices and 4096-byte blocks.
    - All existing L4 Mock tests pass unchanged through the L3 layer
    - Thread safety burn-in tests (40 threads, configurable `--burn-seconds`)
 
-**Next Phase:** L2 Mock — ✅ COMPLETE. See [L2 Mock](L2_mock.md) for the current implementation.
+**Next Phase:** L2 Mock — ✅ COMPLETE. See [L2 Mock](L2_mock.md).
+**Current:** L1 — ✅ COMPLETE. See [L1](L1.md) for the single-file backend implementation.

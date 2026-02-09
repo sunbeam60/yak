@@ -59,7 +59,7 @@ Each layer writes a header section. Per the architecture, the length field inclu
 | L3 | `"strfil"` | StreamsFromFiles mock L3 (file-backed streams) |
 | L2 | `"blocks"` | Block storage layer (real) |
 | L2 | `"blkfil"` | BlocksFromFiles mock L2 (file-backed blocks) |
-| L1 | `"ondisk"` | File system abstraction (future) |
+| L1 | `"ondisk"` | File system abstraction (✅ implemented) |
 
 ### Complete header layout (L2 Mock, no L1)
 
@@ -928,4 +928,4 @@ None. All key decisions have been resolved.
    - Phase 8 multi-block tests (19 tests) with small blocks (64 bytes, fan_out=16)
    - Thread safety burn-in tests (40 threads, 10s default) pass cleanly
 
-**Next Phase:** L1 Mock — Define L1 trait for raw file I/O, make L2 generic over L1, implement single-file SFS.
+**Next Phase:** L1 — ✅ COMPLETE. See [L1](L1.md) for the single-file backend implementation.

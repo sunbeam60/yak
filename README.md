@@ -4,18 +4,18 @@ A layered file system implementation in Rust that provides a "file system in a f
 
 ## Project Status
 
-**L2 Mock: ✅ COMPLETE** (68/68 tests passing)
+**L1: ✅ COMPLETE** (85/85 tests passing + 3 cargo tests)
 
-All core components implemented and tested:
-- ✅ Rust library (`stream_fs`) — L4 generic over L3 trait, L3 generic over L2 trait
-- ✅ Real L3 implementation (`StreamsFromBlocks`) — pyramid block linking
-- ✅ L2 mock (`BlocksFromFiles`) — numbered `.block` files on disk
-- ✅ L3 mock (`StreamsFromFiles`) — kept as debugging tool
-- ✅ Header chain (L4 → L3 → L2 → disk)
+SFS now operates as a true single-file filesystem. All four layers are implemented:
+- ✅ L1 (`FileOnDisk`) — single-file backend with process-level locking via `fs2`
+- ✅ L2 (`BlocksInFile`) — real block storage in a single file via L1
+- ✅ L3 (`StreamsFromBlocks`) — pyramid block linking for numbered streams
+- ✅ L4 (`Sfs`) — filing abstraction with directories and named streams
+- ✅ Header chain (L4 → L3 → L2 → L1 → disk) with two-pass create
 - ✅ C FFI wrapper (`stream_fs_c`)
 - ✅ Python bindings (`sfs_pytest/sfs`)
 - ✅ Command-line tool (`sfs_cl`)
-- ✅ Comprehensive test suite including multi-block and thread safety burn-in tests
+- ✅ Comprehensive test suite including multi-block, single-file persistence, and thread safety burn-in tests
 
 ## Quick Start
 
@@ -76,50 +76,58 @@ docs/            - Architecture and design documentation
 ## Documentation
 
 - [Architecture Overview](docs/architecture.md) - Complete 4-layer architecture
-- [L2 Mock Design](docs/L2_mock.md) - Current implementation phase details
-- [L3 Mock Design](docs/L3_mock.md) - Previous phase design decisions
-- [L4 Mock Design](docs/L4_mock.md) - Initial phase design decisions
+- [L1 Design](docs/L1.md) - Current phase: single-file backend with FileOnDisk and BlocksInFile
+- [L2 Mock Design](docs/L2_mock.md) - BlockLayer trait and StreamsFromBlocks pyramid linking
+- [L3 Mock Design](docs/L3_mock.md) - StreamLayer trait and StreamsFromFiles
+- [L4 Mock Design](docs/L4_mock.md) - Initial phase: filing abstraction API
 - [Project Instructions](.claude/CLAUDE.md) - Development guidelines
 
 ## Architecture Layers
 
 SFS is built in 4 layers, implemented bottom-up using a "mock first" approach:
 
-1. **L1 - File System Abstraction** - Wraps OS file operations (planned)
-2. **L2 - Block Storage** - Manages fixed-size blocks (✅ complete — mocked with files)
+1. **L1 - File System Abstraction** - Wraps OS file operations with process-level locking (✅ complete)
+2. **L2 - Block Storage** - Manages fixed-size blocks in a single file (✅ complete)
 3. **L3 - Stream Abstraction** - Links blocks into streams via pyramid structure (✅ complete)
 4. **L4 - Filing Abstraction** - Provides directories and named streams (✅ complete)
 
-## Current Implementation (L2 Mock)
+## Current Implementation
 
-L3 is a real stream layer built on numbered blocks from L2:
-- SFS "files" are directories on disk containing numbered `.block` files
+SFS operates as a true single-file filesystem (`SfsDefault = Sfs<StreamsFromBlocks<BlocksInFile<FileOnDisk>>>`):
+- A `.sfs` file is a single binary file on disk
+- L1 (`FileOnDisk`) wraps OS file I/O with exclusive process-level locking via `fs2`
+- L2 (`BlocksInFile`) stores fixed-size blocks within the single file, with a free list for block reuse
 - L3 (`StreamsFromBlocks`) links blocks into streams using pyramid block linking
-- Stream descriptors stored in a "Streams stream" with out-of-band descriptor in the header chain
-- Header chain: L4 → L3 → L2 → disk, each layer with its own header section
+- L4 (`Sfs`) provides the filing abstraction with directories and named streams
+- Header chain: L4 → L3 → L2 → L1 → disk (96 bytes total), each layer with its own section
 - `block_index_width` and `block_size_shift` are runtime values stored in the header
+- Two-pass create: layers pass placeholder headers down, then rewrite with real values
 - Thread-safe: RWLock on Streams stream + Mutex for bookkeeping + per-stream locking
 
 ## Features
 
-### Current (L2 Mock)
 - Create/open/close SFS files with configurable block parameters
+- Single-file storage (no directory-based mocks needed for production use)
 - Directory operations (mkdir, rmdir, rename, list)
 - Stream operations (create, delete, rename)
 - Stream I/O (read, write, seek, tell, truncate)
 - Multi-block streams with pyramid block linking (depth 0, 1, 2+)
+- Block reuse via free list (singly-linked in block content)
 - Proper locking (one writer OR many readers per stream)
+- Process-level file locking (exclusive access via `fs2`)
 - Thread safety with interior mutability
 - Full C ABI for language interop
 - Python bindings with Pythonic API
 - Command-line tool for manual operations
 - Thread safety burn-in tests (configurable duration)
 - Header chain with per-layer metadata persistence
+- Data persistence across close/reopen cycles
 
-### Planned (L1)
-- Cross-platform file abstraction (single-file SFS)
-- Crash recovery
-- Process-level locking
+## Mock Backends (for debugging)
+
+The mock backends from earlier development phases are retained for debugging:
+- `SfsBlockFileBacked = Sfs<StreamsFromBlocks<BlocksFromFiles>>` — L2 mock (numbered `.block` files)
+- `SfsFileBacked = Sfs<StreamsFromFiles>` — L3 mock (numbered `.stream` files)
 
 ## License
 

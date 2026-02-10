@@ -45,7 +45,9 @@ fn print_usage() {
     eprintln!();
     eprintln!("Commands:");
     eprintln!("  create <sfs-file>                      Create a new SFS file");
-    eprintln!("  ls [-r] <sfs-file> [dir]               List directory contents (-r for recursive)");
+    eprintln!(
+        "  ls [-r] <sfs-file> [dir]               List directory contents (-r for recursive)"
+    );
     eprintln!("  mkdir <sfs-file> <dir>                 Create a directory");
     eprintln!("  rmdir <sfs-file> <dir>                 Remove an empty directory");
     eprintln!("  mv-dir <sfs-file> <old> <new>          Rename/move a directory");
@@ -287,7 +289,10 @@ fn cmd_put(args: &[String]) -> Result<(), ()> {
             if n != data.len() {
                 eprintln!("Warning: wrote {} bytes, expected {}", n, data.len());
             }
-            println!("Imported {} bytes from {} to {}", n, local_file, stream_path);
+            println!(
+                "Imported {} bytes from {} to {}",
+                n, local_file, stream_path
+            );
         }
         Err(e) => {
             eprintln!("Error writing stream: {}", e);
@@ -364,7 +369,12 @@ fn cmd_get(args: &[String]) -> Result<(), ()> {
 
     match fs::write(local_file, &buffer) {
         Ok(()) => {
-            println!("Exported {} bytes from {} to {}", buffer.len(), stream_path, local_file);
+            println!(
+                "Exported {} bytes from {} to {}",
+                buffer.len(),
+                stream_path,
+                local_file
+            );
             Ok(())
         }
         Err(e) => {

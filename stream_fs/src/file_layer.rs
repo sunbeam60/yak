@@ -15,9 +15,10 @@ pub trait FileLayer: Send + Sync {
     /// `upper_layers` contains the accumulated header sections from L2+L3+L4
     /// (possibly with placeholder values — correct sizes, uninitialised data).
     ///
-    /// L1 writes: magic + L1 section + upper_layers to the file, then acquires
-    /// an exclusive process lock. After this call, `data_offset()` returns the
-    /// byte offset where block data begins.
+    /// L1 writes: magic (including `total_header_length`) + L1 section +
+    /// upper_layers to the file, then acquires an exclusive process lock.
+    /// After this call, `data_offset()` returns the byte offset where block
+    /// data begins (equal to `total_header_length`).
     fn create(path: &str, upper_layers: &[u8]) -> Result<Self, SfsError>
     where
         Self: Sized;
@@ -44,6 +45,7 @@ pub trait FileLayer: Send + Sync {
     /// Byte offset in the file where block data begins
     /// (immediately after ALL header sections).
     ///
+    /// Equal to `total_header_length` from the magic section.
     /// This value is fixed at create time and never changes.
     fn data_offset(&self) -> u64;
 

@@ -116,7 +116,7 @@ impl<L1: FileLayer> BlockLayer for BlocksInFile<L1> {
             block_size_shift,
             block_index_width,
             0,        // total_blocks
-            sentinel,  // free_list_head (empty list)
+            sentinel, // free_list_head (empty list)
         );
 
         // Prepend L2 section to upper_layers and pass down to L1

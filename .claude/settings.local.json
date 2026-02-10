@@ -23,7 +23,9 @@
       "Bash(/c/Users/bjorn/Code/SFS/target/debug/sfs.exe:*)",
       "Bash(git commit:*)",
       "Bash(git push:*)",
-      "Bash(C:/Python311/python.exe -m pytest:*)"
+      "Bash(C:/Python311/python.exe -m pytest:*)",
+      "Bash(cargo check:*)",
+      "Bash(cargo fmt:*)"
     ]
   }
 }

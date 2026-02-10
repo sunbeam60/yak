@@ -121,26 +121,26 @@ impl BlockLayer for BlocksFromFiles {
         let header_data = fs::read(root.join("header"))
             .map_err(|e| SfsError::IoError(format!("failed to read header: {}", e)))?;
 
-        // Verify magic
-        if header_data.len() < 10 || &header_data[0..9] != b"stream_fs" || header_data[9] != 0 {
+        // Verify magic (12 bytes: "stream_fs" + version + total_header_length)
+        if header_data.len() < 12 || &header_data[0..9] != b"stream_fs" || header_data[9] != 0 {
             return Err(SfsError::IoError("invalid SFS header magic".to_string()));
         }
 
-        // Read L2 section: offset 10 = length, offset 12 = identifier
-        if header_data.len() < 21 {
+        // Read L2 section: offset 12 = length, offset 14 = identifier
+        if header_data.len() < 23 {
             return Err(SfsError::IoError(
                 "header too short for L2 section".to_string(),
             ));
         }
-        if &header_data[12..18] != b"blkfil" {
+        if &header_data[14..20] != b"blkfil" {
             return Err(SfsError::IoError(format!(
                 "expected L2 identifier 'blkfil', got '{}'",
-                String::from_utf8_lossy(&header_data[12..18])
+                String::from_utf8_lossy(&header_data[14..20])
             )));
         }
-        // offset 18 = version (skip), 19 = block_size_shift, 20 = block_index_width
-        let block_size_shift = header_data[19];
-        let block_index_width = header_data[20];
+        // offset 20 = version (skip), 21 = block_size_shift, 22 = block_index_width
+        let block_size_shift = header_data[21];
+        let block_index_width = header_data[22];
 
         let next_block_id = Self::read_meta(&root)?;
 
@@ -181,9 +181,8 @@ impl BlockLayer for BlocksFromFiles {
         // Create zeroed block file
         let block_size = self.block_size();
         let block_path = self.block_path(id);
-        fs::write(&block_path, vec![0u8; block_size]).map_err(|e| {
-            SfsError::IoError(format!("failed to create block {}: {}", id, e))
-        })?;
+        fs::write(&block_path, vec![0u8; block_size])
+            .map_err(|e| SfsError::IoError(format!("failed to create block {}: {}", id, e)))?;
 
         state.next_block_id += 1;
         let next_id = state.next_block_id;
@@ -197,9 +196,8 @@ impl BlockLayer for BlocksFromFiles {
         if !path.exists() {
             return Err(SfsError::NotFound(format!("block {}", index)));
         }
-        fs::remove_file(&path).map_err(|e| {
-            SfsError::IoError(format!("failed to delete block {}: {}", index, e))
-        })?;
+        fs::remove_file(&path)
+            .map_err(|e| SfsError::IoError(format!("failed to delete block {}: {}", index, e)))?;
         Ok(())
     }
 
@@ -207,7 +205,9 @@ impl BlockLayer for BlocksFromFiles {
         if index >= self.sentinel() {
             return Err(SfsError::IoError(format!(
                 "read_block: block index {} is >= sentinel {} (block_index_width={})",
-                index, self.sentinel(), self.block_index_width
+                index,
+                self.sentinel(),
+                self.block_index_width
             )));
         }
         let block_size = self.block_size();
@@ -257,12 +257,16 @@ impl BlockLayer for BlocksFromFiles {
     }
 
     fn store_header(&self, upper_layers: &[u8]) -> Result<(), SfsError> {
+        let l2_section = self.build_l2_section();
+        let total_header_length: u16 = (12 + l2_section.len() + upper_layers.len()) as u16;
+
         let mut header = Vec::new();
-        // Magic
+        // Magic: "stream_fs" + version + total_header_length
         header.extend_from_slice(b"stream_fs");
         header.push(0); // layout version 0
+        header.extend_from_slice(&total_header_length.to_le_bytes());
         // L2 section
-        header.extend_from_slice(&self.build_l2_section());
+        header.extend_from_slice(&l2_section);
         // L3 + L4 sections (passed through from above)
         header.extend_from_slice(upper_layers);
 
@@ -274,23 +278,25 @@ impl BlockLayer for BlocksFromFiles {
         let data = fs::read(self.header_path())
             .map_err(|e| SfsError::IoError(format!("failed to read header: {}", e)))?;
 
-        // Verify magic
-        if data.len() < 10 || &data[0..9] != b"stream_fs" || data[9] != 0 {
+        // Verify magic (12 bytes: "stream_fs" + version + total_header_length)
+        if data.len() < 12 || &data[0..9] != b"stream_fs" || data[9] != 0 {
             return Err(SfsError::IoError("invalid SFS header magic".to_string()));
         }
 
-        // Read L2 section length at offset 10, skip L2 section
-        if data.len() < 12 {
+        // Read L2 section length at offset 12, skip L2 section
+        if data.len() < 14 {
             return Err(SfsError::IoError(
                 "header too short for L2 section".to_string(),
             ));
         }
-        let l2_len = u16::from_le_bytes([data[10], data[11]]) as usize;
-        if data.len() < 10 + l2_len {
-            return Err(SfsError::IoError("header too short for L2 data".to_string()));
+        let l2_len = u16::from_le_bytes([data[12], data[13]]) as usize;
+        if data.len() < 12 + l2_len {
+            return Err(SfsError::IoError(
+                "header too short for L2 data".to_string(),
+            ));
         }
 
         // Return remainder (L3 + L4 sections)
-        Ok(data[10 + l2_len..].to_vec())
+        Ok(data[12 + l2_len..].to_vec())
     }
 }

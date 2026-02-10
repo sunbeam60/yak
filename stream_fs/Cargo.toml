@@ -3,6 +3,12 @@ name = "stream_fs"
 version = "0.1.0"
 edition = "2021"
 description = "Stream File System - a file system in a file"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/sunbeam60/stream_fs"
+homepage = "https://github.com/sunbeam60/stream_fs"
+keywords = ["filesystem", "embedded", "streams", "storage"]
+categories = ["filesystem", "data-structures"]
+publish = false
 
 [dependencies]
 fs2 = "0.4.3"

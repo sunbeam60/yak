@@ -3,9 +3,12 @@ name = "stream_fs_c"
 version = "0.1.0"
 edition = "2021"
 description = "C ABI wrapper for the Stream File System library"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/sunbeam60/stream_fs"
+publish = false
 
 [lib]
 crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
-stream_fs = { path = "../stream_fs" }
+stream_fs = { path = "../stream_fs", version = "0.1.0" }

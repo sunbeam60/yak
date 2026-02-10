@@ -14,9 +14,8 @@ thread_local! {
 fn set_last_error(msg: &str) {
     LAST_ERROR.with(|e| {
         *e.borrow_mut() = Some(
-            CString::new(msg).unwrap_or_else(|_| {
-                CString::new("error message contained null byte").unwrap()
-            }),
+            CString::new(msg)
+                .unwrap_or_else(|_| CString::new("error message contained null byte").unwrap()),
         );
     });
 }
@@ -288,11 +287,7 @@ pub extern "C" fn sfs_create_stream(handle: *mut c_void, path: *const c_char) ->
 
 /// Open an existing stream. mode: 0=READ, 1=WRITE. Returns handle ID or -1.
 #[no_mangle]
-pub extern "C" fn sfs_open_stream(
-    handle: *mut c_void,
-    path: *const c_char,
-    mode: c_int,
-) -> i64 {
+pub extern "C" fn sfs_open_stream(handle: *mut c_void, path: *const c_char, mode: c_int) -> i64 {
     let sfs = unsafe { &*(handle as *const Sfs) };
     let path = match cstr_to_str(path) {
         Some(s) => s,
@@ -376,12 +371,7 @@ pub extern "C" fn sfs_rename_stream(
 
 /// Read up to `len` bytes. Returns bytes read or -1 on error.
 #[no_mangle]
-pub extern "C" fn sfs_read(
-    handle: *mut c_void,
-    stream: i64,
-    buf: *mut c_void,
-    len: u64,
-) -> i64 {
+pub extern "C" fn sfs_read(handle: *mut c_void, stream: i64, buf: *mut c_void, len: u64) -> i64 {
     let sfs = unsafe { &*(handle as *const Sfs) };
     let sh = StreamHandle::from_id(stream as u64);
     let buf = unsafe { std::slice::from_raw_parts_mut(buf as *mut u8, len as usize) };
@@ -396,12 +386,7 @@ pub extern "C" fn sfs_read(
 
 /// Write `len` bytes. Returns bytes written or -1 on error.
 #[no_mangle]
-pub extern "C" fn sfs_write(
-    handle: *mut c_void,
-    stream: i64,
-    buf: *const c_void,
-    len: u64,
-) -> i64 {
+pub extern "C" fn sfs_write(handle: *mut c_void, stream: i64, buf: *const c_void, len: u64) -> i64 {
     let sfs = unsafe { &*(handle as *const Sfs) };
     let sh = StreamHandle::from_id(stream as u64);
     let buf = unsafe { std::slice::from_raw_parts(buf as *const u8, len as usize) };

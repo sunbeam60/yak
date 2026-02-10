@@ -232,9 +232,8 @@ impl StreamLayer for StreamsFromFiles {
         let id = state.next_stream_id;
         let stream_path = self.stream_path(id);
 
-        fs::File::create(&stream_path).map_err(|e| {
-            SfsError::IoError(format!("failed to create stream {}: {}", id, e))
-        })?;
+        fs::File::create(&stream_path)
+            .map_err(|e| SfsError::IoError(format!("failed to create stream {}: {}", id, e)))?;
 
         state.next_stream_id += 1;
         let next_id = state.next_stream_id;
@@ -285,9 +284,8 @@ impl StreamLayer for StreamsFromFiles {
         }
         drop(state);
 
-        fs::remove_file(&path).map_err(|e| {
-            SfsError::IoError(format!("failed to delete stream {}: {}", id, e))
-        })?;
+        fs::remove_file(&path)
+            .map_err(|e| SfsError::IoError(format!("failed to delete stream {}: {}", id, e)))?;
         Ok(())
     }
 
@@ -384,12 +382,16 @@ impl StreamLayer for StreamsFromFiles {
             state.next_stream_id
         };
 
-        let mut header = Vec::new();
-        // Magic
-        header.extend_from_slice(b"stream_fs");
-        header.push(0); // layout version 0
         // L3 section: | length: u16 | "strfil" | version: u8 | next_stream_id: u64 |
         let l3_len: u16 = 2 + 6 + 1 + 8; // = 17
+        let total_header_length: u16 = 12 + l3_len + upper_layers.len() as u16;
+
+        let mut header = Vec::new();
+        // Magic: "stream_fs" + version + total_header_length
+        header.extend_from_slice(b"stream_fs");
+        header.push(0); // layout version 0
+        header.extend_from_slice(&total_header_length.to_le_bytes());
+        // L3 section
         header.extend_from_slice(&l3_len.to_le_bytes());
         header.extend_from_slice(b"strfil");
         header.push(0); // version
@@ -409,27 +411,31 @@ impl StreamLayer for StreamsFromFiles {
         let data = fs::read(&path)
             .map_err(|e| SfsError::IoError(format!("failed to read header: {}", e)))?;
 
-        // Verify magic (bytes 0..9 == "stream_fs", byte 9 == 0)
-        if data.len() < 10 || &data[0..9] != b"stream_fs" || data[9] != 0 {
+        // Verify magic (bytes 0..9 == "stream_fs", byte 9 == version, bytes 10..12 == total_header_length)
+        if data.len() < 12 || &data[0..9] != b"stream_fs" || data[9] != 0 {
             return Err(SfsError::IoError("invalid SFS header magic".to_string()));
         }
 
-        // Read L3 section length at offset 10, verify "strfil" identifier
-        if data.len() < 12 {
-            return Err(SfsError::IoError("header too short for L3 section".to_string()));
+        // Read L3 section length at offset 12, verify "strfil" identifier
+        if data.len() < 14 {
+            return Err(SfsError::IoError(
+                "header too short for L3 section".to_string(),
+            ));
         }
-        let l3_len = u16::from_le_bytes([data[10], data[11]]) as usize;
-        if data.len() < 10 + l3_len {
-            return Err(SfsError::IoError("header too short for L3 data".to_string()));
+        let l3_len = u16::from_le_bytes([data[12], data[13]]) as usize;
+        if data.len() < 12 + l3_len {
+            return Err(SfsError::IoError(
+                "header too short for L3 data".to_string(),
+            ));
         }
-        if &data[12..18] != b"strfil" {
+        if &data[14..20] != b"strfil" {
             return Err(SfsError::IoError(format!(
                 "expected L3 identifier 'strfil', got '{}'",
-                String::from_utf8_lossy(&data[12..18])
+                String::from_utf8_lossy(&data[14..20])
             )));
         }
 
         // Return remainder (L4 section and above)
-        Ok(data[10 + l3_len..].to_vec())
+        Ok(data[12 + l3_len..].to_vec())
     }
 }

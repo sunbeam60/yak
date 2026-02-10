@@ -415,8 +415,7 @@ impl<L1: FileLayer> BlockLayer for BlocksInFile<L1> {
         }
 
         // 5. Build claimed set and check for out-of-range
-        let claimed_set: std::collections::HashSet<u64> =
-            claimed_blocks.iter().cloned().collect();
+        let claimed_set: std::collections::HashSet<u64> = claimed_blocks.iter().cloned().collect();
         for &block_id in claimed_blocks {
             if block_id >= total_blocks {
                 issues.push(format!(

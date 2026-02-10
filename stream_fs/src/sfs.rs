@@ -322,7 +322,10 @@ impl<L3: StreamLayer> Sfs<L3> {
         stream_ids.push(dir_stream_id);
 
         // Open and read directory entries
-        let handle = match self.layer3.open_stream_blocking(dir_stream_id, OpenMode::Read) {
+        let handle = match self
+            .layer3
+            .open_stream_blocking(dir_stream_id, OpenMode::Read)
+        {
             Ok(h) => h,
             Err(e) => {
                 issues.push(format!(

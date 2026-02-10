@@ -315,8 +315,7 @@ impl BlockLayer for BlocksFromFiles {
             }
         }
 
-        let claimed_set: std::collections::HashSet<u64> =
-            claimed_blocks.iter().cloned().collect();
+        let claimed_set: std::collections::HashSet<u64> = claimed_blocks.iter().cloned().collect();
 
         // Blocks on disk but not claimed
         for &id in &disk_blocks {

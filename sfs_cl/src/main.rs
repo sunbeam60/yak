@@ -521,7 +521,11 @@ fn cmd_verify(args: &[String]) -> Result<(), ()> {
                 }
             }
             sfs.close();
-            if issues.is_empty() { Ok(()) } else { Err(()) }
+            if issues.is_empty() {
+                Ok(())
+            } else {
+                Err(())
+            }
         }
         Err(e) => {
             eprintln!("Error running verify: {}", e);

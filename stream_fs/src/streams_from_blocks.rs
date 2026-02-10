@@ -559,6 +559,13 @@ fn deallocate_tree<L2: BlockLayer>(
     Ok(())
 }
 
+/// Accumulator for collecting block IDs and issues during pyramid tree walks.
+struct TreeCollector<'a> {
+    blocks: &'a mut Vec<u64>,
+    issues: &'a mut Vec<String>,
+    label: &'a str,
+}
+
 /// Recursively collect all block IDs in a pyramid tree (data + redirector blocks).
 /// Used by `verify` to enumerate all blocks belonging to a stream.
 fn collect_tree_blocks<L2: BlockLayer>(
@@ -567,11 +574,9 @@ fn collect_tree_blocks<L2: BlockLayer>(
     depth: u32,
     fan_out: u64,
     block_index_width: u8,
-    blocks: &mut Vec<u64>,
-    issues: &mut Vec<String>,
-    label: &str,
+    collector: &mut TreeCollector<'_>,
 ) {
-    blocks.push(block);
+    collector.blocks.push(block);
 
     if depth == 0 {
         return; // Data block, already collected
@@ -588,16 +593,14 @@ fn collect_tree_blocks<L2: BlockLayer>(
                         depth - 1,
                         fan_out,
                         block_index_width,
-                        blocks,
-                        issues,
-                        label,
+                        collector,
                     );
                 }
             }
             Err(e) => {
-                issues.push(format!(
+                collector.issues.push(format!(
                     "L3: stream {}: error reading redirector block {} slot {}: {}",
-                    label, block, slot, e
+                    collector.label, block, slot, e
                 ));
             }
         }
@@ -1342,28 +1345,30 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
         let biw = self.block_index_width_val();
 
         // 1. Clone the Streams stream descriptor (out-of-band)
-        let streams_desc = self.streams_descriptor.lock().unwrap().clone();
+        let streams_desc = *self.streams_descriptor.lock().unwrap();
 
         // 2. Collect blocks belonging to the Streams stream itself
         if streams_desc.size > 0 {
             let num_blocks = data_blocks_needed(streams_desc.size, bs);
             let depth = pyramid_depth(num_blocks, fo);
+            let mut collector = TreeCollector {
+                blocks: &mut all_claimed_blocks,
+                issues: &mut issues,
+                label: "Streams-stream",
+            };
             collect_tree_blocks(
                 &self.layer2,
                 streams_desc.top_block,
                 depth,
                 fo,
                 biw,
-                &mut all_claimed_blocks,
-                &mut issues,
-                "Streams-stream",
+                &mut collector,
             );
         }
 
         // 3. Read all stream descriptors, build set of active stream IDs
         let num_slots = streams_desc.size / DESCRIPTOR_SIZE;
-        let claimed_set: std::collections::HashSet<u64> =
-            claimed_streams.iter().cloned().collect();
+        let claimed_set: std::collections::HashSet<u64> = claimed_streams.iter().cloned().collect();
         let mut active_on_disk = std::collections::HashSet::new();
 
         for i in 0..num_slots {
@@ -1384,15 +1389,19 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
                         if desc.size > 0 {
                             let num_blocks = data_blocks_needed(desc.size, bs);
                             let depth = pyramid_depth(num_blocks, fo);
+                            let stream_label = i.to_string();
+                            let mut collector = TreeCollector {
+                                blocks: &mut all_claimed_blocks,
+                                issues: &mut issues,
+                                label: &stream_label,
+                            };
                             collect_tree_blocks(
                                 &self.layer2,
                                 desc.top_block,
                                 depth,
                                 fo,
                                 biw,
-                                &mut all_claimed_blocks,
-                                &mut issues,
-                                &i.to_string(),
+                                &mut collector,
                             );
                         }
                     }

@@ -476,8 +476,7 @@ impl StreamLayer for StreamsFromFiles {
             }
         }
 
-        let claimed_set: std::collections::HashSet<u64> =
-            claimed_streams.iter().cloned().collect();
+        let claimed_set: std::collections::HashSet<u64> = claimed_streams.iter().cloned().collect();
 
         // Streams on disk but not claimed by L4
         for &id in &disk_streams {

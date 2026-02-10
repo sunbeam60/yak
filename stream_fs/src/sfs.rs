@@ -988,7 +988,7 @@ impl<L3: StreamLayer> Sfs<L3> {
             let entry = entries
                 .iter()
                 .find(|e| e.name == dir_name)
-                .ok_or_else(|| SfsError::NotFound(format!("parent directory does not exist")))?;
+                .ok_or_else(|| SfsError::NotFound("parent directory does not exist".to_string()))?;
             current_id = entry.id;
         }
 

@@ -57,6 +57,11 @@ pub trait FileLayer: Send + Sync {
     /// Get current file length in bytes.
     fn len(&self) -> Result<u64, SfsError>;
 
+    /// Check whether the file is empty (length == 0).
+    fn is_empty(&self) -> Result<bool, SfsError> {
+        Ok(self.len()? == 0)
+    }
+
     /// Set file length. Used to grow the file when allocating new blocks,
     /// or to shrink it.
     fn set_len(&self, len: u64) -> Result<(), SfsError>;

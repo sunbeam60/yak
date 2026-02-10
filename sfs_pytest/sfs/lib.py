@@ -117,6 +117,19 @@ def _load_library():
     lib.sfs_truncate.restype = ctypes.c_int
     lib.sfs_truncate.argtypes = [ctypes.c_void_p, ctypes.c_int64, ctypes.c_uint64]
 
+    # --- Verify ---
+    lib.sfs_verify.restype = ctypes.c_void_p
+    lib.sfs_verify.argtypes = [ctypes.c_void_p]
+
+    lib.sfs_verify_count.restype = ctypes.c_int
+    lib.sfs_verify_count.argtypes = [ctypes.c_void_p]
+
+    lib.sfs_verify_issue.restype = ctypes.c_char_p
+    lib.sfs_verify_issue.argtypes = [ctypes.c_void_p, ctypes.c_int]
+
+    lib.sfs_verify_free.restype = None
+    lib.sfs_verify_free.argtypes = [ctypes.c_void_p]
+
     return lib
 
 

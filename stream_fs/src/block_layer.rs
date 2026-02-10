@@ -74,4 +74,14 @@ pub trait BlockLayer: Send + Sync {
     /// L2 reads the full header from disk, verifies the magic and its own
     /// section, then returns the remainder (L3 + L4 sections).
     fn load_header(&self) -> Result<Vec<u8>, SfsError>;
+
+    /// Run L2 integrity checks. `claimed_blocks` are block IDs that upper
+    /// layers assert are in use. L2 validates that claimed + free == all blocks,
+    /// with no overlaps, no orphans, and no free-list cycles.
+    /// Returns a list of issues found (including any L1 issues).
+    /// Default implementation returns empty (no checks).
+    fn verify(&self, claimed_blocks: &[u64]) -> Result<Vec<String>, SfsError> {
+        let _ = claimed_blocks;
+        Ok(Vec::new())
+    }
 }

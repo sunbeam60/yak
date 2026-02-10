@@ -55,6 +55,12 @@ pub trait StreamLayer: Send + Sync {
     /// Check whether a stream with the given identifier exists.
     fn stream_exists(&self, id: u64) -> bool;
 
+    /// Return the number of active (non-free) streams.
+    fn stream_count(&self) -> Result<u64, SfsError>;
+
+    /// Return the identifiers of all active (non-free) streams.
+    fn stream_ids(&self) -> Result<Vec<u64>, SfsError>;
+
     /// Open an existing stream by identifier.
     /// Enforces locking: one writer OR many readers per stream.
     /// Returns `LockConflict` immediately if the stream is already locked
@@ -102,4 +108,11 @@ pub trait StreamLayer: Send + Sync {
     /// Returns the concatenated header sections that were passed to
     /// `store_header()` — i.e. everything except this layer's own section.
     fn load_header(&self) -> Result<Vec<u8>, SfsError>;
+
+    /// Run L3 integrity checks. `claimed_streams` are stream IDs that L4
+    /// asserts should exist (directory streams + data streams).
+    /// L3 validates stream descriptors, walks pyramid structures to collect
+    /// all block IDs, then passes them down to L2 for verification.
+    /// Returns a list of issues found (including L2 and L1 issues).
+    fn verify(&self, claimed_streams: &[u64]) -> Result<Vec<String>, SfsError>;
 }

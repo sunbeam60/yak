@@ -356,4 +356,109 @@ impl<L1: FileLayer> BlockLayer for BlocksInFile<L1> {
 
         Ok(header_data[l2_len..].to_vec())
     }
+
+    fn verify(&self, claimed_blocks: &[u64]) -> Result<Vec<String>, SfsError> {
+        let mut issues = Vec::new();
+
+        // 1. Run L1 verification
+        issues.extend(self.file.verify()?);
+
+        // 2. Read current state
+        let state = self.state.lock().unwrap();
+        let total_blocks = state.total_blocks;
+        let free_list_head = state.free_list_head;
+        drop(state);
+
+        let sentinel = self.sentinel();
+        let block_size = self.block_size() as u64;
+
+        // 3. Check file size consistency
+        let file_len = self.file.len()?;
+        let expected_len = self.file.data_offset() + total_blocks * block_size;
+        if file_len != expected_len {
+            issues.push(format!(
+                "L2: file size ({}) does not match expected ({}) for {} blocks",
+                file_len, expected_len, total_blocks
+            ));
+        }
+
+        // 4. Walk the free list, collecting free block IDs and detecting cycles
+        let mut free_blocks = std::collections::HashSet::new();
+        let mut current = free_list_head;
+        let mut steps = 0u64;
+        while current != sentinel {
+            if current >= total_blocks {
+                issues.push(format!(
+                    "L2: free list references block {} which is >= total_blocks ({})",
+                    current, total_blocks
+                ));
+                break;
+            }
+            if !free_blocks.insert(current) {
+                issues.push(format!(
+                    "L2: free list cycle detected at block {} after {} steps",
+                    current, steps
+                ));
+                break;
+            }
+            steps += 1;
+            if steps > total_blocks {
+                issues.push("L2: free list longer than total_blocks (cycle likely)".to_string());
+                break;
+            }
+            // Read next pointer from block
+            let biw = self.block_index_width as usize;
+            let mut next_buf = [0u8; 8];
+            self.file
+                .read(self.block_offset(current), &mut next_buf[..biw])?;
+            current = u64::from_le_bytes(next_buf);
+        }
+
+        // 5. Build claimed set and check for out-of-range
+        let claimed_set: std::collections::HashSet<u64> =
+            claimed_blocks.iter().cloned().collect();
+        for &block_id in claimed_blocks {
+            if block_id >= total_blocks {
+                issues.push(format!(
+                    "L2: claimed block {} is >= total_blocks ({})",
+                    block_id, total_blocks
+                ));
+            }
+        }
+
+        // 6. Check for duplicate claims (a block claimed by two streams)
+        if claimed_set.len() != claimed_blocks.len() {
+            let mut seen = std::collections::HashSet::new();
+            for &block_id in claimed_blocks {
+                if !seen.insert(block_id) {
+                    issues.push(format!(
+                        "L2: block {} claimed by multiple streams",
+                        block_id
+                    ));
+                }
+            }
+        }
+
+        // 7. Check overlap between claimed and free
+        for &block_id in &claimed_set {
+            if free_blocks.contains(&block_id) {
+                issues.push(format!(
+                    "L2: block {} is both claimed by a stream and on the free list",
+                    block_id
+                ));
+            }
+        }
+
+        // 8. Check for orphaned blocks (not claimed, not free)
+        for block_id in 0..total_blocks {
+            if !claimed_set.contains(&block_id) && !free_blocks.contains(&block_id) {
+                issues.push(format!(
+                    "L2: block {} is orphaned (not claimed by any stream, not on free list)",
+                    block_id
+                ));
+            }
+        }
+
+        Ok(issues)
+    }
 }

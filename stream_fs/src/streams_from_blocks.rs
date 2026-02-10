@@ -559,6 +559,51 @@ fn deallocate_tree<L2: BlockLayer>(
     Ok(())
 }
 
+/// Recursively collect all block IDs in a pyramid tree (data + redirector blocks).
+/// Used by `verify` to enumerate all blocks belonging to a stream.
+fn collect_tree_blocks<L2: BlockLayer>(
+    layer2: &L2,
+    block: u64,
+    depth: u32,
+    fan_out: u64,
+    block_index_width: u8,
+    blocks: &mut Vec<u64>,
+    issues: &mut Vec<String>,
+    label: &str,
+) {
+    blocks.push(block);
+
+    if depth == 0 {
+        return; // Data block, already collected
+    }
+
+    // Redirector block: recurse into children
+    for slot in 0..fan_out {
+        match read_block_index(layer2, block, slot, block_index_width) {
+            Ok(child) => {
+                if child != block_sentinel(block_index_width) {
+                    collect_tree_blocks(
+                        layer2,
+                        child,
+                        depth - 1,
+                        fan_out,
+                        block_index_width,
+                        blocks,
+                        issues,
+                        label,
+                    );
+                }
+            }
+            Err(e) => {
+                issues.push(format!(
+                    "L3: stream {}: error reading redirector block {} slot {}: {}",
+                    label, block, slot, e
+                ));
+            }
+        }
+    }
+}
+
 /// Deallocate data blocks from `keep_blocks` to `total_blocks - 1`,
 /// and any redirector blocks that become empty.
 fn deallocate_excess_blocks<L2: BlockLayer>(
@@ -1058,6 +1103,42 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
         result
     }
 
+    fn stream_count(&self) -> Result<u64, SfsError> {
+        self.acquire_lock(STREAMS_STREAM_ID, OpenMode::Read, true)?;
+        let result = {
+            let streams_desc = self.streams_descriptor.lock().unwrap();
+            let num_slots = streams_desc.size / DESCRIPTOR_SIZE;
+            let mut count = 0u64;
+            for i in 0..num_slots {
+                let desc = self.read_descriptor(&streams_desc, i)?;
+                if !desc.is_free() {
+                    count += 1;
+                }
+            }
+            Ok(count)
+        };
+        self.release_lock(STREAMS_STREAM_ID, OpenMode::Read);
+        result
+    }
+
+    fn stream_ids(&self) -> Result<Vec<u64>, SfsError> {
+        self.acquire_lock(STREAMS_STREAM_ID, OpenMode::Read, true)?;
+        let result = {
+            let streams_desc = self.streams_descriptor.lock().unwrap();
+            let num_slots = streams_desc.size / DESCRIPTOR_SIZE;
+            let mut ids = Vec::new();
+            for i in 0..num_slots {
+                let desc = self.read_descriptor(&streams_desc, i)?;
+                if !desc.is_free() {
+                    ids.push(i);
+                }
+            }
+            Ok(ids)
+        };
+        self.release_lock(STREAMS_STREAM_ID, OpenMode::Read);
+        result
+    }
+
     fn open_stream(&self, id: u64, mode: OpenMode) -> Result<Self::Handle, SfsError> {
         self.open_stream_inner(id, mode, false)
     }
@@ -1250,5 +1331,104 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
     fn load_header(&self) -> Result<Vec<u8>, SfsError> {
         // Return the L4 section cached during open()
         Ok(self.l4_header_cache.lock().unwrap().clone())
+    }
+
+    fn verify(&self, claimed_streams: &[u64]) -> Result<Vec<String>, SfsError> {
+        let mut issues = Vec::new();
+        let mut all_claimed_blocks: Vec<u64> = Vec::new();
+
+        let bs = self.block_size();
+        let fo = self.fan_out();
+        let biw = self.block_index_width_val();
+
+        // 1. Clone the Streams stream descriptor (out-of-band)
+        let streams_desc = self.streams_descriptor.lock().unwrap().clone();
+
+        // 2. Collect blocks belonging to the Streams stream itself
+        if streams_desc.size > 0 {
+            let num_blocks = data_blocks_needed(streams_desc.size, bs);
+            let depth = pyramid_depth(num_blocks, fo);
+            collect_tree_blocks(
+                &self.layer2,
+                streams_desc.top_block,
+                depth,
+                fo,
+                biw,
+                &mut all_claimed_blocks,
+                &mut issues,
+                "Streams-stream",
+            );
+        }
+
+        // 3. Read all stream descriptors, build set of active stream IDs
+        let num_slots = streams_desc.size / DESCRIPTOR_SIZE;
+        let claimed_set: std::collections::HashSet<u64> =
+            claimed_streams.iter().cloned().collect();
+        let mut active_on_disk = std::collections::HashSet::new();
+
+        for i in 0..num_slots {
+            match self.read_descriptor(&streams_desc, i) {
+                Ok(desc) => {
+                    if !desc.is_free() {
+                        active_on_disk.insert(i);
+
+                        // Validate descriptor consistency
+                        if desc.size == 0 && desc.top_block != 0 {
+                            issues.push(format!(
+                                "L3: stream {}: size is 0 but top_block is {} (expected 0)",
+                                i, desc.top_block
+                            ));
+                        }
+
+                        // Collect blocks for this stream's pyramid
+                        if desc.size > 0 {
+                            let num_blocks = data_blocks_needed(desc.size, bs);
+                            let depth = pyramid_depth(num_blocks, fo);
+                            collect_tree_blocks(
+                                &self.layer2,
+                                desc.top_block,
+                                depth,
+                                fo,
+                                biw,
+                                &mut all_claimed_blocks,
+                                &mut issues,
+                                &i.to_string(),
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    issues.push(format!(
+                        "L3: error reading descriptor for stream {}: {}",
+                        i, e
+                    ));
+                }
+            }
+        }
+
+        // 4. Cross-check: streams claimed by L4 that don't exist at L3
+        for &stream_id in claimed_streams {
+            if !active_on_disk.contains(&stream_id) {
+                issues.push(format!(
+                    "L3: stream {} claimed by L4 but not found in stream descriptors",
+                    stream_id
+                ));
+            }
+        }
+
+        // 5. Cross-check: active streams at L3 that L4 doesn't claim
+        for &stream_id in &active_on_disk {
+            if !claimed_set.contains(&stream_id) {
+                issues.push(format!(
+                    "L3: stream {} exists in stream descriptors but is not claimed by L4 (orphaned stream)",
+                    stream_id
+                ));
+            }
+        }
+
+        // 6. Pass all collected blocks to L2 for verification
+        issues.extend(self.layer2.verify(&all_claimed_blocks)?);
+
+        Ok(issues)
     }
 }

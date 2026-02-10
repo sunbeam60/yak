@@ -81,4 +81,10 @@ pub trait FileLayer: Send + Sync {
     /// Read and return the upper layer header sections
     /// (everything after magic + L1 section).
     fn load_header(&self) -> Result<Vec<u8>, SfsError>;
+
+    /// Run L1 integrity checks. Returns a list of issues found.
+    /// Default implementation returns empty (no checks).
+    fn verify(&self) -> Result<Vec<String>, SfsError> {
+        Ok(Vec::new())
+    }
 }

@@ -135,11 +135,11 @@ An SFS file must handle being accessed by multiple threads within the same proce
 
 SFS files are not ACID compliant. A process crash during a write is likely to leave the SFS file in an inconsistent state.
 
-## Endianness safety
+## Endianness
 
-SFS keeps track of the endianness of files that it opens and respects the endianness of the file when it writes. For new files that SFS creates, SFS uses the endianness of the platform creating the file.
+All multi-byte management data in an SFS file (block indices, stream lengths, header fields, directory entry lengths, etc.) is stored in little-endian byte order. This applies to all platforms — on big-endian systems, the library performs the necessary byte-swapping transparently.
 
-Naturally, because SFS doesn't know anything about that data that gets written by callers, it cannot make any guarantees or conversions of endianness of written and read stream data. But all "management" data, i.e. the data that SFS does know about (block indices, stream lengths etc) is written in the endianness that the file was originally written in, or in a format that's endian independent (UTF-8).
+Naturally SFS cannot make any guarantees about the endianness of user-written stream data, since it cannot know what is written. Callers are responsible for their own data encoding.
 
 ## Opening and creating a SFS file
 
@@ -246,11 +246,11 @@ L3 deals with linking blocks together from L2 and presenting them as identified 
 
 L3's API, which is used by L4, should solely concern itself with:
 
-* Creating a new stream (returns a stream handle).
+* Creating a new stream (returns a stream identifier).
 * Verifying that a stream exists, by identifier.
 * Opening an existing stream in read or write mode, by identifier (returns a stream handle).
 * Closing an existing stream, by handle.
-* Deleting an existing stream by handle.
+* Deleting an existing stream by identifier. The stream must be closed before deletion.
 * Reading from a stream, by handle.
 * Writing to a stream, by handle and starting position, potentially enlarging the stream in the process.
 * Shortening an existing stream, by handle.

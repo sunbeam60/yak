@@ -273,6 +273,92 @@ impl<L3: StreamLayer> Sfs<L3> {
         // Dropping self closes all handles via HashMap drop.
     }
 
+    /// Run integrity verification across all layers.
+    ///
+    /// L4 walks the directory tree to collect all stream IDs (both directory
+    /// streams and data streams), then passes them to L3 for further
+    /// validation. Returns a list of issues found across all layers.
+    ///
+    /// This is a read-only operation that works regardless of open mode.
+    pub fn verify(&self) -> Result<Vec<String>, SfsError> {
+        let mut issues = Vec::new();
+
+        // Collect all stream IDs by walking the directory tree
+        let mut all_stream_ids = Vec::new();
+        self.collect_stream_ids_recursive(
+            self.root_dir_stream_id,
+            &mut all_stream_ids,
+            &mut issues,
+        )?;
+
+        // Check for duplicate stream IDs (a stream referenced from multiple dirs)
+        {
+            let mut seen = std::collections::HashSet::new();
+            for &id in &all_stream_ids {
+                if !seen.insert(id) {
+                    issues.push(format!(
+                        "L4: stream ID {} appears in multiple directory entries",
+                        id
+                    ));
+                }
+            }
+        }
+
+        // Pass claimed streams to L3 for verification
+        issues.extend(self.layer3.verify(&all_stream_ids)?);
+
+        Ok(issues)
+    }
+
+    /// Recursively walk directory streams to collect all stream IDs.
+    /// Adds both directory stream IDs and data stream IDs.
+    fn collect_stream_ids_recursive(
+        &self,
+        dir_stream_id: u64,
+        stream_ids: &mut Vec<u64>,
+        issues: &mut Vec<String>,
+    ) -> Result<(), SfsError> {
+        // Include this directory stream itself
+        stream_ids.push(dir_stream_id);
+
+        // Open and read directory entries
+        let handle = match self.layer3.open_stream_blocking(dir_stream_id, OpenMode::Read) {
+            Ok(h) => h,
+            Err(e) => {
+                issues.push(format!(
+                    "L4: failed to open directory stream {} for verification: {}",
+                    dir_stream_id, e
+                ));
+                return Ok(());
+            }
+        };
+
+        let entries = match self.read_entries_from_handle(&handle) {
+            Ok(e) => e,
+            Err(e) => {
+                issues.push(format!(
+                    "L4: failed to read entries from directory stream {}: {}",
+                    dir_stream_id, e
+                ));
+                let _ = self.layer3.close_stream(handle);
+                return Ok(());
+            }
+        };
+        self.layer3.close_stream(handle)?;
+
+        for entry in &entries {
+            if entry.name.ends_with('/') {
+                // Directory entry — recurse
+                self.collect_stream_ids_recursive(entry.id, stream_ids, issues)?;
+            } else {
+                // Data stream entry
+                stream_ids.push(entry.id);
+            }
+        }
+
+        Ok(())
+    }
+
     /// The number of bytes used for block indices on disk.
     pub fn block_index_width(&self) -> u8 {
         self.layer3.block_index_width()

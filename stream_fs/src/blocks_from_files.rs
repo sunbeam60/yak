@@ -299,4 +299,45 @@ impl BlockLayer for BlocksFromFiles {
         // Return remainder (L3 + L4 sections)
         Ok(data[12 + l2_len..].to_vec())
     }
+
+    fn verify(&self, claimed_blocks: &[u64]) -> Result<Vec<String>, SfsError> {
+        let mut issues = Vec::new();
+
+        // Collect existing .block files on disk
+        let state = self.state.lock().unwrap();
+        let next_id = state.next_block_id;
+        drop(state);
+
+        let mut disk_blocks = std::collections::HashSet::new();
+        for id in 0..next_id {
+            if self.block_path(id).exists() {
+                disk_blocks.insert(id);
+            }
+        }
+
+        let claimed_set: std::collections::HashSet<u64> =
+            claimed_blocks.iter().cloned().collect();
+
+        // Blocks on disk but not claimed
+        for &id in &disk_blocks {
+            if !claimed_set.contains(&id) {
+                issues.push(format!(
+                    "L2-mock: block {} exists on disk but is not claimed",
+                    id
+                ));
+            }
+        }
+
+        // Blocks claimed but not on disk
+        for &id in &claimed_set {
+            if !disk_blocks.contains(&id) {
+                issues.push(format!(
+                    "L2-mock: block {} is claimed but does not exist on disk",
+                    id
+                ));
+            }
+        }
+
+        Ok(issues)
+    }
 }

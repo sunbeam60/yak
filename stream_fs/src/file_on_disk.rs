@@ -291,4 +291,39 @@ impl FileLayer for FileOnDisk {
             .map_err(|e| SfsError::IoError(format!("failed to read header: {}", e)))?;
         Ok(buf)
     }
+
+    fn verify(&self) -> Result<Vec<String>, SfsError> {
+        let mut issues = Vec::new();
+
+        // Check file size >= data_offset
+        let file_len = self.len()?;
+        if file_len < self.data_offset {
+            issues.push(format!(
+                "L1: file size ({}) is less than data_offset ({})",
+                file_len, self.data_offset
+            ));
+        }
+
+        // Re-read and validate magic header
+        let mut magic_buf = [0u8; MAGIC_SIZE];
+        self.read(0, &mut magic_buf)?;
+        if &magic_buf[0..9] != MAGIC {
+            issues.push("L1: file magic 'stream_fs' is corrupted".to_string());
+        }
+        if magic_buf[9] != HEADER_FORMAT_VERSION {
+            issues.push(format!(
+                "L1: header format version {} does not match expected {}",
+                magic_buf[9], HEADER_FORMAT_VERSION
+            ));
+        }
+        let stored_header_len = u16::from_le_bytes([magic_buf[10], magic_buf[11]]);
+        if stored_header_len as u64 != self.data_offset {
+            issues.push(format!(
+                "L1: total_header_length in magic ({}) does not match data_offset ({})",
+                stored_header_len, self.data_offset
+            ));
+        }
+
+        Ok(issues)
+    }
 }

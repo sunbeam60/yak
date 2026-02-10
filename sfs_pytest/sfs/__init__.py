@@ -1,5 +1,7 @@
 """Python wrapper around the Stream File System C ABI."""
 
+from __future__ import annotations
+
 from enum import IntEnum
 
 from .lib import _lib, hello
@@ -193,3 +195,23 @@ class Sfs:
         result = _lib.sfs_truncate(self._handle, handle, new_len)
         if result != 0:
             _check_error()
+
+    # --- Verify ---
+
+    def verify(self) -> list[str]:
+        """Run integrity verification across all layers.
+
+        Returns a list of issue descriptions (empty = clean).
+        """
+        result_handle = _lib.sfs_verify(self._handle)
+        if result_handle is None:
+            _check_error()
+        try:
+            count = _lib.sfs_verify_count(result_handle)
+            issues = []
+            for i in range(count):
+                issue_ptr = _lib.sfs_verify_issue(result_handle, i)
+                issues.append(issue_ptr.decode("utf-8"))
+            return issues
+        finally:
+            _lib.sfs_verify_free(result_handle)

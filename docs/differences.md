@@ -1,26 +1,6 @@
 Differences between architecture and implementation
 
 # Major Differences
-## Endianness support — completely missing
-The architecture explicitly states: "SFS keeps track of the endianness of files that it opens and respects the endianness of the file when it writes. For new files that SFS creates, SFS uses the endianness of the platform creating the file."
-
-The code uses hardcoded little-endian everywhere (to_le_bytes() / from_le_bytes()). There's no endianness field in the header, no detection on open, and no mechanism to handle big-endian files. A file created on a big-endian platform would be unreadable on little-endian and vice versa.
-
-## L3 API: delete_stream takes ID, not handle
-Architecture says: "Deleting an existing stream by handle."
-
-Code: fn delete_stream(&self, id: u64) — takes a stream ID. The stream must be closed first. The architecture implies deleting while the stream is open (via handle), but the implementation requires it closed.
-
-## L3 API: create_stream returns ID, not handle
-Architecture says: "Creating a new stream (returns a stream handle)."
-
-Code: fn create_stream(&self) -> Result<u64, SfsError> — returns a stream ID. The stream is not auto-opened; L4 must call open_stream separately after creating. This is a deliberate design choice that simplifies L3, but deviates from the spec.
-
-## No L3 stream iteration/enumeration API
-Architecture says: "It provides functions for Layer 4 to discover how many data streams exist and to iterate over each data stream identifier."
-
-Code: StreamLayer has stream_exists(id: u64) -> bool but no way to enumerate or count streams. L4 discovers streams through directory entries, which works in practice, but an external L4 implementation couldn't iterate the raw stream namespace.
-
 ## No reserve() API in L4
 Architecture says: "Additionally there are utility functions to 'reserve' space for the data stream growing, which may be used to decrease the fragmentation of storage in the underlying layers."
 
@@ -29,7 +9,7 @@ Code: No reserve() method exists anywhere. Streams grow on-demand only.
 ## No L2 debug-mode block tracking
 Architecture says: "In debug builds, however, L2 must maintain tracking over which blocks it believes are in use and check, when asked to write, read or deallocate a block that the block has previously been allocated."
 
-Code: Neither BlocksInFile nor BlocksFromFiles has #[cfg(debug_assertions)] tracking. A double-free or write-to-freed-block would go undetected.
+Code: Instead of `#[cfg(debug_assertions)]` runtime tracking, a `verify()` chain (L4→L3→L2→L1) validates cross-layer integrity on demand. L4 walks the directory tree to collect stream IDs, L3 walks pyramid structures to collect block IDs, L2 cross-checks against the free list. This is arguably better: it catches orphaned blocks, free-list cycles, and stream/block mismatches in any build, not just debug builds.
 
 ## Sfs::close() doesn't flush open stream handles
 Architecture says: "Data streams should be closed when reading and writing is no longer needed, which ensures that any last writes are written the data stream."
@@ -70,19 +50,15 @@ Code: BlocksFromFiles (mock) deletes the file on deallocate and always allocates
 Summary Table
 |     | Area              | Architecture             | Code                     | Severity |
 | --- | ----------------- | ------------------------ | ------------------------ | -------- |
-| 1   | Endianness        | Track & respect          | Hardcoded LE             | Major    |
-| 2   | L3 delete         | By handle                | By ID, must be closed    | Major    |
-| 3   | L3 create         | Returns handle           | Returns ID               | Major    |
-| 4   | L3 iteration      | Enumerate streams        | Only stream_exists       | Major    |
-| 5   | L4 reserve        | Required                 | Missing                  | Major    |
-| 6   | L2 debug tracking | Required in debug builds | Missing                  | Major    |
-| 7   | Sfs::close        | Flush open handles       | Drops without flushing   | Major    |
-| 8   | L1 head position  | Explicit head API        | Offset-based (stateless) | Minor    |
-| 9   | L2 block size     | Bytes in header          | Shift exponent           | Minor    |
-| 10  | L2 batch alloc    | 1+ blocks                | 1 block only             | Minor    |
-| 11  | L2 flush          | Before mutex release     | After mutex release      | Minor    |
-| 12  | Streams lock      | RwLock                   | Condvar+Mutex            | Minor    |
-| 13  | Mock free list    | Required                 | Mock skips it            | Minor    |
+| 1   | L4 reserve        | Required                 | Missing                  | Major    |
+| 2   | L2 debug tracking | Required in debug builds | verify() chain instead   | Resolved |
+| 3   | Sfs::close        | Flush open handles       | Drops without flushing   | Major    |
+| 4   | L1 head position  | Explicit head API        | Offset-based (stateless) | Minor    |
+| 5   | L2 block size     | Bytes in header          | Shift exponent           | Minor    |
+| 6   | L2 batch alloc    | 1+ blocks                | 1 block only             | Minor    |
+| 7   | L2 flush          | Before mutex release     | After mutex release      | Minor    |
+| 8   | Streams lock      | RwLock                   | Condvar+Mutex            | Minor    |
+| 9   | Mock free list    | Required                 | Mock skips it            | Minor    |
 
-Items 2, 3, 8, and 12 were conscious implementation trade-offs that are arguably better than the architecture describes. Items 1, 5, 6, and 7 are genuine gaps. Item 7 is the most immediate risk (silent data loss).
+Items 4 and 8 were conscious implementation trade-offs that are arguably better than the architecture describes. Item 2 is resolved via `verify()`. Items 1 and 3 are genuine gaps. Item 3 is the most immediate risk (silent data loss).
 

@@ -70,6 +70,46 @@ mod tests {
     }
 
     #[test]
+    fn test_stream_enumeration() {
+        let path = std::env::temp_dir().join("sfs_test_stream_enum.sfs");
+        let _ = std::fs::remove_file(&path);
+        let path_str = path.to_str().unwrap();
+
+        // Test L3 directly via StreamsFromBlocks
+        type L3 = StreamsFromBlocks<BlocksInFile<FileOnDisk>>;
+        let l3 = L3::create(path_str, 4, 12, &[]).unwrap();
+
+        // Initially no streams
+        assert_eq!(l3.stream_count().unwrap(), 0);
+        assert!(l3.stream_ids().unwrap().is_empty());
+
+        // Create 3 streams
+        let id0 = l3.create_stream().unwrap();
+        let id1 = l3.create_stream().unwrap();
+        let id2 = l3.create_stream().unwrap();
+
+        assert_eq!(l3.stream_count().unwrap(), 3);
+        let mut ids = l3.stream_ids().unwrap();
+        ids.sort();
+        assert_eq!(ids, vec![id0, id1, id2]);
+
+        // Delete the middle stream
+        l3.delete_stream(id1).unwrap();
+        assert_eq!(l3.stream_count().unwrap(), 2);
+        let mut ids = l3.stream_ids().unwrap();
+        ids.sort();
+        assert_eq!(ids, vec![id0, id2]);
+
+        // Create another — should reuse the freed slot
+        let id3 = l3.create_stream().unwrap();
+        assert_eq!(id3, id1); // reuses freed descriptor slot
+        assert_eq!(l3.stream_count().unwrap(), 3);
+        let mut ids = l3.stream_ids().unwrap();
+        ids.sort();
+        assert_eq!(ids, vec![id0, id1, id2]);
+    }
+
+    #[test]
     fn test_depth2_write() {
         let path = std::env::temp_dir().join("sfs_test_depth2.sfs");
         let _ = std::fs::remove_file(&path); // clean up from previous run
@@ -93,5 +133,40 @@ mod tests {
 
         sfs.close_stream(sh).unwrap();
         sfs.close();
+    }
+
+    #[test]
+    fn test_verify_clean() {
+        let path = std::env::temp_dir().join("sfs_test_verify.sfs");
+        let _ = std::fs::remove_file(&path);
+        let path_str = path.to_str().unwrap();
+
+        // Create with dirs, streams, and data
+        {
+            let sfs = SfsDefault::create(path_str, 4, 12).unwrap();
+            sfs.mkdir("docs").unwrap();
+
+            let sh = sfs.create_stream("hello.txt").unwrap();
+            sfs.write(&sh, b"Hello, World!").unwrap();
+            sfs.close_stream(sh).unwrap();
+
+            let sh = sfs.create_stream("docs/readme.txt").unwrap();
+            sfs.write(&sh, b"A readme").unwrap();
+            sfs.close_stream(sh).unwrap();
+
+            // Verify while open for writing
+            let issues = sfs.verify().unwrap();
+            assert!(issues.is_empty(), "Issues found: {:?}", issues);
+
+            sfs.close();
+        }
+
+        // Reopen read-only and verify
+        {
+            let sfs = SfsDefault::open(path_str, OpenMode::Read).unwrap();
+            let issues = sfs.verify().unwrap();
+            assert!(issues.is_empty(), "Issues found: {:?}", issues);
+            sfs.close();
+        }
     }
 }

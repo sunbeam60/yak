@@ -246,6 +246,28 @@ impl StreamLayer for StreamsFromFiles {
         self.stream_path(id).exists()
     }
 
+    fn stream_count(&self) -> Result<u64, SfsError> {
+        let state = self.state.lock().unwrap();
+        let mut count = 0u64;
+        for id in 0..state.next_stream_id {
+            if self.stream_path(id).exists() {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    fn stream_ids(&self) -> Result<Vec<u64>, SfsError> {
+        let state = self.state.lock().unwrap();
+        let mut ids = Vec::new();
+        for id in 0..state.next_stream_id {
+            if self.stream_path(id).exists() {
+                ids.push(id);
+            }
+        }
+        Ok(ids)
+    }
+
     fn open_stream(&self, id: u64, mode: OpenMode) -> Result<Self::Handle, SfsError> {
         self.open_stream_inner(id, mode, false)
     }
@@ -437,5 +459,47 @@ impl StreamLayer for StreamsFromFiles {
 
         // Return remainder (L4 section and above)
         Ok(data[12 + l3_len..].to_vec())
+    }
+
+    fn verify(&self, claimed_streams: &[u64]) -> Result<Vec<String>, SfsError> {
+        let mut issues = Vec::new();
+
+        // Collect existing .stream files on disk
+        let state = self.state.lock().unwrap();
+        let next_id = state.next_stream_id;
+        drop(state);
+
+        let mut disk_streams = std::collections::HashSet::new();
+        for id in 0..next_id {
+            if self.stream_path(id).exists() {
+                disk_streams.insert(id);
+            }
+        }
+
+        let claimed_set: std::collections::HashSet<u64> =
+            claimed_streams.iter().cloned().collect();
+
+        // Streams on disk but not claimed by L4
+        for &id in &disk_streams {
+            if !claimed_set.contains(&id) {
+                issues.push(format!(
+                    "L3-mock: stream {} exists on disk but is not claimed by L4",
+                    id
+                ));
+            }
+        }
+
+        // Streams claimed by L4 but not on disk
+        for &id in &claimed_set {
+            if !disk_streams.contains(&id) {
+                issues.push(format!(
+                    "L3-mock: stream {} is claimed by L4 but does not exist on disk",
+                    id
+                ));
+            }
+        }
+
+        // No blocks to pass down (L3 mock has no L2)
+        Ok(issues)
     }
 }

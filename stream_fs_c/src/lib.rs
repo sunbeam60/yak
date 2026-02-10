@@ -265,6 +265,60 @@ pub extern "C" fn sfs_list_free(list: *mut c_void) {
 }
 
 // ---------------------------------------------------------------------------
+// Verify
+// ---------------------------------------------------------------------------
+
+struct SfsVerifyResult {
+    issues: Vec<CString>,
+}
+
+/// Run integrity verification across all layers. Returns a result handle (NULL on error).
+/// Use sfs_verify_count/sfs_verify_issue to read issues, then sfs_verify_free to release.
+#[no_mangle]
+pub extern "C" fn sfs_verify(handle: *mut c_void) -> *mut c_void {
+    let sfs = unsafe { &*(handle as *const Sfs) };
+    match sfs.verify() {
+        Ok(issues) => {
+            let c_issues: Vec<CString> = issues
+                .into_iter()
+                .map(|s| CString::new(s).unwrap_or_else(|_| CString::new("?").unwrap()))
+                .collect();
+            Box::into_raw(Box::new(SfsVerifyResult { issues: c_issues })) as *mut c_void
+        }
+        Err(e) => {
+            set_last_error(&e.to_string());
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn sfs_verify_count(result: *mut c_void) -> c_int {
+    let result = unsafe { &*(result as *mut SfsVerifyResult) };
+    result.issues.len() as c_int
+}
+
+#[no_mangle]
+pub extern "C" fn sfs_verify_issue(result: *mut c_void, index: c_int) -> *const c_char {
+    let result = unsafe { &*(result as *mut SfsVerifyResult) };
+    if index < 0 || (index as usize) >= result.issues.len() {
+        return std::ptr::null();
+    }
+    result.issues[index as usize].as_ptr()
+}
+
+/// # Safety
+/// `result` must be a valid pointer returned by `sfs_verify` and not yet freed.
+#[no_mangle]
+pub extern "C" fn sfs_verify_free(result: *mut c_void) {
+    if !result.is_null() {
+        unsafe {
+            drop(Box::from_raw(result as *mut SfsVerifyResult));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Stream lifecycle
 // ---------------------------------------------------------------------------
 

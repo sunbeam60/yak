@@ -24,6 +24,7 @@ fn main() {
         "rm" => cmd_rm(&args[2..]),
         "mv" => cmd_mv(&args[2..]),
         "info" => cmd_info(&args[2..]),
+        "verify" => cmd_verify(&args[2..]),
         "hello" => {
             println!("{}", stream_fs::hello());
             Ok(())
@@ -57,6 +58,7 @@ fn print_usage() {
     eprintln!("  rm <sfs-file> <stream>                 Delete a stream");
     eprintln!("  mv <sfs-file> <old> <new>              Rename/move a stream");
     eprintln!("  info <sfs-file> <stream>               Show stream information");
+    eprintln!("  verify <sfs-file>                      Verify SFS integrity");
     eprintln!("  hello                                  Print a greeting");
 }
 
@@ -489,6 +491,40 @@ fn cmd_mv(args: &[String]) -> Result<(), ()> {
         }
         Err(e) => {
             eprintln!("Error renaming stream: {}", e);
+            Err(())
+        }
+    }
+}
+
+fn cmd_verify(args: &[String]) -> Result<(), ()> {
+    if args.len() != 1 {
+        eprintln!("Usage: sfs verify <sfs-file>");
+        return Err(());
+    }
+
+    let sfs = match Sfs::open(&args[0], OpenMode::Read) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error opening SFS file: {}", e);
+            return Err(());
+        }
+    };
+
+    match sfs.verify() {
+        Ok(issues) => {
+            if issues.is_empty() {
+                println!("OK — no issues found");
+            } else {
+                println!("Found {} issue(s):", issues.len());
+                for issue in &issues {
+                    println!("  - {}", issue);
+                }
+            }
+            sfs.close();
+            if issues.is_empty() { Ok(()) } else { Err(()) }
+        }
+        Err(e) => {
+            eprintln!("Error running verify: {}", e);
             Err(())
         }
     }

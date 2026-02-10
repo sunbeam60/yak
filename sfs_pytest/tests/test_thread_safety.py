@@ -8,6 +8,157 @@ import sfs
 
 NUM_THREADS = 40
 NUM_STREAMS = 10
+NUM_LIFECYCLE_THREADS = 20
+
+
+class TestStreamLifecycleStress:
+    """Stress-test concurrent stream creation, writing, closing, and deletion.
+
+    Unlike the other thread-safety tests which pre-create streams,
+    this hammers the descriptor allocation/deallocation paths and
+    concurrent directory-stream modifications.
+    """
+
+    @pytest.fixture
+    def burn_seconds(self, request):
+        return request.config.getoption("--burn-seconds")
+
+    def test_concurrent_create_write_close_delete(self, tmp_path, burn_seconds):
+        """Threads concurrently create, write, close, verify, and delete streams.
+
+        All threads share a single "arena" directory, maximising contention
+        on the directory stream write-lock (L4 uses open_stream_blocking so
+        threads queue up rather than failing).
+        Uses small blocks (64 bytes) to force multi-block growth quickly.
+        """
+        sfs_path = str(tmp_path / "lifecycle.sfs")
+        f = sfs.Sfs.create(sfs_path, block_index_width=4, block_size_shift=6)
+
+        # Single shared directory — all threads contend on the same
+        # directory stream write-lock.
+        f.mkdir("arena")
+
+        errors = []
+        barrier = threading.Barrier(NUM_LIFECYCLE_THREADS)
+
+        def lifecycle_thread(tid):
+            rounds = 0
+            try:
+                barrier.wait(timeout=5)
+                deadline = time.monotonic() + burn_seconds
+
+                while time.monotonic() < deadline:
+                    name = f"arena/t{tid}_r{rounds}"
+                    content = f"tid={tid},round={rounds}:".encode() + bytes(range(256))
+
+                    # Create and write — allocates descriptor + blocks
+                    h = f.create_stream(name)
+                    written = f.write(h, content)
+                    assert written == len(content), (
+                        f"T{tid} r{rounds}: wrote {written} != {len(content)}"
+                    )
+                    f.close_stream(h)
+
+                    # Reopen and verify — descriptor cached correctly
+                    h = f.open_stream(name, sfs.OpenMode.READ)
+                    length = f.stream_length(h)
+                    assert length == len(content), (
+                        f"T{tid} r{rounds}: length {length} != {len(content)}"
+                    )
+                    data = f.read(h, length)
+                    assert data == content, (
+                        f"T{tid} r{rounds}: content mismatch"
+                    )
+                    f.close_stream(h)
+
+                    # Delete — frees descriptor slot and blocks for reuse
+                    f.delete_stream(name)
+
+                    rounds += 1
+
+            except Exception as e:
+                errors.append(f"Thread {tid} (round {rounds}): {e}")
+
+        threads = []
+        for i in range(NUM_LIFECYCLE_THREADS):
+            t = threading.Thread(target=lifecycle_thread, args=(i,))
+            threads.append(t)
+            t.start()
+
+        for t in threads:
+            t.join(timeout=burn_seconds + 30)
+
+        f.close()
+        assert not errors, "Thread errors:\n" + "\n".join(errors)
+
+    def test_concurrent_create_accumulate(self, tmp_path, burn_seconds):
+        """Threads create many streams without deleting — forces descriptor stream growth.
+
+        Each thread creates streams in its own subdirectory so directory
+        contention is spread across multiple directory streams while
+        descriptor allocation contention is maximised on the shared
+        Streams stream.
+        """
+        sfs_path = str(tmp_path / "accumulate.sfs")
+        f = sfs.Sfs.create(sfs_path, block_index_width=4, block_size_shift=6)
+
+        # Each thread gets its own directory
+        for i in range(NUM_LIFECYCLE_THREADS):
+            f.mkdir(f"t{i}")
+
+        errors = []
+        barrier = threading.Barrier(NUM_LIFECYCLE_THREADS)
+
+        def accumulate_thread(tid):
+            rounds = 0
+            try:
+                barrier.wait(timeout=5)
+                deadline = time.monotonic() + burn_seconds
+
+                while time.monotonic() < deadline:
+                    name = f"t{tid}/s{rounds}"
+                    content = f"{tid}:{rounds}".encode() + b"\xAB" * 80
+
+                    h = f.create_stream(name)
+                    f.write(h, content)
+                    f.close_stream(h)
+
+                    # Verify immediately
+                    h = f.open_stream(name, sfs.OpenMode.READ)
+                    data = f.read(h, len(content) + 1)
+                    assert data == content, (
+                        f"T{tid} r{rounds}: verify failed"
+                    )
+                    f.close_stream(h)
+
+                    rounds += 1
+
+            except Exception as e:
+                errors.append(f"Thread {tid} (round {rounds}): {e}")
+
+        threads = []
+        for i in range(NUM_LIFECYCLE_THREADS):
+            t = threading.Thread(target=accumulate_thread, args=(i,))
+            threads.append(t)
+            t.start()
+
+        for t in threads:
+            t.join(timeout=burn_seconds + 30)
+
+        # Verify all streams survived
+        verify_errors = []
+        for i in range(NUM_LIFECYCLE_THREADS):
+            entries = f.list(f"t{i}")
+            for entry in entries:
+                h = f.open_stream(f"t{i}/{entry.name}", sfs.OpenMode.READ)
+                data = f.read(h, 200)
+                f.close_stream(h)
+                if not data:
+                    verify_errors.append(f"t{i}/{entry.name}: empty")
+
+        f.close()
+        all_errors = errors + verify_errors
+        assert not all_errors, "Thread errors:\n" + "\n".join(all_errors)
 
 
 class TestThreadSafety:

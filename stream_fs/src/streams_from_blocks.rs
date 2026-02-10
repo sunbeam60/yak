@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Mutex, RwLock};
+use std::sync::{Condvar, Mutex};
 
 use crate::block_layer::BlockLayer;
 use crate::stream_layer::StreamLayer;
@@ -15,6 +15,11 @@ const FREE_DESCRIPTOR_MARKER: u64 = u64::MAX;
 
 /// Size of a stream descriptor in bytes: u64 size + u64 top_block.
 const DESCRIPTOR_SIZE: u64 = 16;
+
+/// Well-known stream ID for the Streams stream in the lock map.
+/// u64::MAX can never be a valid stream ID (it would require an impossible
+/// offset in the Streams stream, and equals FREE_DESCRIPTOR_MARKER).
+const STREAMS_STREAM_ID: u64 = u64::MAX;
 
 /// Compute the sentinel value for a given block_index_width.
 /// All 0xFF bytes in `w` bytes, zero-extended to u64.
@@ -43,7 +48,7 @@ impl StreamDescriptor {
         self.top_block == FREE_DESCRIPTOR_MARKER
     }
 
-    fn to_bytes(&self) -> [u8; 16] {
+    fn to_bytes(self) -> [u8; 16] {
         let mut buf = [0u8; 16];
         buf[0..8].copy_from_slice(&self.size.to_le_bytes());
         buf[8..16].copy_from_slice(&self.top_block.to_le_bytes());
@@ -104,16 +109,20 @@ struct StreamsFromBlocksState {
 pub struct StreamsFromBlocks<L2: BlockLayer> {
     layer2: L2,
 
-    /// Out-of-band descriptor for the Streams stream, protected by RWLock.
-    /// Write lock: creating/deleting streams, flushing descriptors.
-    /// Read lock: reading descriptors (opening streams).
-    streams_lock: RwLock<StreamDescriptor>,
+    /// Out-of-band descriptor for the Streams stream.
+    /// Access control is via the lock map (STREAMS_STREAM_ID entry);
+    /// this Mutex is only for safe value access (never contends in practice).
+    streams_descriptor: Mutex<StreamDescriptor>,
 
     /// Cached L4 header blob (loaded during open, updated via store_header).
     l4_header_cache: Mutex<Vec<u8>>,
 
     /// Bookkeeping state: per-stream locks, open handles.
     state: Mutex<StreamsFromBlocksState>,
+
+    /// Signalled when any stream lock is released, waking threads blocked
+    /// in `acquire_lock`. Paired with `state`.
+    lock_released: Condvar,
 }
 
 // ---------------------------------------------------------------------------
@@ -122,10 +131,7 @@ pub struct StreamsFromBlocks<L2: BlockLayer> {
 
 /// Calculate the number of data blocks needed for `size` bytes.
 fn data_blocks_needed(size: u64, block_size: usize) -> u64 {
-    if size == 0 {
-        return 0;
-    }
-    (size + block_size as u64 - 1) / block_size as u64
+    size.div_ceil(block_size as u64)
 }
 
 /// Calculate the pyramid depth for a given number of data blocks.
@@ -274,7 +280,11 @@ fn ensure_capacity<L2: BlockLayer>(
     descriptor.top_block = current_top;
 
     // Allocate missing data blocks (fill pyramid slots)
-    let effective_current = if current_data_blocks == 0 { 1 } else { current_data_blocks };
+    let effective_current = if current_data_blocks == 0 {
+        1
+    } else {
+        current_data_blocks
+    };
     for block_idx in effective_current..target_data_blocks {
         let new_data_block = layer2.allocate_block()?;
         // Navigate to the correct slot and write the new block index
@@ -362,11 +372,21 @@ fn pyramid_read<L2: BlockLayer>(
     let mut current_pos = pos;
 
     while bytes_read < to_read {
-        let (data_block, offset) =
-            navigate_to_position(layer2, descriptor, current_pos, block_size, fan_out, block_index_width)?;
+        let (data_block, offset) = navigate_to_position(
+            layer2,
+            descriptor,
+            current_pos,
+            block_size,
+            fan_out,
+            block_index_width,
+        )?;
 
         let chunk_len = (to_read - bytes_read).min(block_size - offset);
-        let n = layer2.read_block(data_block, offset, &mut buf[bytes_read..bytes_read + chunk_len])?;
+        let n = layer2.read_block(
+            data_block,
+            offset,
+            &mut buf[bytes_read..bytes_read + chunk_len],
+        )?;
         bytes_read += n;
         current_pos += n as u64;
 
@@ -397,7 +417,14 @@ fn pyramid_write<L2: BlockLayer>(
 
     // Ensure we have enough blocks
     let target_blocks = data_blocks_needed(end_pos, block_size);
-    ensure_capacity(layer2, descriptor, target_blocks, block_size, fan_out, block_index_width)?;
+    ensure_capacity(
+        layer2,
+        descriptor,
+        target_blocks,
+        block_size,
+        fan_out,
+        block_index_width,
+    )?;
 
     // Temporarily set size to end_pos so navigation works for new blocks
     let old_size = descriptor.size;
@@ -408,12 +435,23 @@ fn pyramid_write<L2: BlockLayer>(
     let mut bytes_written = 0;
     let mut current_pos = pos;
 
+    // write the data, possibly over multiple blocks
     while bytes_written < buf.len() {
-        let (data_block, offset) =
-            navigate_to_position(layer2, descriptor, current_pos, block_size, fan_out, block_index_width)?;
+        let (data_block, offset) = navigate_to_position(
+            layer2,
+            descriptor,
+            current_pos,
+            block_size,
+            fan_out,
+            block_index_width,
+        )?;
 
         let chunk_len = (buf.len() - bytes_written).min(block_size - offset);
-        let n = layer2.write_block(data_block, offset, &buf[bytes_written..bytes_written + chunk_len])?;
+        let n = layer2.write_block(
+            data_block,
+            offset,
+            &buf[bytes_written..bytes_written + chunk_len],
+        )?;
         bytes_written += n;
         current_pos += n as u64;
 
@@ -451,7 +489,13 @@ fn pyramid_truncate<L2: BlockLayer>(
         if descriptor.size > 0 && descriptor.top_block != 0 {
             let old_blocks = data_blocks_needed(descriptor.size, block_size);
             let old_depth = pyramid_depth(old_blocks, fan_out);
-            deallocate_tree(layer2, descriptor.top_block, old_depth, fan_out, block_index_width)?;
+            deallocate_tree(
+                layer2,
+                descriptor.top_block,
+                old_depth,
+                fan_out,
+                block_index_width,
+            )?;
         }
         descriptor.size = 0;
         descriptor.top_block = 0;
@@ -582,14 +626,26 @@ fn deallocate_data_block_at<L2: BlockLayer>(
 
     // Deallocate data block and mark slot
     layer2.deallocate_block(data_block)?;
-    write_block_index(layer2, current_block, slot, block_sentinel(block_index_width), block_index_width)?;
+    write_block_index(
+        layer2,
+        current_block,
+        slot,
+        block_sentinel(block_index_width),
+        block_index_width,
+    )?;
 
     // Check if bottom redirector is now empty; if so, deallocate it and mark in parent
     // We check all slots
     if is_redirector_empty(layer2, current_block, fan_out, block_index_width)? {
         layer2.deallocate_block(current_block)?;
         if let Some(&(parent_block, parent_slot)) = path.last() {
-            write_block_index(layer2, parent_block, parent_slot, block_sentinel(block_index_width), block_index_width)?;
+            write_block_index(
+                layer2,
+                parent_block,
+                parent_slot,
+                block_sentinel(block_index_width),
+                block_index_width,
+            )?;
         }
     }
 
@@ -638,8 +694,115 @@ impl<L2: BlockLayer> StreamsFromBlocks<L2> {
         }
     }
 
+    /// Acquire a per-stream lock. If `blocking` is true, waits via Condvar
+    /// until the lock can be acquired. If false, returns LockConflict immediately.
+    fn acquire_lock(&self, id: u64, mode: OpenMode, blocking: bool) -> Result<(), SfsError> {
+        let mut state = self.state.lock().unwrap();
+        loop {
+            let lock = state.locks.entry(id).or_default();
+            match mode {
+                OpenMode::Read => {
+                    if !lock.has_writer {
+                        lock.readers += 1;
+                        return Ok(());
+                    }
+                }
+                OpenMode::Write => {
+                    if !lock.has_writer && lock.readers == 0 {
+                        lock.has_writer = true;
+                        return Ok(());
+                    }
+                }
+            }
+            if !blocking {
+                // Clean up the default entry if we just created it
+                let lock = state.locks.get(&id).unwrap();
+                if lock.readers == 0 && !lock.has_writer {
+                    state.locks.remove(&id);
+                }
+                return Err(SfsError::LockConflict(format!(
+                    "lock conflict on stream {}",
+                    id
+                )));
+            }
+            state = self.lock_released.wait(state).unwrap();
+        }
+    }
+
+    /// Release a per-stream lock and notify all waiters.
+    fn release_lock(&self, id: u64, mode: OpenMode) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(lock) = state.locks.get_mut(&id) {
+            match mode {
+                OpenMode::Read => lock.readers = lock.readers.saturating_sub(1),
+                OpenMode::Write => lock.has_writer = false,
+            }
+            if lock.readers == 0 && !lock.has_writer {
+                state.locks.remove(&id);
+            }
+        }
+        drop(state);
+        self.lock_released.notify_all();
+    }
+
+    /// Open a stream, optionally blocking on lock contention.
+    fn open_stream_inner(
+        &self,
+        id: u64,
+        mode: OpenMode,
+        blocking: bool,
+    ) -> Result<BlockStreamHandle, SfsError> {
+        if id == STREAMS_STREAM_ID {
+            return Err(SfsError::InvalidPath(
+                "cannot open Streams stream directly".to_string(),
+            ));
+        }
+
+        // 1. Acquire per-stream lock
+        self.acquire_lock(id, mode, blocking)?;
+
+        // 2. Read the stream's descriptor (acquire STREAMS read lock, always blocking)
+        if let Err(e) = self.acquire_lock(STREAMS_STREAM_ID, OpenMode::Read, true) {
+            self.release_lock(id, mode);
+            return Err(e);
+        }
+        let desc_result = {
+            let streams_desc = self.streams_descriptor.lock().unwrap();
+            self.read_descriptor(&streams_desc, id)
+        };
+        self.release_lock(STREAMS_STREAM_ID, OpenMode::Read);
+
+        let desc = match desc_result {
+            Ok(d) => d,
+            Err(e) => {
+                self.release_lock(id, mode);
+                return Err(e);
+            }
+        };
+
+        if desc.is_free() {
+            self.release_lock(id, mode);
+            return Err(SfsError::NotFound(format!("stream {}", id)));
+        }
+
+        // 3. Create handle
+        let mut state = self.state.lock().unwrap();
+        let handle_id = state.next_handle_id;
+        state.next_handle_id += 1;
+        state.open_handles.insert(
+            handle_id,
+            HandleInfo {
+                stream_id: id,
+                mode,
+                cached_descriptor: desc,
+            },
+        );
+
+        Ok(BlockStreamHandle(handle_id))
+    }
+
     /// Read a stream descriptor from the Streams stream.
-    /// Caller must hold at least a read lock on streams_lock.
+    /// Caller must hold at least a read lock on STREAMS_STREAM_ID.
     fn read_descriptor(
         &self,
         streams_desc: &StreamDescriptor,
@@ -658,7 +821,7 @@ impl<L2: BlockLayer> StreamsFromBlocks<L2> {
     }
 
     /// Write a stream descriptor to the Streams stream.
-    /// Caller must hold the write lock on streams_lock.
+    /// Caller must hold the write lock on STREAMS_STREAM_ID.
     fn write_descriptor(
         &self,
         streams_desc: &mut StreamDescriptor,
@@ -718,7 +881,7 @@ impl<L2: BlockLayer> StreamsFromBlocks<L2> {
     }
 
     /// Persist the header chain (L3 + cached L4 sections) via L2.
-    /// Caller must hold the write lock (or have exclusive access to streams_desc).
+    /// Caller must hold the STREAMS_STREAM_ID lock.
     fn persist_header(&self, streams_desc: &StreamDescriptor) -> Result<(), SfsError> {
         let l4_cache = self.l4_header_cache.lock().unwrap();
         let l3_section = Self::build_l3_section(streams_desc);
@@ -757,13 +920,14 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
 
         let instance = StreamsFromBlocks {
             layer2,
-            streams_lock: RwLock::new(streams_desc),
+            streams_descriptor: Mutex::new(streams_desc),
             l4_header_cache: Mutex::new(upper_layers.to_vec()),
             state: Mutex::new(StreamsFromBlocksState {
                 next_handle_id: 0,
                 locks: HashMap::new(),
                 open_handles: HashMap::new(),
             }),
+            lock_released: Condvar::new(),
         };
 
         Ok(instance)
@@ -784,13 +948,14 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
 
         Ok(StreamsFromBlocks {
             layer2,
-            streams_lock: RwLock::new(streams_desc),
+            streams_descriptor: Mutex::new(streams_desc),
             l4_header_cache: Mutex::new(l4_section),
             state: Mutex::new(StreamsFromBlocksState {
                 next_handle_id: 0,
                 locks: HashMap::new(),
                 open_handles: HashMap::new(),
             }),
+            lock_released: Condvar::new(),
         })
     }
 
@@ -803,135 +968,102 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
     }
 
     fn create_stream(&self) -> Result<u64, SfsError> {
-        let mut streams_desc = self.streams_lock.write().unwrap();
-        let bs = self.block_size();
-        let fo = self.fan_out();
-        let biw = self.block_index_width_val();
+        // we're about to create a new stream, so we need find an available stream descriptor from the Streams stream
+        // therefore we need to acquire the STREAMS_STREAM_ID write lock to ensure exclusive access while we scan for a free descriptor and potentially extend the stream. This is the main reason for the STREAMS_STREAM_ID lock: it protects the integrity of the stream descriptors in the Streams stream.
+        self.acquire_lock(STREAMS_STREAM_ID, OpenMode::Write, true)?;
 
-        // Scan for a free descriptor slot
-        let num_slots = streams_desc.size / DESCRIPTOR_SIZE;
-        let mut free_id: Option<u64> = None;
+        let result = (|| -> Result<u64, SfsError> {
+            // we should never block on this call. The Mutex is just to satisfy Rust's safety guarantees around shared mutable access to the descriptor, but in practice we always hold the STREAMS_STREAM_ID write lock when accessing it, so there is no contention.
+            let mut streams_desc = self.streams_descriptor.lock().unwrap();
+            let bs = self.block_size();
+            let fo = self.fan_out();
+            let biw = self.block_index_width_val();
 
-        for i in 0..num_slots {
-            let desc = self.read_descriptor(&streams_desc, i)?;
-            if desc.is_free() {
-                free_id = Some(i);
-                break;
-            }
-        }
+            // Scan for a free descriptor slot
+            let num_slots = streams_desc.size / DESCRIPTOR_SIZE;
+            let mut free_id: Option<u64> = None;
 
-        let stream_id = match free_id {
-            Some(id) => id,
-            None => {
-                // Extend the Streams stream
-                let new_id = num_slots;
-                // Index overflow protection: L4 serializes stream IDs in block_index_width bytes
-                if new_id >= self.sentinel() {
-                    return Err(SfsError::IoError(format!(
-                        "stream ID overflow: {} >= sentinel {} for block_index_width={}",
-                        new_id,
-                        self.sentinel(),
-                        self.layer2.block_index_width()
-                    )));
+            for i in 0..num_slots {
+                let desc = self.read_descriptor(&streams_desc, i)?;
+                if desc.is_free() {
+                    free_id = Some(i);
+                    break;
                 }
-                // Write a new descriptor to extend
-                let new_desc = StreamDescriptor {
-                    size: 0,
-                    top_block: 0,
-                };
-                let offset = new_id * DESCRIPTOR_SIZE;
-                let buf = new_desc.to_bytes();
-                pyramid_write(&self.layer2, &mut streams_desc, offset, &buf, bs, fo, biw)?;
-                new_id
             }
-        };
 
-        // Write the new descriptor (size=0, top_block=0)
-        let new_desc = StreamDescriptor {
-            size: 0,
-            top_block: 0,
-        };
-        self.write_descriptor(&mut streams_desc, stream_id, &new_desc)?;
+            // Did we find a free slot? If not, we need to extend the Streams stream by adding a new descriptor at the end
+            let stream_id = match free_id {
+                Some(id) => id,
+                None => {
+                    // Extend the Streams stream
+                    // TODO: optimize by writing a zeroed block instead of individual descriptors (this is currently safe, but may not be in the future, so while possibly more efficient, it's also slightly riskier to just zero it out)
+                    // TODO: Make it configurable how much to extend by
+                    // new id would be at the end of the slots, so we just need to write a new descriptor there with size=0 and top_block=0
+                    let new_id = num_slots;
+                    if new_id >= self.sentinel() {
+                        return Err(SfsError::IoError(format!(
+                            "stream ID overflow: {} >= sentinel {} for block_index_width={}",
+                            new_id,
+                            self.sentinel(),
+                            self.layer2.block_index_width()
+                        )));
+                    }
+                    let new_desc = StreamDescriptor {
+                        size: 0,
+                        top_block: 0,
+                    };
+                    let offset = new_id * DESCRIPTOR_SIZE;
+                    let buf = new_desc.to_bytes();
+                    pyramid_write(&self.layer2, &mut streams_desc, offset, &buf, bs, fo, biw)?;
+                    new_id
+                }
+            };
 
-        // Persist header
-        self.persist_header(&streams_desc)?;
+            // Write the new descriptor (size=0, top_block=0)
+            let new_desc = StreamDescriptor {
+                size: 0,
+                top_block: 0,
+            };
+            self.write_descriptor(&mut streams_desc, stream_id, &new_desc)?;
 
-        Ok(stream_id)
+            self.persist_header(&streams_desc)?;
+
+            Ok(stream_id)
+        })();
+
+        self.release_lock(STREAMS_STREAM_ID, OpenMode::Write);
+        result
     }
 
     fn stream_exists(&self, id: u64) -> bool {
-        let streams_desc = self.streams_lock.read().unwrap();
-        let offset = id * DESCRIPTOR_SIZE;
-        if offset + DESCRIPTOR_SIZE > streams_desc.size {
+        if self
+            .acquire_lock(STREAMS_STREAM_ID, OpenMode::Read, true)
+            .is_err()
+        {
             return false;
         }
-        match self.read_descriptor(&streams_desc, id) {
-            Ok(desc) => !desc.is_free(),
-            Err(_) => false,
-        }
+        let result = {
+            let streams_desc = self.streams_descriptor.lock().unwrap();
+            let offset = id * DESCRIPTOR_SIZE;
+            if offset + DESCRIPTOR_SIZE > streams_desc.size {
+                false
+            } else {
+                match self.read_descriptor(&streams_desc, id) {
+                    Ok(desc) => !desc.is_free(),
+                    Err(_) => false,
+                }
+            }
+        };
+        self.release_lock(STREAMS_STREAM_ID, OpenMode::Read);
+        result
     }
 
     fn open_stream(&self, id: u64, mode: OpenMode) -> Result<Self::Handle, SfsError> {
-        // Check/update per-stream lock state
-        let mut state = self.state.lock().unwrap();
-        let lock = state.locks.entry(id).or_default();
-        match mode {
-            OpenMode::Read => {
-                if lock.has_writer {
-                    return Err(SfsError::LockConflict(format!(
-                        "stream {} is opened for writing",
-                        id
-                    )));
-                }
-                lock.readers += 1;
-            }
-            OpenMode::Write => {
-                if lock.has_writer {
-                    return Err(SfsError::LockConflict(format!(
-                        "stream {} is already opened for writing",
-                        id
-                    )));
-                }
-                if lock.readers > 0 {
-                    return Err(SfsError::LockConflict(format!(
-                        "stream {} has active readers",
-                        id
-                    )));
-                }
-                lock.has_writer = true;
-            }
-        }
+        self.open_stream_inner(id, mode, false)
+    }
 
-        // Read the stream's descriptor
-        let streams_desc = self.streams_lock.read().unwrap();
-        let desc = self.read_descriptor(&streams_desc, id)?;
-        drop(streams_desc);
-
-        if desc.is_free() {
-            // Undo lock state
-            let lock = state.locks.get_mut(&id).unwrap();
-            match mode {
-                OpenMode::Read => lock.readers -= 1,
-                OpenMode::Write => lock.has_writer = false,
-            }
-            if lock.readers == 0 && !lock.has_writer {
-                state.locks.remove(&id);
-            }
-            return Err(SfsError::NotFound(format!("stream {}", id)));
-        }
-
-        let handle_id = state.next_handle_id;
-        state.next_handle_id += 1;
-        state.open_handles.insert(
-            handle_id,
-            HandleInfo {
-                stream_id: id,
-                mode,
-                cached_descriptor: desc,
-            },
-        );
-
-        Ok(BlockStreamHandle(handle_id))
+    fn open_stream_blocking(&self, id: u64, mode: OpenMode) -> Result<Self::Handle, SfsError> {
+        self.open_stream_inner(id, mode, true)
     }
 
     fn close_stream(&self, handle: Self::Handle) -> Result<(), SfsError> {
@@ -945,23 +1077,18 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
 
         // If writer, flush cached descriptor back to Streams stream
         if info.mode == OpenMode::Write {
-            let mut streams_desc = self.streams_lock.write().unwrap();
-            self.write_descriptor(&mut streams_desc, info.stream_id, &info.cached_descriptor)?;
-            self.persist_header(&streams_desc)?;
-            drop(streams_desc);
+            self.acquire_lock(STREAMS_STREAM_ID, OpenMode::Write, true)?;
+            let result = {
+                let mut streams_desc = self.streams_descriptor.lock().unwrap();
+                self.write_descriptor(&mut streams_desc, info.stream_id, &info.cached_descriptor)?;
+                self.persist_header(&streams_desc)
+            };
+            self.release_lock(STREAMS_STREAM_ID, OpenMode::Write);
+            result?;
         }
 
-        // Update per-stream lock state
-        let mut state = self.state.lock().unwrap();
-        if let Some(lock) = state.locks.get_mut(&info.stream_id) {
-            match info.mode {
-                OpenMode::Read => lock.readers = lock.readers.saturating_sub(1),
-                OpenMode::Write => lock.has_writer = false,
-            }
-            if lock.readers == 0 && !lock.has_writer {
-                state.locks.remove(&info.stream_id);
-            }
-        }
+        // Release per-stream lock
+        self.release_lock(info.stream_id, info.mode);
 
         Ok(())
     }
@@ -980,31 +1107,38 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
             }
         }
 
-        let mut streams_desc = self.streams_lock.write().unwrap();
-        let desc = self.read_descriptor(&streams_desc, id)?;
-        if desc.is_free() {
-            return Err(SfsError::NotFound(format!("stream {}", id)));
-        }
+        self.acquire_lock(STREAMS_STREAM_ID, OpenMode::Write, true)?;
 
-        // Deallocate all blocks belonging to the stream
-        if desc.size > 0 && desc.top_block != 0 {
-            let bs = self.block_size();
-            let fo = self.fan_out();
-            let biw = self.block_index_width_val();
-            let num_blocks = data_blocks_needed(desc.size, bs);
-            let depth = pyramid_depth(num_blocks, fo);
-            deallocate_tree(&self.layer2, desc.top_block, depth, fo, biw)?;
-        }
+        let result = (|| -> Result<(), SfsError> {
+            let mut streams_desc = self.streams_descriptor.lock().unwrap();
+            let desc = self.read_descriptor(&streams_desc, id)?;
+            if desc.is_free() {
+                return Err(SfsError::NotFound(format!("stream {}", id)));
+            }
 
-        // Mark descriptor as free
-        let free_desc = StreamDescriptor {
-            size: 0,
-            top_block: FREE_DESCRIPTOR_MARKER,
-        };
-        self.write_descriptor(&mut streams_desc, id, &free_desc)?;
-        self.persist_header(&streams_desc)?;
+            // Deallocate all blocks belonging to the stream
+            if desc.size > 0 && desc.top_block != 0 {
+                let bs = self.block_size();
+                let fo = self.fan_out();
+                let biw = self.block_index_width_val();
+                let num_blocks = data_blocks_needed(desc.size, bs);
+                let depth = pyramid_depth(num_blocks, fo);
+                deallocate_tree(&self.layer2, desc.top_block, depth, fo, biw)?;
+            }
 
-        Ok(())
+            // Mark descriptor as free
+            let free_desc = StreamDescriptor {
+                size: 0,
+                top_block: FREE_DESCRIPTOR_MARKER,
+            };
+            self.write_descriptor(&mut streams_desc, id, &free_desc)?;
+            self.persist_header(&streams_desc)?;
+
+            Ok(())
+        })();
+
+        self.release_lock(STREAMS_STREAM_ID, OpenMode::Write);
+        result
     }
 
     fn read(&self, handle: &Self::Handle, pos: u64, buf: &mut [u8]) -> Result<usize, SfsError> {
@@ -1101,11 +1235,16 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
             let mut cache = self.l4_header_cache.lock().unwrap();
             *cache = upper_layers.to_vec();
         }
-        let streams_desc = self.streams_lock.read().unwrap();
-        let l3_section = Self::build_l3_section(&streams_desc);
-        let mut combined = l3_section;
-        combined.extend_from_slice(upper_layers);
-        self.layer2.store_header(&combined)
+        self.acquire_lock(STREAMS_STREAM_ID, OpenMode::Read, true)?;
+        let result = {
+            let streams_desc = self.streams_descriptor.lock().unwrap();
+            let l3_section = Self::build_l3_section(&streams_desc);
+            let mut combined = l3_section;
+            combined.extend_from_slice(upper_layers);
+            self.layer2.store_header(&combined)
+        };
+        self.release_lock(STREAMS_STREAM_ID, OpenMode::Read);
+        result
     }
 
     fn load_header(&self) -> Result<Vec<u8>, SfsError> {

@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::{Condvar, Mutex};
 
 use crate::stream_layer::StreamLayer;
 use crate::{OpenMode, SfsError};
@@ -49,6 +49,7 @@ pub struct StreamsFromFiles {
     block_index_width: u8,
     block_size_shift: u8,
     state: Mutex<StreamsState>,
+    lock_released: Condvar,
 }
 
 impl StreamsFromFiles {
@@ -74,7 +75,81 @@ impl StreamsFromFiles {
             .map_err(|e| SfsError::IoError(format!("failed to write meta: {}", e)))
     }
 
-    fn read_meta(root: &PathBuf) -> Result<(u8, u8, u64), SfsError> {
+    fn acquire_lock(&self, id: u64, mode: OpenMode, blocking: bool) -> Result<(), SfsError> {
+        let mut state = self.state.lock().unwrap();
+        loop {
+            let lock = state.locks.entry(id).or_default();
+            match mode {
+                OpenMode::Read => {
+                    if !lock.has_writer {
+                        lock.readers += 1;
+                        return Ok(());
+                    }
+                }
+                OpenMode::Write => {
+                    if !lock.has_writer && lock.readers == 0 {
+                        lock.has_writer = true;
+                        return Ok(());
+                    }
+                }
+            }
+            if !blocking {
+                let lock = state.locks.get(&id).unwrap();
+                if lock.readers == 0 && !lock.has_writer {
+                    state.locks.remove(&id);
+                }
+                return Err(SfsError::LockConflict(format!(
+                    "lock conflict on stream {}",
+                    id
+                )));
+            }
+            state = self.lock_released.wait(state).unwrap();
+        }
+    }
+
+    fn release_lock(&self, id: u64, mode: OpenMode) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(lock) = state.locks.get_mut(&id) {
+            match mode {
+                OpenMode::Read => lock.readers = lock.readers.saturating_sub(1),
+                OpenMode::Write => lock.has_writer = false,
+            }
+            if lock.readers == 0 && !lock.has_writer {
+                state.locks.remove(&id);
+            }
+        }
+        drop(state);
+        self.lock_released.notify_all();
+    }
+
+    fn open_stream_inner(
+        &self,
+        id: u64,
+        mode: OpenMode,
+        blocking: bool,
+    ) -> Result<FileStreamHandle, SfsError> {
+        let path = self.stream_path(id);
+        if !path.exists() {
+            return Err(SfsError::NotFound(format!("stream {}", id)));
+        }
+
+        self.acquire_lock(id, mode, blocking)?;
+
+        let mut state = self.state.lock().unwrap();
+        let handle_id = state.next_handle_id;
+        state.next_handle_id += 1;
+        state.open_handles.insert(
+            handle_id,
+            HandleInfo {
+                stream_id: id,
+                mode,
+            },
+        );
+
+        Ok(FileStreamHandle(handle_id))
+    }
+
+    fn read_meta(root: &Path) -> Result<(u8, u8, u64), SfsError> {
         let bytes = fs::read(root.join("meta"))
             .map_err(|e| SfsError::IoError(format!("failed to read meta: {}", e)))?;
         if bytes.len() < 10 {
@@ -114,6 +189,7 @@ impl StreamLayer for StreamsFromFiles {
                 locks: HashMap::new(),
                 open_handles: HashMap::new(),
             }),
+            lock_released: Condvar::new(),
         };
         instance.persist_meta(0)?;
 
@@ -139,6 +215,7 @@ impl StreamLayer for StreamsFromFiles {
                 locks: HashMap::new(),
                 open_handles: HashMap::new(),
             }),
+            lock_released: Condvar::new(),
         })
     }
 
@@ -171,76 +248,23 @@ impl StreamLayer for StreamsFromFiles {
     }
 
     fn open_stream(&self, id: u64, mode: OpenMode) -> Result<Self::Handle, SfsError> {
-        let path = self.stream_path(id);
-        if !path.exists() {
-            return Err(SfsError::NotFound(format!("stream {}", id)));
-        }
+        self.open_stream_inner(id, mode, false)
+    }
 
-        let mut state = self.state.lock().unwrap();
-
-        let lock = state.locks.entry(id).or_default();
-        match mode {
-            OpenMode::Read => {
-                if lock.has_writer {
-                    return Err(SfsError::LockConflict(format!(
-                        "stream {} is opened for writing",
-                        id
-                    )));
-                }
-                lock.readers += 1;
-            }
-            OpenMode::Write => {
-                if lock.has_writer {
-                    return Err(SfsError::LockConflict(format!(
-                        "stream {} is already opened for writing",
-                        id
-                    )));
-                }
-                if lock.readers > 0 {
-                    return Err(SfsError::LockConflict(format!(
-                        "stream {} has active readers",
-                        id
-                    )));
-                }
-                lock.has_writer = true;
-            }
-        }
-
-        let handle_id = state.next_handle_id;
-        state.next_handle_id += 1;
-        state.open_handles.insert(
-            handle_id,
-            HandleInfo {
-                stream_id: id,
-                mode,
-            },
-        );
-
-        Ok(FileStreamHandle(handle_id))
+    fn open_stream_blocking(&self, id: u64, mode: OpenMode) -> Result<Self::Handle, SfsError> {
+        self.open_stream_inner(id, mode, true)
     }
 
     fn close_stream(&self, handle: Self::Handle) -> Result<(), SfsError> {
-        let mut state = self.state.lock().unwrap();
+        let info = {
+            let mut state = self.state.lock().unwrap();
+            state
+                .open_handles
+                .remove(&handle.0)
+                .ok_or_else(|| SfsError::NotFound("invalid stream handle".to_string()))?
+        };
 
-        let info = state
-            .open_handles
-            .remove(&handle.0)
-            .ok_or_else(|| SfsError::NotFound("invalid stream handle".to_string()))?;
-
-        if let Some(lock) = state.locks.get_mut(&info.stream_id) {
-            match info.mode {
-                OpenMode::Read => {
-                    lock.readers = lock.readers.saturating_sub(1);
-                }
-                OpenMode::Write => {
-                    lock.has_writer = false;
-                }
-            }
-            if lock.readers == 0 && !lock.has_writer {
-                state.locks.remove(&info.stream_id);
-            }
-        }
-
+        self.release_lock(info.stream_id, info.mode);
         Ok(())
     }
 

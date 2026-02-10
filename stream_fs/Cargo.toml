@@ -5,4 +5,4 @@ edition = "2021"
 description = "Stream File System - a file system in a file"
 
 [dependencies]
-fs2 = "0.4"
+fs2 = "0.4.3"

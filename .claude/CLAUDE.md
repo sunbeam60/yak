@@ -8,6 +8,7 @@
 
 ## Human & AI, working together
 Before committing, at all times present & allow edits to the commit message to the user. Do not include "co-authored by Claude" message.
+Humans will use the extension Todo Tree extension. It's good practice to use //TODO: and //FIXME: comments where appropriate, to give humans an overview over possible improvements or concerns in the code.
 
 ## Architecture
 Please read the [architecture](./../docs/architecture.md) for a comprehensive overview of SFS. This architecture must be respected - if it cannot, please stop, inform and ask for directions.
@@ -40,34 +41,34 @@ All 85 tests passing (68 original + 17 L1-specific), plus 3 cargo tests. SFS now
 
 ### Implementation Status Summary
 
-| Phase     | Component                          | Status         | Tests     |
-| --------- | ---------------------------------- | -------------- | --------- |
-| L4 Mock   | All components                     | ✅ Complete     | -         |
-| L3 Mock   | `StreamLayer` trait (no generics)  | ✅ Complete     | -         |
-| L3 Mock   | `StreamsFromFiles` (L3 impl)      | ✅ Complete     | -         |
-| L3 Mock   | L4 rewrite (generic over L3)      | ✅ Complete     | -         |
-| L3 Mock   | Runtime block params refactor      | ✅ Complete     | -         |
-| L3 Mock   | Thread safety (`&self` + Mutex)    | ✅ Complete     | -         |
-| L3 Mock   | C FFI (`stream_fs_c`)             | ✅ Complete     | -         |
-| L3 Mock   | CLI tool (`sfs_cl`)               | ✅ Complete     | -         |
-| L3 Mock   | Thread safety burn-in tests        | ✅ Complete     | -         |
-| L3 Mock   | Full test suite                    | ✅ Complete     | 49/49     |
-| L2 Mock   | `BlockLayer` trait                 | ✅ Complete     | -         |
-| L2 Mock   | `BlocksFromFiles` (L2 impl)       | ✅ Complete     | -         |
-| L2 Mock   | `StreamsFromBlocks` (real L3)      | ✅ Complete     | -         |
-| L2 Mock   | Header chain (L4→L3→L2→disk)      | ✅ Complete     | -         |
-| L2 Mock   | `SfsDefault` updated               | ✅ Complete     | -         |
-| L2 Mock   | Phase 8 multi-block tests          | ✅ Complete     | 19/19     |
-| L2 Mock   | Thread safety burn-in              | ✅ Complete     | -         |
-| L2 Mock   | Full test suite                    | ✅ Complete     | 68/68     |
-| **Total** | **L2 Mock**                        | **✅ COMPLETE** | **68/68** |
-| L1        | `FileLayer` trait (L1 contract)    | ✅ Complete     | -         |
-| L1        | `FileOnDisk` (L1 impl)             | ✅ Complete     | -         |
-| L1        | `BlocksInFile` (real L2)           | ✅ Complete     | -         |
-| L1        | Header chain (L4→L3→L2→L1→disk)   | ✅ Complete     | -         |
-| L1        | Two-pass create with `upper_layers`| ✅ Complete     | -         |
-| L1        | `SfsDefault` = single-file backend | ✅ Complete     | -         |
-| L1        | Process-level locking (`fs2`)      | ✅ Complete     | -         |
-| L1        | L1-specific test suite             | ✅ Complete     | 17/17     |
-| L1        | Full test suite                    | ✅ Complete     | 85/85     |
-| **Total** | **L1**                             | **✅ COMPLETE** | **85/85** |
+| Phase     | Component                           | Status         | Tests     |
+| --------- | ----------------------------------- | -------------- | --------- |
+| L4 Mock   | All components                      | ✅ Complete     | -         |
+| L3 Mock   | `StreamLayer` trait (no generics)   | ✅ Complete     | -         |
+| L3 Mock   | `StreamsFromFiles` (L3 impl)        | ✅ Complete     | -         |
+| L3 Mock   | L4 rewrite (generic over L3)        | ✅ Complete     | -         |
+| L3 Mock   | Runtime block params refactor       | ✅ Complete     | -         |
+| L3 Mock   | Thread safety (`&self` + Mutex)     | ✅ Complete     | -         |
+| L3 Mock   | C FFI (`stream_fs_c`)               | ✅ Complete     | -         |
+| L3 Mock   | CLI tool (`sfs_cl`)                 | ✅ Complete     | -         |
+| L3 Mock   | Thread safety burn-in tests         | ✅ Complete     | -         |
+| L3 Mock   | Full test suite                     | ✅ Complete     | 49/49     |
+| L2 Mock   | `BlockLayer` trait                  | ✅ Complete     | -         |
+| L2 Mock   | `BlocksFromFiles` (L2 impl)         | ✅ Complete     | -         |
+| L2 Mock   | `StreamsFromBlocks` (real L3)       | ✅ Complete     | -         |
+| L2 Mock   | Header chain (L4→L3→L2→disk)        | ✅ Complete     | -         |
+| L2 Mock   | `SfsDefault` updated                | ✅ Complete     | -         |
+| L2 Mock   | Phase 8 multi-block tests           | ✅ Complete     | 19/19     |
+| L2 Mock   | Thread safety burn-in               | ✅ Complete     | -         |
+| L2 Mock   | Full test suite                     | ✅ Complete     | 68/68     |
+| **Total** | **L2 Mock**                         | **✅ COMPLETE** | **68/68** |
+| L1        | `FileLayer` trait (L1 contract)     | ✅ Complete     | -         |
+| L1        | `FileOnDisk` (L1 impl)              | ✅ Complete     | -         |
+| L1        | `BlocksInFile` (real L2)            | ✅ Complete     | -         |
+| L1        | Header chain (L4→L3→L2→L1→disk)     | ✅ Complete     | -         |
+| L1        | Two-pass create with `upper_layers` | ✅ Complete     | -         |
+| L1        | `SfsDefault` = single-file backend  | ✅ Complete     | -         |
+| L1        | Process-level locking (`fs2`)       | ✅ Complete     | -         |
+| L1        | L1-specific test suite              | ✅ Complete     | 17/17     |
+| L1        | Full test suite                     | ✅ Complete     | 85/85     |
+| **Total** | **L1**                              | **✅ COMPLETE** | **85/85** |

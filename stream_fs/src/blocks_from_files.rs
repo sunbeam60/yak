@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crate::block_layer::BlockLayer;
@@ -43,11 +43,11 @@ impl BlocksFromFiles {
 
     /// Meta format: | next_block_id: u64 | (8 bytes, little-endian)
     fn persist_meta(&self, next_block_id: u64) -> Result<(), SfsError> {
-        fs::write(self.meta_path(), &next_block_id.to_le_bytes())
+        fs::write(self.meta_path(), next_block_id.to_le_bytes())
             .map_err(|e| SfsError::IoError(format!("failed to write meta: {}", e)))
     }
 
-    fn read_meta(root: &PathBuf) -> Result<u64, SfsError> {
+    fn read_meta(root: &Path) -> Result<u64, SfsError> {
         let bytes = fs::read(root.join("meta"))
             .map_err(|e| SfsError::IoError(format!("failed to read meta: {}", e)))?;
         if bytes.len() < 8 {
@@ -181,7 +181,7 @@ impl BlockLayer for BlocksFromFiles {
         // Create zeroed block file
         let block_size = self.block_size();
         let block_path = self.block_path(id);
-        fs::write(&block_path, &vec![0u8; block_size]).map_err(|e| {
+        fs::write(&block_path, vec![0u8; block_size]).map_err(|e| {
             SfsError::IoError(format!("failed to create block {}: {}", id, e))
         })?;
 

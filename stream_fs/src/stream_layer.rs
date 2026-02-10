@@ -57,7 +57,16 @@ pub trait StreamLayer: Send + Sync {
 
     /// Open an existing stream by identifier.
     /// Enforces locking: one writer OR many readers per stream.
+    /// Returns `LockConflict` immediately if the stream is already locked
+    /// in a conflicting way.
     fn open_stream(&self, id: u64, mode: OpenMode) -> Result<Self::Handle, SfsError>;
+
+    /// Open an existing stream by identifier, blocking until the lock is
+    /// available. Used by L4 for short-lived internal directory operations
+    /// that should wait rather than fail on contention.
+    fn open_stream_blocking(&self, id: u64, mode: OpenMode) -> Result<Self::Handle, SfsError> {
+        self.open_stream(id, mode)
+    }
 
     /// Close a stream handle.
     fn close_stream(&self, handle: Self::Handle) -> Result<(), SfsError>;

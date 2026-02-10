@@ -302,8 +302,8 @@ impl<L3: StreamLayer> Sfs<L3> {
         let parent_id = self.resolve_dir_stream_id(&parent_path)?;
         let dir_entry_name = format!("{}/", leaf);
 
-        // Open parent dir stream for writing (exclusive)
-        let parent_handle = self.layer3.open_stream(parent_id, OpenMode::Write)?;
+        // Open parent dir stream for writing (blocking — waits for contention)
+        let parent_handle = self.layer3.open_stream_blocking(parent_id, OpenMode::Write)?;
 
         // Read existing entries and check for duplicates
         let entries = self.read_entries_from_handle(&parent_handle)?;
@@ -346,8 +346,8 @@ impl<L3: StreamLayer> Sfs<L3> {
         let parent_id = self.resolve_dir_stream_id(&parent_path)?;
         let dir_entry_name = format!("{}/", leaf);
 
-        // Open parent for writing
-        let parent_handle = self.layer3.open_stream(parent_id, OpenMode::Write)?;
+        // Open parent for writing (blocking)
+        let parent_handle = self.layer3.open_stream_blocking(parent_id, OpenMode::Write)?;
         let entries = self.read_entries_from_handle(&parent_handle)?;
 
         let entry = entries.iter().find(|e| e.name == dir_entry_name);
@@ -357,8 +357,8 @@ impl<L3: StreamLayer> Sfs<L3> {
         }
         let dir_stream_id = entry.unwrap().id;
 
-        // Check that directory is empty (different stream, no lock conflict)
-        let child_handle = self.layer3.open_stream(dir_stream_id, OpenMode::Read)?;
+        // Check that directory is empty (blocking)
+        let child_handle = self.layer3.open_stream_blocking(dir_stream_id, OpenMode::Read)?;
         let child_len = self.layer3.stream_length(&child_handle)?;
         self.layer3.close_stream(child_handle)?;
 
@@ -393,7 +393,7 @@ impl<L3: StreamLayer> Sfs<L3> {
             self.resolve_dir_stream_id(path)?
         };
 
-        let handle = self.layer3.open_stream(dir_id, OpenMode::Read)?;
+        let handle = self.layer3.open_stream_blocking(dir_id, OpenMode::Read)?;
         let entries = self.read_entries_from_handle(&handle)?;
         self.layer3.close_stream(handle)?;
 
@@ -439,8 +439,8 @@ impl<L3: StreamLayer> Sfs<L3> {
         let new_parent_id = self.resolve_dir_stream_id(&new_parent_path)?;
 
         if old_parent_id == new_parent_id {
-            // Same parent: rename entry in place
-            let handle = self.layer3.open_stream(old_parent_id, OpenMode::Write)?;
+            // Same parent: rename entry in place (blocking)
+            let handle = self.layer3.open_stream_blocking(old_parent_id, OpenMode::Write)?;
             let entries = self.read_entries_from_handle(&handle)?;
 
             let old_entry = entries.iter().find(|e| e.name == old_dir_name);
@@ -475,8 +475,8 @@ impl<L3: StreamLayer> Sfs<L3> {
             }
             self.layer3.close_stream(handle)?;
         } else {
-            // Different parents: remove from old, add to new
-            let old_handle = self.layer3.open_stream(old_parent_id, OpenMode::Write)?;
+            // Different parents: remove from old, add to new (blocking)
+            let old_handle = self.layer3.open_stream_blocking(old_parent_id, OpenMode::Write)?;
             let old_entries = self.read_entries_from_handle(&old_handle)?;
 
             let old_entry = old_entries.iter().find(|e| e.name == old_dir_name);
@@ -497,8 +497,8 @@ impl<L3: StreamLayer> Sfs<L3> {
             }
             self.layer3.close_stream(old_handle)?;
 
-            // Add to new parent
-            let new_handle = self.layer3.open_stream(new_parent_id, OpenMode::Write)?;
+            // Add to new parent (blocking)
+            let new_handle = self.layer3.open_stream_blocking(new_parent_id, OpenMode::Write)?;
             let new_entries = self.read_entries_from_handle(&new_handle)?;
 
             if new_entries
@@ -542,8 +542,8 @@ impl<L3: StreamLayer> Sfs<L3> {
         let parent_id = self.resolve_dir_stream_id(&parent_path)?;
         let dir_entry_name = format!("{}/", leaf);
 
-        // Open parent dir stream for writing
-        let parent_handle = self.layer3.open_stream(parent_id, OpenMode::Write)?;
+        // Open parent dir stream for writing (blocking)
+        let parent_handle = self.layer3.open_stream_blocking(parent_id, OpenMode::Write)?;
         let entries = self.read_entries_from_handle(&parent_handle)?;
 
         // Check for duplicates (stream or directory with same name)
@@ -590,11 +590,7 @@ impl<L3: StreamLayer> Sfs<L3> {
 
     /// Open an existing stream for reading or writing.
     /// Returns a handle positioned at byte 0.
-    pub fn open_stream(
-        &self,
-        path: &str,
-        mode: OpenMode,
-    ) -> Result<StreamHandle, SfsError> {
+    pub fn open_stream(&self, path: &str, mode: OpenMode) -> Result<StreamHandle, SfsError> {
         if mode == OpenMode::Write {
             self.require_write()?;
         }
@@ -608,8 +604,8 @@ impl<L3: StreamLayer> Sfs<L3> {
         let (parent_path, leaf) = split_parent_leaf(path);
         let parent_id = self.resolve_dir_stream_id(&parent_path)?;
 
-        // Read parent dir to find the stream ID
-        let parent_handle = self.layer3.open_stream(parent_id, OpenMode::Read)?;
+        // Read parent dir to find the stream ID (blocking)
+        let parent_handle = self.layer3.open_stream_blocking(parent_id, OpenMode::Read)?;
         let entries = self.read_entries_from_handle(&parent_handle)?;
         self.layer3.close_stream(parent_handle)?;
 
@@ -668,8 +664,8 @@ impl<L3: StreamLayer> Sfs<L3> {
         let (parent_path, leaf) = split_parent_leaf(path);
         let parent_id = self.resolve_dir_stream_id(&parent_path)?;
 
-        // Open parent for writing
-        let parent_handle = self.layer3.open_stream(parent_id, OpenMode::Write)?;
+        // Open parent for writing (blocking)
+        let parent_handle = self.layer3.open_stream_blocking(parent_id, OpenMode::Write)?;
         let entries = self.read_entries_from_handle(&parent_handle)?;
 
         let entry = entries.iter().find(|e| e.name == leaf);
@@ -696,10 +692,7 @@ impl<L3: StreamLayer> Sfs<L3> {
         }
 
         // Remove entry from parent
-        let remaining: Vec<StreamEntry> = entries
-            .into_iter()
-            .filter(|e| e.name != leaf)
-            .collect();
+        let remaining: Vec<StreamEntry> = entries.into_iter().filter(|e| e.name != leaf).collect();
         let buf = serialize_entries(&remaining, biw);
         self.layer3.truncate(&parent_handle, 0)?;
         if !buf.is_empty() {
@@ -731,8 +724,8 @@ impl<L3: StreamLayer> Sfs<L3> {
         let new_parent_id = self.resolve_dir_stream_id(&new_parent_path)?;
 
         if old_parent_id == new_parent_id {
-            // Same parent
-            let handle = self.layer3.open_stream(old_parent_id, OpenMode::Write)?;
+            // Same parent (blocking)
+            let handle = self.layer3.open_stream_blocking(old_parent_id, OpenMode::Write)?;
             let entries = self.read_entries_from_handle(&handle)?;
 
             let old_entry = entries.iter().find(|e| e.name == old_leaf);
@@ -767,10 +760,8 @@ impl<L3: StreamLayer> Sfs<L3> {
                 return Err(SfsError::AlreadyExists(new_path.to_string()));
             }
 
-            let mut remaining: Vec<StreamEntry> = entries
-                .into_iter()
-                .filter(|e| e.name != old_leaf)
-                .collect();
+            let mut remaining: Vec<StreamEntry> =
+                entries.into_iter().filter(|e| e.name != old_leaf).collect();
             remaining.push(StreamEntry {
                 id: stream_id,
                 name: new_leaf.to_string(),
@@ -783,8 +774,8 @@ impl<L3: StreamLayer> Sfs<L3> {
             }
             self.layer3.close_stream(handle)?;
         } else {
-            // Different parents
-            let old_handle = self.layer3.open_stream(old_parent_id, OpenMode::Write)?;
+            // Different parents (blocking)
+            let old_handle = self.layer3.open_stream_blocking(old_parent_id, OpenMode::Write)?;
             let old_entries = self.read_entries_from_handle(&old_handle)?;
 
             let old_entry = old_entries.iter().find(|e| e.name == old_leaf);
@@ -820,7 +811,7 @@ impl<L3: StreamLayer> Sfs<L3> {
             }
             self.layer3.close_stream(old_handle)?;
 
-            let new_handle = self.layer3.open_stream(new_parent_id, OpenMode::Write)?;
+            let new_handle = self.layer3.open_stream_blocking(new_parent_id, OpenMode::Write)?;
             let new_entries = self.read_entries_from_handle(&new_handle)?;
 
             let new_dir_name = format!("{}/", new_leaf);
@@ -990,13 +981,14 @@ impl<L3: StreamLayer> Sfs<L3> {
         let mut current_id = self.root_dir_stream_id;
         for component in path.split('/') {
             let dir_name = format!("{}/", component);
-            let handle = self.layer3.open_stream(current_id, OpenMode::Read)?;
+            let handle = self.layer3.open_stream_blocking(current_id, OpenMode::Read)?;
             let entries = self.read_entries_from_handle(&handle)?;
             self.layer3.close_stream(handle)?;
 
-            let entry = entries.iter().find(|e| e.name == dir_name).ok_or_else(|| {
-                SfsError::NotFound(format!("parent directory does not exist"))
-            })?;
+            let entry = entries
+                .iter()
+                .find(|e| e.name == dir_name)
+                .ok_or_else(|| SfsError::NotFound(format!("parent directory does not exist")))?;
             current_id = entry.id;
         }
 
@@ -1004,10 +996,7 @@ impl<L3: StreamLayer> Sfs<L3> {
     }
 
     /// Read and parse all directory stream entries from an already-open handle.
-    fn read_entries_from_handle(
-        &self,
-        handle: &L3::Handle,
-    ) -> Result<Vec<StreamEntry>, SfsError> {
+    fn read_entries_from_handle(&self, handle: &L3::Handle) -> Result<Vec<StreamEntry>, SfsError> {
         let len = self.layer3.stream_length(handle)?;
         if len == 0 {
             return Ok(Vec::new());

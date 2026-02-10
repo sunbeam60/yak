@@ -246,11 +246,11 @@
         },
         {
             "label": "copy-release-binaries",
-            "type": "shell",
+            "type": "process",
             "command": "powershell",
             "args": [
                 "-Command",
-                "New-Item -ItemType Directory -Force -Path '${env:USERPROFILE}/bin'; Copy-Item '${workspaceFolder}/target/release/sfs.exe' '${env:USERPROFILE}/bin/sfs.exe' -Force; Copy-Item '${workspaceFolder}/target/release/stream_fs_c.dll' '${env:USERPROFILE}/bin/stream_fs_c.dll' -Force; Write-Host 'Release binaries copied to ~/bin/'"
+                "$branch = (git -C '${workspaceFolder}' branch --show-current).Trim().Replace('/','-'); if ($branch -eq 'master') { $name = 'sfs.exe' } else { $name = 'sfs-' + $branch + '.exe' }; New-Item -ItemType Directory -Force -Path '${env:USERPROFILE}/bin'; Copy-Item '${workspaceFolder}/target/release/sfs.exe' ('${env:USERPROFILE}/bin/' + $name) -Force; Copy-Item '${workspaceFolder}/target/release/stream_fs_c.dll' '${env:USERPROFILE}/bin/stream_fs_c.dll' -Force; Write-Host ('Release binary copied to ~/bin/' + $name)"
             ],
             "options": {
                 "cwd": "${workspaceFolder}"

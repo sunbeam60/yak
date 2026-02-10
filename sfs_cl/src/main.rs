@@ -1,3 +1,5 @@
+mod bench;
+
 use std::env;
 use std::fs;
 use std::io::{self, Write};
@@ -25,6 +27,7 @@ fn main() {
         "mv" => cmd_mv(&args[2..]),
         "info" => cmd_info(&args[2..]),
         "verify" => cmd_verify(&args[2..]),
+        "bench" => bench::cmd_bench(&args[2..]),
         "hello" => {
             println!("{}", stream_fs::hello());
             Ok(())
@@ -59,6 +62,7 @@ fn print_usage() {
     eprintln!("  mv <sfs-file> <old> <new>              Rename/move a stream");
     eprintln!("  info <sfs-file> <stream>               Show stream information");
     eprintln!("  verify <sfs-file>                      Verify SFS integrity");
+    eprintln!("  bench <scenario> [options]              Run benchmark scenario");
     eprintln!("  hello                                  Print a greeting");
 }
 

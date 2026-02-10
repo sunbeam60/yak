@@ -37,7 +37,7 @@ It is critical that the four layers in SFS are kept as decoupled as possible: L4
 ### Current project phase
 **L1: ✅ COMPLETE** - See [L1](./../docs/L1.md) for full documentation.
 
-All 85 tests passing (68 original + 17 L1-specific), plus 3 cargo tests. SFS now operates as a true single-file filesystem.
+All 120 Python tests passing + 5 cargo tests. SFS now operates as a true single-file filesystem with open-mode locking and integrity verification.
 
 ### Implementation Status Summary
 
@@ -72,3 +72,8 @@ All 85 tests passing (68 original + 17 L1-specific), plus 3 cargo tests. SFS now
 | L1        | L1-specific test suite              | ✅ Complete     | 17/17     |
 | L1        | Full test suite                     | ✅ Complete     | 85/85     |
 | **Total** | **L1**                              | **✅ COMPLETE** | **85/85** |
+| Post-L1   | Open mode (read/write) locking      | ✅ Complete     | 24/24     |
+| Post-L1   | `verify()` chain (L4→L3→L2→L1)     | ✅ Complete     | 11/11     |
+| Post-L1   | `verify` CLI command                | ✅ Complete     | -         |
+| Post-L1   | `stream_count()` / `stream_ids()`  | ✅ Complete     | -         |
+| **Total** | **Post-L1**                         | **✅ COMPLETE** | **120 Python + 5 cargo** |

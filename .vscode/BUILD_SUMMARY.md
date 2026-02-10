@@ -95,14 +95,15 @@ SFS/
 ## ⚙️ VSCode Integration
 
 ### Launch Configurations
-- **Debug builds**: Use `Debug CLI:` configurations
-- **Release builds**: Use `Run Release:` configuration
+- **Debug CLI: create test.sfs** — create a new SFS file in `./temp/`
+- **Debug: Rust Tests (stream_fs)** — debug cargo unit tests
+- **Python: All Tests** — debug all pytest tests
 
-### Tasks (Ctrl+Shift+B)
-- Debug: `cargo-build-cli` (default)
-- Release: `cargo-build-cli-release`
-- Install: `install-cli-release`
-- Copy: `release-build-and-copy`
+### Tasks
+- `Ctrl+Shift+B` → `cargo-build-cli` (default debug build)
+- `Ctrl+Shift+Alt+B` → `cargo-build-all-release` (workspace release build)
+- `copy-release-binaries` — builds release + copies to `~/bin/`
+- `rebuild-and-test` — debug build + Python tests (sequential)
 
 ## 📊 Performance Comparison
 

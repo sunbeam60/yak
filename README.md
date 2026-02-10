@@ -4,7 +4,7 @@ A layered file system implementation in Rust that provides a "file system in a f
 
 ## Project Status
 
-**L1: ✅ COMPLETE** (85/85 tests passing + 3 cargo tests)
+**L1: ✅ COMPLETE** (120/120 Python tests + 5 cargo tests)
 
 SFS now operates as a true single-file filesystem. All four layers are implemented:
 - ✅ L1 (`FileOnDisk`) — single-file backend with process-level locking via `fs2`
@@ -15,7 +15,8 @@ SFS now operates as a true single-file filesystem. All four layers are implement
 - ✅ C FFI wrapper (`stream_fs_c`)
 - ✅ Python bindings (`sfs_pytest/sfs`)
 - ✅ Command-line tool (`sfs_cl`)
-- ✅ Comprehensive test suite including multi-block, single-file persistence, and thread safety burn-in tests
+- ✅ Integrity verification chain (`verify()` across L4→L3→L2→L1)
+- ✅ Comprehensive test suite including multi-block, single-file persistence, thread safety burn-in, and corruption detection tests
 
 ## Quick Start
 
@@ -59,8 +60,8 @@ sfs ls mydata.sfs documents
 # Read a stream
 sfs cat mydata.sfs documents/readme.txt
 
-# Get help
-sfs --help
+# Verify integrity
+sfs verify mydata.sfs
 ```
 
 ## Project Structure
@@ -80,6 +81,7 @@ docs/            - Architecture and design documentation
 - [L2 Mock Design](docs/L2_mock.md) - BlockLayer trait and StreamsFromBlocks pyramid linking
 - [L3 Mock Design](docs/L3_mock.md) - StreamLayer trait and StreamsFromFiles
 - [L4 Mock Design](docs/L4_mock.md) - Initial phase: filing abstraction API
+- [Architecture Differences](docs/differences.md) - Divergences from the architecture spec
 - [Project Instructions](.claude/CLAUDE.md) - Development guidelines
 
 ## Architecture Layers
@@ -99,7 +101,7 @@ SFS operates as a true single-file filesystem (`SfsDefault = Sfs<StreamsFromBloc
 - L2 (`BlocksInFile`) stores fixed-size blocks within the single file, with a free list for block reuse
 - L3 (`StreamsFromBlocks`) links blocks into streams using pyramid block linking
 - L4 (`Sfs`) provides the filing abstraction with directories and named streams
-- Header chain: L4 → L3 → L2 → L1 → disk (96 bytes total), each layer with its own section
+- Header chain: L4 → L3 → L2 → L1 → disk (90 bytes total), each layer with its own section
 - `block_index_width` and `block_size_shift` are runtime values stored in the header
 - Two-pass create: layers pass placeholder headers down, then rewrite with real values
 - Thread-safe: RWLock on Streams stream + Mutex for bookkeeping + per-stream locking
@@ -119,6 +121,7 @@ SFS operates as a true single-file filesystem (`SfsDefault = Sfs<StreamsFromBloc
 - Full C ABI for language interop
 - Python bindings with Pythonic API
 - Command-line tool for manual operations
+- Integrity verification chain (L4→L3→L2→L1) with corruption detection
 - Thread safety burn-in tests (configurable duration)
 - Header chain with per-layer metadata persistence
 - Data persistence across close/reopen cycles

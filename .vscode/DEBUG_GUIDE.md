@@ -14,46 +14,34 @@ This workspace is now configured for debugging both Rust and Python code in the 
 
 | Configuration | Description | Working Dir |
 |---------------|-------------|-------------|
-| **Debug CLI: sfs_cl --help** | Test help command | Project root |
 | **Debug CLI: create test.sfs** | Create a new SFS file | `./temp/` |
-| **Debug CLI: ls test.sfs** | List SFS contents | `./temp/` |
-| **Debug CLI: custom args** | Customize args in launch.json | Project root |
-| **Debug: Rust Tests** | Debug Rust unit tests | Project root |
-
-### Rust CLI Running (Release Builds)
-
-| Configuration | Description | Working Dir |
-|---------------|-------------|-------------|
-| **Run Release: custom args** | Run optimized CLI with custom args | `./temp/` |
+| **Debug: Rust Tests (stream_fs)** | Debug Rust unit tests | Project root |
 
 ### Python Test Debugging
 
 | Configuration | Description |
 |---------------|-------------|
-| **Python: Current Test File** | Debug the currently open test file |
 | **Python: All Tests** | Debug all pytest tests |
-| **Python: Locking Tests** | Debug Phase 5 locking tests |
-| **Python: Edge Cases Tests** | Debug Phase 6 edge case tests |
 
 ## 🛠️ Build Tasks
 
 Press `Ctrl+Shift+B` to see build tasks, or run them via `Terminal > Run Task`:
 
-### Debug Builds (fast compile, unoptimized, in `target/debug/`)
-- **cargo-build-cli** (default) - Build the CLI tool
+### Debug Builds (`Ctrl+Shift+B`, fast compile, unoptimized, in `target/debug/`)
+- **cargo-build-cli** (default build task) - Build the CLI tool
 - **cargo-build-all** - Build entire workspace
 - **cargo-test-build** - Build tests without running
-- **rebuild-and-test** - Full rebuild + test run
 
-### Release Builds (slow compile, optimized, in `target/release/`)
+### Release Builds (`Ctrl+Shift+Alt+B`, slow compile, optimized, in `target/release/`)
 - **cargo-build-cli-release** - Build CLI tool (optimized)
-- **cargo-build-all-release** - Build entire workspace (optimized)
-- **copy-release-binaries** - Copy release binaries to `~/bin/` directory
-- **test-release-build** - Build release + run tests
+- **cargo-build-all-release** - Build entire workspace (optimized, bound to `Ctrl+Shift+Alt+B`)
+- **copy-release-binaries** - Build release + copy binaries to `~/bin/`
+- **test-release-build** - Build release + run Python tests
 
-### Utility
-- **cargo-clean** - Clean all build artifacts
+### Testing & Utility
 - **run-pytest-all** - Run all Python tests
+- **rebuild-and-test** - Debug build + Python tests (sequential)
+- **cargo-clean** - Clean all build artifacts
 
 ## 🎯 Debugging Tips
 
@@ -72,11 +60,7 @@ Press `Ctrl+Shift+B` to see build tasks, or run them via `Terminal > Run Task`:
 
 ### Custom CLI Arguments
 
-To debug with custom arguments:
-
-1. Select "Debug CLI: custom args"
-2. Edit `.vscode/launch.json`
-3. Modify the `args` array, e.g.:
+To debug with custom arguments, copy the "Debug CLI: create test.sfs" configuration in `.vscode/launch.json` and modify the `args` array, e.g.:
    ```json
    "args": ["put", "test.sfs", "myfile.txt", "stream.dat"]
    ```

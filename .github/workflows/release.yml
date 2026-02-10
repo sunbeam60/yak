@@ -164,5 +164,4 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo publish -p stream_fs --dry-run
-      - run: cargo publish -p stream_fs_c --dry-run
       - run: cargo publish -p sfs_cl --dry-run

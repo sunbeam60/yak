@@ -5,3 +5,13 @@ members = [
     "sfs_cl",
 ]
 resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/sunbeam60/stream_fs"
+publish = false
+
+[workspace.dependencies]
+stream_fs = { path = "stream_fs", version = "0.1.0" }

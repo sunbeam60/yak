@@ -4,13 +4,13 @@ This documentation provides a high level overview of the Stream File System (SFS
 
 ## SFS Purpose
 
-The SFS lib is a Rust module that provides an API and implementation for library users to create, manage and use SFS storage files. An SFS storage file is a "file system in a file" meant for users to create a file wherein there is 0..n data streams, addressable by a string name. Each data stream can be read and written similar to how an actual file can be read and written, meaning after a data stream has been opened, it returns a handle from which the user can obtain the length, a position (where reads and writes happen from) and the contents of the data stream itself. After such a data stream has been opened, there are functions to read and write data from and to the data stream. 
+The SFS crate is a Rust library that enable users to create, manage and use SFS storage files. An SFS storage file is a "file system in a file", wherein there is 0..n data streams, addressable by a string name. Each data stream can be read and written similar to how an real file can be read and written, meaning after a data stream has been opened, it returns a handle from which the user can obtain the length, a position (where reads and writes happen) and the contents of the data stream itself. After such a data stream has been opened, there are functions to read and write data from and to the data stream. 
 
 ## Data streams
 
-Data streams appear to the user as a contiguous byte stream, much like a file. While they cannot be addressed like an array, the underlying library hides the underlying storage location, much like a virtual memory manager hides the memory pages of an operating system. 
+Data streams appear to the user as a contiguous byte stream, much like a file. While they cannot be addressed like an array, the underlying library hides the underlying storage location, much like a virtual memory manager hides the memory pages of an operating system. Seeking a new position on the stream is an O(log n) operation.
 
-Data streams are addressable by "directory" (recognised by ending with a forward-slash "/"). A data stream name must not contain forward-slash, and it cannot be named similarly to another data stream within the same directory, but can otherwise be named as the user sees fit. In this way, the user can store a data stream hierarchy that could look as follows:
+Data streams are addressable by "directory" (recognised by ending with a forward-slash "/"). A data stream name must not contain forward-slash or null terminators, and it cannot have the same name as data stream in the same directory, but it can otherwise be named as the user sees fit. In this way, the user can store a data stream hierarchy that could look as follows:
 
 * image.png
 * another_image.png
@@ -18,7 +18,7 @@ Data streams are addressable by "directory" (recognised by ending with a forward
 * textures/another_image.png
 * an empty folder/
 
-Data streams must be opened and closed, like a regular file in a file system. Once opened, a set of functions exist to operate on the data stream. Data streams should be closed when reading and writing is no longer needed, which ensures that any last writes are written the data stream. Like a regular file, a data stream can be opened for writing by only one active writer, whereas it can be opened for reading by multiple simultaneous readers.
+Data streams must be opened and closed, like a regular file in a file system. Once opened, a set of functions exist to operate on the data stream. Data streams should be closed when reading and writing is no longer needed, which ensures that any last writes are written to the data stream. A data stream can be opened for writing by only one active writer, whereas it can be opened for reading by multiple simultaneous readers.
 
 It is not possible to "open" a directory, i.e. in the above example, the user cannot open "an empty folder/". The user can only open data streams for reading and writing - the "directories" function the same way as a real file system directory functions, in that they are used to contain things, including other directories.
 
@@ -38,7 +38,7 @@ An SFS file is useful as a generic storage container. Given that it supports ext
 
 While these scenarios are obvious, it is also expected that SFS files will be used for convenience when needing to write a lot of different data (even if the total length of the data to write is known), as a sort of "upgraded" block based file layout, .e.g IFF (interchange file format) file, where data stream names are used instead of IFF block identifiers.
 
-Naturally, to be usable by other libraries, which would normally write their data to a regular file system, the using library has to support abstractions on top of the file system so that a write to a file goes instead into a data stream in an SFS file.
+Naturally, to be usable as a storage container for other libraries, which would normally write their data to a regular file system, the using library has to support abstractions on top of the file system so that a write to a file goes instead into an SFS data stream.
 
 ## High level architecture
 
@@ -51,11 +51,11 @@ The SFS library is architecturally divided into four layers:
 
 ### Layer 4: Filing abstraction
 
-A caller only engages with Layer 4 and callers cannot engage directly with Layer 3, 2 or 1. Callers are often, however, aware of which specific Layer 3, 2 and 1 implementation is used when they create the SFS file.
+A caller only engages with Layer 4 and callers cannot engage directly with Layer 3, 2 or 1. However, callers are often aware of which specific Layer 3, 2 and 1 implementation is used when they create the SFS file.
 
-At this layer, directories can be created, deleted and iterated on and files can be opened, closed, written to and read from.
+At Layer 4, directories can be created, deleted and iterated and streams can be opened, closed, written to, and read from.
 
-This layer provides the caller a data structure that wraps a data stream, which the caller can use to write data to, read data from, change the head position and shorten the length of the data stream. Additionally there are utility functions to "reserve" space for the data stream growing, which may be used to decrease the fragmentation of storage in the underlying layers.
+Layer 4 provides the caller a data structure that wraps a data stream, which the caller must use to write data, read data from, change the head position, and shorten the length of the data stream. Additionally there are utility functions to "reserve" space for the data stream growing, which may be used to decrease the fragmentation of storage in the underlying layers and increase the speed of multiple sequential writes.
 
 This layer also provides utility functions to iterate the named contents of the SFS file, equivalent to typing "ls" on a regular file system to discover the hierarchical content of the SFS file.
 
@@ -67,7 +67,7 @@ In short, Layer 4 answers the question: Can you build a filing system out of num
 
 At this layer, data streams can be created, lengthened, shortened, deleted, written to and read from. This layer responds to requests from Layer 4 to create a new data stream and it returns a number-based identifier to Layer 4. This layer doesn't know anything about the filing name (that is the concern of Layer 4) or the content of the data streams.
 
-Internally, this layer requests new blocks from Layer 2. It links these blocks together to create data streams. When the data streams are created and lengthened, it requests new blocks from Layer 2 to achieve this. When the data streams are deleted or shortened, it returns newly freed blocks to Layer 2.
+Internally, this layer requests new blocks from Layer 2. It links these blocks together to create data streams. When the data streams are created and lengthened, it requests new blocks from Layer 2 to achieve this. When the data streams are deleted or shortened, it returns blocks no longer needed to Layer 2.
 
 Layer 3 concerns itself only with data streams. It provides functions for Layer 4 to discover how many data streams exist and to iterate over each data stream identifier. It also provides to Layer 4 the ability to lengthen, shorten, create and delete data streams. Layer 3 never reveals to Layer 4 how data streams are linked together.
 
@@ -75,32 +75,33 @@ In short, Layer 3 answers the question: Can you build numbered streams out of nu
 
 ### Layer 2: Block storage abstraction
 
-Layer 2 manages blocks. It provides to Layer 3 a new, unused block when requested and it keeps track of unused blocks that it has created or been handed back from Layer 3. Layer 2 uses Layer 1 to work with the actual file system when it needs to create new blocks, which it does by lengthening the underlying SFS file, doing whatever is required to initialise free blocks and then adds them to an internal list of unused blocks.
+Layer 2 manages blocks. It provides to Layer 3 a new, unused block when requested and it keeps track of unused blocks that it has created or received back from Layer 3. Layer 2 uses Layer 1 to work with the underlying storage system when it needs to create new blocks, which it does by lengthening the underlying SFS storage file, doing whatever is required to initialise free blocks and then adds them to an internal list of unused blocks.
 
-In short, Layer 2 answers the question: Can you build numbered blocks out of a file?
+In short, Layer 2 answers the question: Can you build numbered blocks out of a storage abstraction that behaves like a file?
 
 ### Layer 1: File system abstraction
 
-At this layer, real file system access is shielded away from Layer 2. This layer can create a file on the underlying file system, which it wraps away in some handle that is provided to Layer 2. At Layer 1, functions exist to create files, write to files, read from files, reposition the reading/writing head and shorten files. Layer 2 never touches the underlying file system directly; instead of works with Layer 1 to modify the underlying SFS file.
+At this layer, real file system access is shielded away from Layer 2. This layer can create a storage representation that acts like a fie on the underlying storage system, which it wraps away in some handle that is provided to Layer 2. At Layer 1, functions exist to create a storage representation, write to it, read from it, reposition the reading/writing head and shorten the storage representation. Layer 2 never touches the underlying file system directly; instead of works with Layer 1 to modify the underlying SFS storage.
 
-In short, Layer 1 answers the question: Can you wrap a file abstraction over a real file?
+In short, Layer 1 answers the question: Can the underlying storage be represented like a file, which can be locked, written to and read from.
 
-### Layer composition
+### Layer composition opportunities
 
 Layer 4 (the filing abstraction layer) provides to the caller a "virtual file system", with directories and files. Similarly Layer 1 (the file system abstraction) handles access to a file system, with directories and files.
 
 Because Layer 4 and Layer 1 operate on the same constructs - files and directories - you could write a layer 1 that writes to and reads from a data stream in another SFS file, in the way of Matryoshka dolls.
 
-This reveals a number of interesting opportunities, such as:
+This reveals some interesting opportunities, such as:
 
-- One SFS file could be operating on top of a real file system, using very large blocks (say 128 kb). Large data streams could be written directly to this SFS file. For smaller data streams, a stream inside this SFS file (say "small_files.efs") could operate with much smaller blocks (say 1 kb) to store small files. Whenever this small_files SFS file needed to expand to accommodate more small files, it would grow the small_files.efs data stream, in effect obtaining more 128 kb blocks to parcel out to in 1 kb increments.
-- Layer 4, the filing layer, could reserve some data streams for internal purposes. For example, internal in layer 4, when the SFS file was created, the first data stream (data stream 0) could be reserved for information about all the other data streams, by writing double-linked-list attribute blocks into this data stream and maintaining a free list of attribute blocks to future data streams.
+- One SFS file could be operating on top of a real file system, using very large blocks (say 512 kb). Large data streams could be written directly to this SFS file. For smaller data streams, a stream inside this SFS file (say "small_files.sfs") could operate with much smaller blocks (say 4 kb) to store small files. Whenever this small_files SFS file needed to expand to accommodate more small files, it would grow the small_files.efs data stream, in effect obtaining more 512 kb blocks to parcel out to in 1 kb increments.
 
-In addition, because layers can be mixed/match, alternative versions of layers can be written for particular needs, e.g.:
+- One SFS with large-ish blocks (e.g. 64 kb) file could use a custom Layer 2 (block storage layer) that, instead of storing its blocks through a Layer 1 file representation like normal, compressed and stored the 64 kb blocks it handled in an SFS file (with each block simply given its block number as a name) with much smaller blocks (say 4kb), thereby enabling real-time, transparent compression/decompression (and possibly encryption) of blocks.
 
-* Instead of a Layer 2 that retrieves blocks from a single Layer 1 file, an alternative Layer 2 could be written that creates a directory instead of a .SFS file and store each block as a real file inside this directory. This would ease testability as each block could be inspected using a regular file manager.
-* Instead of a Layer 3 file that links blocks together from Layer 2, an alternative Layer 3 could be written that creates a directory instead of an .SFS file and store each stream as a real file inside this directory. This would ease testability as new streams could be inspected using a regular file manager.
-* Instead of a Layer 2 that stores and retrieves blocks into a regular file stream provided by Layer 1, it could encrypt blocks when they were written and decrypt them when they were read
+- Instead of a Layer 2 that retrieves blocks from a single Layer 1 file, an alternative Layer 2 could be written that creates a directory instead of a .SFS file and store each block as a real file inside this directory. This would ease testability as each block could be inspected using a regular file manager.
+
+- Instead of a Layer 3 file that links blocks together from Layer 2, an alternative Layer 3 could be written that creates a directory instead of an .SFS file and store each stream as a real file inside this directory. This would ease testability as new streams could be inspected using a regular file manager.
+
+- Instead of a Layer 2 that stores and retrieves blocks into a regular file stream provided by Layer 1, it could encrypt blocks (with a length preserving encryption algorithm like AES-XTS) when they were written and decrypt them when they were read.
 
 # SFS Architecture & Implementation notes
 

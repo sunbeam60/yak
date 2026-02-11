@@ -18,7 +18,7 @@ pub use stream_layer::StreamLayer;
 pub use streams_from_blocks::StreamsFromBlocks;
 pub use streams_from_files::StreamsFromFiles;
 
-/// Default SFS configuration: single-file SFS with real L1+L2.
+/// Default SFS configuration: single-file SFS with default L1, L2, L3, L4 layers.
 pub type SfsDefault = Sfs<StreamsFromBlocks<BlocksInFile<FileOnDisk>>>;
 
 /// Block-file-backed streams (L2 mock, debugging/testing tool).

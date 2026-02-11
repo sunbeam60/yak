@@ -107,40 +107,43 @@ This reveals some interesting opportunities, such as:
 
 This documentation provides architectural support notes and considerations.
 
-Throughout this document, layers are described by L1, L2, L3 and L4, denoting Layer 1, 2, 3 and 4 respectively.
+Throughout this section, layers are described by L1, L2, L3 and L4, denoting Layer 1, 2, 3 and 4 respectively.
 
 ## Project structure
 
-There must be 4 projects across the workspace:
+There are 4 projects across the workspace:
 
-* SFS module, implemented in Rust: ./stream_fs/
-* C ABI SFS wrapper module, implemented in Rust: ./stream_fs_c/
-* Command line SFS manipulator, implemented in Rust: ./sfs_cl/
-* Testing harness and test, implement in Python/pytest: ./sfs_pytest
+
+| Module                    | Language      | Path         |
+| ------------------------- | ------------- | ------------ |
+| SFS module                | Rust          | stream_fs/   |
+| C ABI SFS wrapper module  | Rust          | stream_fs_c/ |
+| Command line SFS tool     | Rust          | sfs_cl/      |
+| Testing harness and tests | Python/pytest | sfs_pytest/  |
 
 ## Implementation language
 
-The library must be implemented as a Rust module, but support a C-compatible ABI on all public functions (using extern "C" and #[no_mangle] etc.). This ensures that the library can be linked into and used by as many other programming languages as possible. The public API must be a wrapper around a regular Rust L4 implementation so that other Rust libraries can use SFS without going through the C-style API. As far as possible, the Rust implementation must use static dispatch, i.e. generics, rather than dynamic dispatch.
+The library is implemented as a Rust library create that can be used directly, but it also supports a C-compatible ABI on all public functions (using extern "C" and #[no_mangle] etc.). This ensures that the library can be linked into and used by as many other programming languages as possible, including the included Python test suite.
 
 ## Testing
 
-The library must be tested using Python/pytest. This allows us to rapidly develop tests. Wherever possible, an approach of writing tests first, then implementing the library to make those tests pass, also known as Test Driven Development (TDD), should be used. A python library that wraps all the SFS C-ABI calls must be written to simplify testing in Python.
+The library is tested using Python/pytest. This allows us to rapidly develop tests and to test the C FFI wrapper around the Rust library.
 
 ## SFS file thread, process, machine & crash safety
 
 An SFS file must handle being accessed by multiple threads within the same process and multiple processes on the local machine, with the following considerations:
 
-- Within a process, a stream can be simultaneously opened for reading many times. If a stream is opened for reading, it cannot additionally be opened for writing. As long as a stream is opened for writing, all other attempts to open the stream, whether for reading or writing, fails. Multiple streams can, however, be opened at the same time, some for reading and some for writing. In short: Each stream can have one writer OR many readers.
+- Within a process, a stream can be simultaneously opened for reading many times. If a stream is opened for reading, it cannot additionally be opened for writing. When a stream is opened for writing, all other attempts to open the stream, whether for reading or writing, fails. Multiple streams can, however, be opened at the same time, some for reading and some for writing. In short: Each stream can have one writer OR many readers.
 - Within a machine, multiple processes may open an SFS file for reading simultaneously. Alternatively, a single process may open the SFS file for writing. If any process holds a write lock, no other process may open the file; if any process holds a read lock, no process may open for writing. In short: An SFS file can have one writer OR many readers.
 - Across a network, no access coordination is attempted. Multiple machines accessing the same SFS file simultaneously is undefined behaviour. In short: Don't access an SFS file over the network unless you know you're the only one accessing the file.
 
-SFS files are not ACID compliant. A process crash during a write is likely to leave the SFS file in an inconsistent state.
+SFS files are not ACID compliant. A process crash during a write can leave the SFS file in an inconsistent state. A function to verify the integrity of an SFS file is provided, although it cannot spot all the ways in which the integrity of an SFS file can fail.
 
 ## Endianness
 
 All multi-byte management data in an SFS file (block indices, stream lengths, header fields, directory entry lengths, etc.) is stored in little-endian byte order. This applies to all platforms — on big-endian systems, the library performs the necessary byte-swapping transparently.
 
-Naturally SFS cannot make any guarantees about the endianness of user-written stream data, since it cannot know what is written. Callers are responsible for their own data encoding.
+Naturally SFS cannot make any guarantees about the endianness of user-written stream data, since it cannot know what is written. Callers are responsible for their own data encoding, including that of encoding the byte order should they need to swap SFS files between opposing byte-order systems.
 
 ## Opening and creating a SFS file
 
@@ -148,24 +151,24 @@ An API is provided to create a new SFS file. This takes in a L3 type, a L2 type 
 
 An API is also provided to open an existing SFS file, also taking in L3, L2 and L1 types. When opening a file, a caller must specify either for reading - in which case other processes can also open the file for reading - or for writing - in which no other process can. This is handled by L1 file locking calls.
 
-When the four layers instantiate for creation, they each pass down a header (in layer order 4, 3, 2 and 1) as a byte array. Ultimately, on L1, the file is created writing out the byte arrays in the oppositive order (1, 2, 3 and then 4). What these headers contain is up to each layer, but all layer headers must start with a length descriptor. In a normal SFS file, the layout is as follows:
+When the four layers instantiate for creation, they each pass down a header (in layer order 4, 3, 2 and 1) as a byte array. Ultimately, on L1, the file is created writing out the byte arrays in the oppositive order (1, 2, 3 and then 4). What these headers contain is up to each layer, but all layer headers must start with a length descriptor. In a normal SFS file that uses the layers defined by the SfsDefault type, the layout is as follows:
 
 ```
-Magic: File magic header | header layout version
-L1: length | L1 identifier | L1 version | data offset
+Magic: File magic header | header layout version | total header length
+L1: length | L1 identifier | L1 version
 L2: length | L2 identifier | L2 version | block size (bytes) | block index size (bytes)
 L3: length | L3 identifier | L3 version | Streams stream descriptor
 L4: length | L4 identifier | L4 version | root directory stream index
 ```
 
-The `data offset` in L1's header records where block data begins in the file (immediately after L4's section). L1 needs this because it has no knowledge of how many upper layer sections exist or how large they are — `data offset` provides the definitive boundary between headers and data.
+The `total header length` in the magic section records the total size of all headers, which equals the data offset where block data begins in the file (immediately after L4's section). Any layer can read this from the magic section to find the definitive boundary between headers and data.
 
 When a SFS file is opened, L1 (as it opens the file) checks the file magic header and the header layout version to ensure it can read the headers. This ensures that:
 
 * This is indeed an SFS file, and
-* The layout of the headers follows a form that the code can read (in this version it's simply "each layer header is preceded by a length")
+* The layout of the headers follows a form that the code can read (in this version it's simply "the length of all headers is stored immediately after the version number" and "each layer header is preceded by a length")
 
-Assuming that it can, it reads the L1 header section (whose length is encoded in the section's length field) and validates the L1 identifier. It then reads the `data offset` from the L1 section — this tells L1 exactly how many bytes of upper layer header sections follow. L1 reads that exact range and passes it up the call stack.
+Assuming that it can, it reads the entire header section in and reads the L1 header section (whose length is encoded in the section's length field) so it can validate the L1 identifier.
 
 Each layer pops a header from the stack and compares it to what this layer expects to find, reading in the necessary information from the header to initialise this layer.
 
@@ -200,16 +203,18 @@ Data streams contain the data that a caller has written to the SFS file, with no
 
 Directory streams associate stream identifiers with a name, using a "stream entry" structure, e.g.
 
-* Identifier: 43, Name: image.png
-* Identifier: 101, Name: another_image.png
-* Identifier: 36, Name: textures/
-* Identifier: 930, Name: an empty folder/
+| Stream entry no. | Stream identifier | Name              |
+| ---------------- | ----------------- | ----------------- |
+| 0                | 43                | image.png         |
+| 1                | 101               | another_image.png |
+| 2                | 36                | textures/         |
+| 3                | 930               | an empty folder/  |
 
 When a stream entry ends with "/" the stream identifier points to another directory stream. If a stream entry does not end with a "/", the identifier points to a data stream.
 
 When a new SFS file is created, it immediately creates a directory stream for the root directory and stores the index for this stream in the L4 header.
 
-When an existing SFS file is opened, it reads the root directory stream index number from the header so it knows where to start the listing of named entries in the SFS file.
+When an existing SFS file is opened, it reads the root directory stream index number from the header so it can locate the root directory listing.
 
 #### Stream entry management
 

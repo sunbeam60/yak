@@ -180,11 +180,11 @@ fn run_small_write(bss: u8, biw: u8) -> Result<(), ()> {
     Ok(())
 }
 
-/// T threads, each writing a partition of 250 streams (40KB each).
+/// T threads, each writing a partition of 250 streams (100KB each).
 fn run_threaded_write(bss: u8, biw: u8, threads: usize) -> Result<(), ()> {
     let _guard = CleanupGuard { path: BENCH_FILE };
     let sfs = Arc::new(Sfs::create(BENCH_FILE, biw, bss).map_err(|e| eprintln!("Error: {}", e))?);
-    let buf = Arc::new(make_buffer(40 * 1024));
+    let buf = Arc::new(make_buffer(100 * 1024));
 
     let total_streams = 250usize;
     let per_thread = total_streams / threads;
@@ -229,12 +229,12 @@ fn run_threaded_write(bss: u8, biw: u8, threads: usize) -> Result<(), ()> {
     }
 }
 
-/// Populate 100 streams of 10KB, then T threads each read all streams.
+/// Populate 100 streams of 100KB, then T threads each read all streams.
 fn run_threaded_read(bss: u8, biw: u8, threads: usize) -> Result<(), ()> {
     let _guard = CleanupGuard { path: BENCH_FILE };
 
     let stream_count = 100usize;
-    let stream_size = 10 * 1024usize;
+    let stream_size = 100 * 1024usize;
 
     // Phase 1: populate (single-threaded)
     {

@@ -1,8 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::Mutex;
 
 use crate::stream_layer::StreamLayer;
+
+/// L4 payload size: "filing"(6) + version(1) + root_dir_stream_id(8) = 15 bytes.
+const L4_PAYLOAD_SIZE: u16 = 15;
 
 #[derive(Debug)]
 pub enum SfsError {
@@ -213,16 +216,19 @@ impl<L3: StreamLayer> Sfs<L3> {
         block_index_width: u8,
         block_size_shift: u8,
     ) -> Result<Self, SfsError> {
-        // Build L4 placeholder header section (correct size, placeholder values)
-        let l4_placeholder = build_l4_section(0);
-
-        // Pass placeholder down through the layer chain so L1 can calculate data_offset
-        let layer3 = L3::create(path, block_index_width, block_size_shift, &l4_placeholder)?;
+        // Pass L4 payload size down through the layer chain so L1 can calculate data_offset
+        let layer3 = L3::create(
+            path,
+            block_index_width,
+            block_size_shift,
+            VecDeque::from([L4_PAYLOAD_SIZE]),
+        )?;
         let root_id = layer3.create_stream()?;
 
-        // Now rewrite L4 header with real root_dir_stream_id
-        let l4_section = build_l4_section(root_id);
-        layer3.store_header(&l4_section)?;
+        // Write L4 header payload via slot
+        let l4_slot = layer3.header_slot_for_upper(0);
+        let l4_payload = serialize_header(root_id);
+        layer3.write_header_slot(l4_slot, &l4_payload)?;
 
         Ok(Sfs {
             layer3,
@@ -243,9 +249,10 @@ impl<L3: StreamLayer> Sfs<L3> {
     pub fn open(path: &str, mode: OpenMode) -> Result<Self, SfsError> {
         let layer3 = L3::open(path, mode)?;
 
-        // Restore L4 header from L3
-        let l4_section = layer3.load_header()?;
-        let root_id = parse_l4_section(&l4_section)?;
+        // Read L4 header payload via slot
+        let l4_slot = layer3.header_slot_for_upper(0);
+        let l4_data = layer3.read_header_slot(l4_slot)?;
+        let root_id = deserialize_header(&l4_data)?;
 
         Ok(Sfs {
             layer3,
@@ -1080,6 +1087,42 @@ impl<L3: StreamLayer> Sfs<L3> {
         Ok(())
     }
 
+    /// Pre-allocate storage so that at least `n_bytes` of data capacity is available.
+    /// Does not change the stream's logical size or head position.
+    /// Errors if `n_bytes` is less than the current stream size.
+    pub fn reserve(&self, handle: &StreamHandle, n_bytes: u64) -> Result<(), SfsError> {
+        let (l3_handle, mode) = {
+            let state = self.state.lock().unwrap();
+            let info = state
+                .open_streams
+                .get(&handle.0)
+                .ok_or_else(|| SfsError::NotFound("invalid stream handle".to_string()))?;
+            (info.l3_handle, info.mode)
+        };
+
+        if mode != OpenMode::Write {
+            return Err(SfsError::LockConflict(
+                "stream is not opened for writing".to_string(),
+            ));
+        }
+
+        self.layer3.reserve(&l3_handle, n_bytes)
+    }
+
+    /// Return the current reserved capacity (allocated block capacity in bytes).
+    /// Always >= stream_length and always a multiple of the block size (or 0).
+    pub fn stream_reserved(&self, handle: &StreamHandle) -> Result<u64, SfsError> {
+        let l3_handle = {
+            let state = self.state.lock().unwrap();
+            let info = state
+                .open_streams
+                .get(&handle.0)
+                .ok_or_else(|| SfsError::NotFound("invalid stream handle".to_string()))?;
+            info.l3_handle
+        };
+        self.layer3.stream_reserved(&l3_handle)
+    }
+
     // -------------------------------------------------------------------
     // Internal helpers
     // -------------------------------------------------------------------
@@ -1126,37 +1169,36 @@ impl<L3: StreamLayer> Sfs<L3> {
 // L4 header section helpers
 // ---------------------------------------------------------------------------
 
-/// Build the L4 header section: | length: u16 | "filing" | version: u8 | root_dir_stream_id: u64 |
-fn build_l4_section(root_dir_stream_id: u64) -> Vec<u8> {
-    let data_len: u16 = 8; // root_dir_stream_id
-    let total_len: u16 = 2 + 6 + 1 + data_len; // = 17
-    let mut buf = Vec::with_capacity(total_len as usize);
-    buf.extend_from_slice(&total_len.to_le_bytes());
+/// Serialize the L4 header (no length prefix).
+/// Format: | "filing": [u8;6] | version: u8 | root_dir_stream_id: u64 |
+fn serialize_header(root_dir_stream_id: u64) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(L4_PAYLOAD_SIZE as usize);
     buf.extend_from_slice(b"filing");
     buf.push(0); // version
     buf.extend_from_slice(&root_dir_stream_id.to_le_bytes());
     buf
 }
 
-/// Parse the L4 header section, returning root_dir_stream_id.
-fn parse_l4_section(data: &[u8]) -> Result<u64, SfsError> {
-    if data.is_empty() {
-        // No L4 header stored yet (legacy files) — fall back to root ID 0
-        return Ok(0);
-    }
-    if data.len() < 17 {
-        return Err(SfsError::IoError("L4 header section too short".to_string()));
-    }
-    // Verify identifier
-    if &data[2..8] != b"filing" {
+/// Deserialize the L4 header (no length prefix), returning root_dir_stream_id.
+/// Input: 15 bytes — identifier starts at byte 0.
+fn deserialize_header(data: &[u8]) -> Result<u64, SfsError> {
+    if data.len() < L4_PAYLOAD_SIZE as usize {
         return Err(SfsError::IoError(format!(
-            "expected L4 identifier 'filing', got '{}'",
-            String::from_utf8_lossy(&data[2..8])
+            "L4 payload too short: {} < {}",
+            data.len(),
+            L4_PAYLOAD_SIZE
         )));
     }
-    // Skip length (2) + identifier (6) + version (1) = 9 bytes, then read root_dir_stream_id
+    // Verify identifier
+    if &data[0..6] != b"filing" {
+        return Err(SfsError::IoError(format!(
+            "expected L4 identifier 'filing', got '{}'",
+            String::from_utf8_lossy(&data[0..6])
+        )));
+    }
+    // payload[6] = version, payload[7..15] = root_dir_stream_id
     let root_id = u64::from_le_bytes(
-        data[9..17]
+        data[7..15]
             .try_into()
             .map_err(|_| SfsError::IoError("failed to parse root_dir_stream_id".to_string()))?,
     );

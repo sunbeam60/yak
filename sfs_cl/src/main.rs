@@ -560,18 +560,27 @@ fn cmd_info(args: &[String]) -> Result<(), ()> {
         }
     };
 
-    match sfs.stream_length(&handle) {
-        Ok(length) => {
-            println!("Stream: {}", args[1]);
-            println!("Length: {} bytes", length);
-            let _ = sfs.close_stream(handle);
-            sfs.close();
-            Ok(())
-        }
+    let length = match sfs.stream_length(&handle) {
+        Ok(l) => l,
         Err(e) => {
             eprintln!("Error getting stream length: {}", e);
             let _ = sfs.close_stream(handle);
-            Err(())
+            return Err(());
         }
-    }
+    };
+    let reserved = match sfs.stream_reserved(&handle) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Error getting stream reserved: {}", e);
+            let _ = sfs.close_stream(handle);
+            return Err(());
+        }
+    };
+
+    println!("Stream: {}", args[1]);
+    println!("Length:   {} bytes", length);
+    println!("Reserved: {} bytes", reserved);
+    let _ = sfs.close_stream(handle);
+    sfs.close();
+    Ok(())
 }

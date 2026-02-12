@@ -1,4 +1,6 @@
-use crate::{OpenMode, SfsError};
+use std::collections::VecDeque;
+
+use crate::{HeaderSlotId, OpenMode, SfsError};
 
 /// L1 trait: File system abstraction.
 ///
@@ -6,41 +8,40 @@ use crate::{OpenMode, SfsError};
 /// file. L1 is header-aware: it understands the SFS header format (magic +
 /// length-prefixed layer sections) and knows where block data starts.
 ///
+/// Header sections for upper layers are managed via a slot system. During
+/// `create()`, payload sizes flow down and L1 allocates fixed-size slots.
+/// Each layer can then independently read/write its own section using
+/// `read_header_slot` / `write_header_slot` with its `HeaderSlotId`.
+///
 /// All methods take `&self` (not `&mut self`) so that a single L1 instance
 /// can be safely shared across threads. Implementations use interior
 /// mutability (e.g. `Mutex`) to protect file state.
 pub trait FileLayer: Send + Sync {
     /// Create a new SFS file at the given path.
     ///
-    /// `upper_layers` contains the accumulated header sections from L2+L3+L4
-    /// (possibly with placeholder values — correct sizes, uninitialised data).
+    /// `slot_sizes` contains the payload size (in bytes, NOT including
+    /// the 2-byte length prefix) for each upper layer's header section,
+    /// in on-disk order (inner-to-outer): `[L2_payload, L3_payload, L4_payload]`.
+    /// Each layer push_front's its own size as the deque flows down.
     ///
-    /// L1 writes: magic (including `total_header_length`) + L1 section +
-    /// upper_layers to the file, then acquires an exclusive process lock.
-    /// After this call, `data_offset()` returns the byte offset where block
-    /// data begins (equal to `total_header_length`).
-    fn create(path: &str, upper_layers: &[u8]) -> Result<Self, SfsError>
+    /// L1 writes: magic + L1 section + empty slots (length-prefixed, zeroed
+    /// payloads). After this call, each layer can fill its slot via
+    /// `write_header_slot`.
+    fn create(path: &str, slot_sizes: VecDeque<u16>) -> Result<Self, SfsError>
     where
         Self: Sized;
 
     /// Open an existing SFS file at the given path.
     ///
-    /// L1 reads the magic, validates the header format version, reads all
-    /// length-prefixed header sections, pops its own (L1) section, validates
-    /// it, and caches the remainder for `load_header()`.
+    /// L1 reads the magic, validates the header format version, reads the
+    /// L1 section, and rebuilds the slot registry from the remaining
+    /// length-prefixed sections.
     ///
     /// Acquires a shared process lock for `Read` mode or an exclusive lock
     /// for `Write` mode.
     fn open(path: &str, mode: OpenMode) -> Result<Self, SfsError>
     where
         Self: Sized;
-
-    /// Byte offset in the file where upper layer header data begins
-    /// (immediately after magic + L1 section).
-    ///
-    /// L2 uses this to know where its header section lives in the file,
-    /// enabling efficient in-place updates of bookkeeping fields.
-    fn upper_layers_offset(&self) -> u64;
 
     /// Byte offset in the file where block data begins
     /// (immediately after ALL header sections).
@@ -71,16 +72,23 @@ pub trait FileLayer: Send + Sync {
     /// Flush all writes to disk.
     fn flush(&self) -> Result<(), SfsError>;
 
-    /// Rewrite the upper layer header sections in-place.
+    /// Get the `HeaderSlotId` for the `index`-th upper layer section.
     ///
-    /// L1 rewrites: magic + L1 section + upper_layers.
-    /// The length of `upper_layers` must equal the original length passed
-    /// during create (section sizes are fixed — only values change).
-    fn store_header(&self, upper_layers: &[u8]) -> Result<(), SfsError>;
+    /// Index 0 = first upper section (L2), index 1 = next (L3), etc.
+    fn header_slot_for_upper(&self, index: u8) -> HeaderSlotId;
 
-    /// Read and return the upper layer header sections
-    /// (everything after magic + L1 section).
-    fn load_header(&self) -> Result<Vec<u8>, SfsError>;
+    /// Write a header section by slot ID.
+    ///
+    /// `data` is the section payload: `identifier[6] + version[1] + payload`.
+    /// L1 validates that `data.len()` matches the slot's expected payload size,
+    /// then writes `[length_prefix: u16] + data` at the slot's file offset.
+    fn write_header_slot(&self, slot: HeaderSlotId, data: &[u8]) -> Result<(), SfsError>;
+
+    /// Read a header section by slot ID.
+    ///
+    /// Returns the section payload (without the 2-byte length prefix):
+    /// `identifier[6] + version[1] + payload`.
+    fn read_header_slot(&self, slot: HeaderSlotId) -> Result<Vec<u8>, SfsError>;
 
     /// Run L1 integrity checks. Returns a list of issues found.
     /// Default implementation returns empty (no checks).

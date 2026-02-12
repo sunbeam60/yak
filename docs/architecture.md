@@ -10,7 +10,7 @@ The SFS crate is a Rust library that enable users to create, manage and use SFS 
 
 Data streams appear to the user as a contiguous byte stream, much like a file. While they cannot be addressed like an array, the underlying library hides the underlying storage location, much like a virtual memory manager hides the memory pages of an operating system. Seeking a new position on the stream is an O(log n) operation.
 
-Data streams are addressable by "directory" (recognised by ending with a forward-slash "/"). A data stream name must not contain forward-slash or null terminators, and it cannot have the same name as data stream in the same directory, but it can otherwise be named as the user sees fit. In this way, the user can store a data stream hierarchy that could look as follows:
+Data streams are addressable by "directory" (recognised by ending with a forward-slash "/"). A data stream name must not contain forward-slash, and it cannot have the same name as data stream in the same directory, but it can otherwise be named as the user sees fit (including null terminators). In this way, the user can store a data stream hierarchy that could look as follows:
 
 * image.png
 * another_image.png
@@ -267,23 +267,28 @@ Unlike L4 stream handles, L3 stream handles do not contain a head position. It i
 
 ### Streams from blocks
 
-Blocks are linked together to form a data stream. L3 (data stream abstraction) must separately keep track of the total length of the stream and the index of the "top block", in a so called "Stream Descriptor":
+Blocks are linked together to form a data stream. L3 must separately keep track of the total length of the stream and the index of the first block (known as the "top block"), in a so called "Stream Descriptor".
+
+* When the size of the stream is 0, the top block index is ignored, but must be 0 to avoid being 0xFFFF...(this value indicates that the Stream Descriptor is available for reuse, see below). A stream with nothing written to it thus takes no blocks of storage (Fig 1)
+* When the size of the stream is less than the length of one block, the "top block" contains the stream data (Fig 2)
+* When the size of the stream is more than the length of one block, the "top block" now contains block indices and is called a redirector block (Fig 3). This top block can now hold sizeof(block) / sizeof(block index) indices. Each index points to another block index, which could potentially also be a redirector block (Fig 4). 
+* In this way, the blocks involved in a data stream are either data blocks (at the lowest level of the block hierarchy) or redirector blocks (above the lowest level of data blocks), forming a "pyramid" data structure.
 
 ```ASCII
 Fig 1.             Fig 2.              Fig 3.                Fig 4.
 ┌──────────┐       ┌──────────┐        ┌──────────┐          ┌──────────┐        
-│ Size: 0  │       │ Size: n  │        │ Size: n  │          │ Size: n  │
+│ Size: 0  │       │ Size: 6  │        │ Size: 17 │          │ Size: 58 │
 │ Top: 0   │  -->  │ Top: 4   │   -->  │ Top: 15  │   -->    │ Top: 140 │
 └──────────┘       └────┬─────┘        └────┬─────┘          └────┬─────┘
                         ▼                   ▼                     ▼      
                   4┌──────────┐      15┌──────────┐       140┌──────────┐
-                   │.....n    │        │4 |10|  | │          │15|11|  | │
+                   │......    │        │4 |10|  | │          │15|11|  | │
                    └──────────┘        └─┬────────┘          └─┬────────┘
                                          ├ 4┌──────────┐       ├15┌──────────┐           
                                          │  │..........│       │  │4 |10|98|6│
                                          │  └──────────┘       │  └─┬────────┘
                                          └10┌──────────┐       │    ├ 4┌──────────┐
-                                            │....n     │       │    │  │..........│
+                                            │.......   │       │    │  │..........│
                                             └──────────┘       │    │  └──────────┘
                                                                │    ├10┌──────────┐
                                                                │    │  │..........│
@@ -301,16 +306,13 @@ Fig 1.             Fig 2.              Fig 3.                Fig 4.
                                                                     │  │..........│
                                                                     │  └──────────┘
                                                                     └19┌──────────┐
-                                                                       │.......n  │
+                                                                       │........  │
                                                                        └──────────┘                         
 ```
 
-* When the size of the stream is 0, the top block index is ignored, but must be 0 to avoid being 0xFFFF...(this value indicates that the Stream Descriptor is available for reuse). A stream with nothing written to it thus takes no blocks of storage (Fig 1)
-* When the size of the stream is less than the length of one block, the "top block" contains the stream data (Fig 2)
-* When the size of the stream is more than the length of one block, the "top block" now contains block indices and is called a redirector block (Fig 3). This top block can now hold sizeof(block) / sizeof(block index) indices. Each index points to another block index, which could potentially also be a redirector block (Fig 4). 
-* In this way, the blocks involved in a data stream are either data blocks (at the lowest level of the block hierarchy) or redirector blocks (above the lowest level of data blocks), forming a "pyramid" data structure.
 
-The lifetime of a new and growing data stream thus looks like this:
+
+Accordingly, the lifetime of a new and growing data stream is as follows:
 
 1. The data stream is created. At this point, no data or redirector blocks are in use. The size of the data stream, tracked separately, is 0 and the top block index is 0 (avoiding it being 0xFFFF... which implies that the stream descriptor is unused) (Fig 1)
 2. Data starts to be written onto the stream. As this happens, the size of the stream grows above 0 and it's necessary for L3 to allocate a new block to hold this data. The size gets updated in the stream descriptor and the data gets written into the first, and only, data block (Fig 2, block 4)
@@ -324,7 +326,10 @@ The lifetime of a new and growing data stream thus looks like this:
    3. The first index in this new top block is, of course, the index of the old top block (Fig 4, block 140, observe index 15). The second index in the new top block is the new redirector block (Fig 4, block 140, observe index 11). In this way, we've increased the height of the data structure by one more.
 5. As more and more stream data is written, the level of redirector blocks grow, from 0 (no redirectors), to 1 and beyond. The more data blocks we need to store, the "taller" the hierarchy of redirector blocks becomes.
 
-The corollary case of a truncated stream is relatively simple 
+The corollary case of a truncated stream is relatively simple; only the left, symmetrical part of the pyramid is kept; all blocks no longer needed are returned.
+
+```ASCII
+```
 
 #### Rationale
 
@@ -334,7 +339,14 @@ The "pyramid shaped" block linking layout has a number of advantages:
 * The lookup time for finding a random point in the stream is O(log n).
 * The lengthening and shortening of data streams doesn't need to move any blocks, only allocate and return blocks, as the number of redirector blocks grow and shrink above the data blocks.
 * The depth of the redirector blocks can be calculated directly from the size of the stream. In addition, there's no overhead to mark a block out as a particular type; since we can reason about the depth, we know how far down the hierarchy the data blocks lie and everything before that is a redirector block.
-* Even with relatively small block sizes a *large* data stream can be tracked with low depth of tracking blocks. For example, if blocks are 4 kb and uint32 indices, an SFS stream can can grow to 4+ GB before needing a third redirector level
+* Even with relatively small block sizes a *large* data stream can be tracked with low depth of tracking blocks. For example, if blocks are 4 kb and uint32 indices, an SFS stream can can grow to 4+ GB before needing a third redirector level.
+
+#### Reserved length
+For clarity of explanation, the explanation above does not deal with reserved capacity of a stream. A stream can be extended into being longer than needed to store the data in the stream. This enables long writes to pre-allocate the necessary blocks instead of the stream going through iterative enlargement, and it often promotes data blocks being allocated next to each other.
+
+So while the explanation above is correct, it leaves out the fact that a stream descriptor actually has 3 fields: Top block, size and reserved, and that the resulting pyramid can therefore be larger than it needs to be to strictly hold the user-written data.
+
+When a stream is truncated, all blocks - including those in any extended reserve - are returned as free blocks.
 
 ### Tracking streams in L3
 

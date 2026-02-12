@@ -1,4 +1,6 @@
-use crate::{OpenMode, SfsError};
+use std::collections::VecDeque;
+
+use crate::{HeaderSlotId, OpenMode, SfsError};
 
 /// L3 trait: Data stream abstraction.
 ///
@@ -24,14 +26,14 @@ pub trait StreamLayer: Send + Sync {
     /// disk (e.g. 2, 4, or 8).
     /// `block_size_shift` is the power-of-2 exponent for block size
     /// (e.g. 12 → 4096 bytes).
-    /// `upper_layers` contains the accumulated header sections from L4
-    /// (possibly with placeholder values). L3 prepends its own section
-    /// and passes everything down to L2.
+    /// `slot_sizes` accumulates payload sizes (NOT including the
+    /// 2-byte length prefix) as they flow down through the layer chain.
+    /// L3 push_front's its own payload size and passes the deque down to L2.
     fn create(
         path: &str,
         block_index_width: u8,
         block_size_shift: u8,
-        upper_layers: &[u8],
+        slot_sizes: VecDeque<u16>,
     ) -> Result<Self, SfsError>
     where
         Self: Sized;
@@ -93,21 +95,35 @@ pub trait StreamLayer: Send + Sync {
     fn stream_length(&self, handle: &Self::Handle) -> Result<u64, SfsError>;
 
     /// Truncate a stream to the given length.
+    /// Also frees excess reserved blocks and resets reserved capacity.
     fn truncate(&self, handle: &Self::Handle, new_len: u64) -> Result<(), SfsError>;
 
-    /// Store header sections for this layer and all layers above.
-    ///
-    /// `upper_layers` contains the already-formatted header sections from
-    /// the layer(s) above (each with their own length/identifier prefix).
-    /// The implementation prepends its own section and passes everything
-    /// down to the layer below (or writes to disk if this is the bottom layer).
-    fn store_header(&self, upper_layers: &[u8]) -> Result<(), SfsError>;
+    /// Pre-allocate storage so that at least `n_bytes` worth of data capacity
+    /// is available for the stream. Does not change the stream's logical size.
+    /// The actual reserved capacity may be larger than `n_bytes` (rounded up to
+    /// block boundaries). Errors if `n_bytes < stream length`.
+    /// Requires the stream to be open for writing.
+    fn reserve(&self, handle: &Self::Handle, n_bytes: u64) -> Result<(), SfsError>;
 
-    /// Load header sections for the layers above this one.
+    /// Return the current reserved capacity (allocated block capacity in bytes).
+    /// This is always >= stream_length and always a multiple of the block size (or 0).
+    fn stream_reserved(&self, handle: &Self::Handle) -> Result<u64, SfsError>;
+
+    /// Get the `HeaderSlotId` for the `index`-th upper layer section.
     ///
-    /// Returns the concatenated header sections that were passed to
-    /// `store_header()` — i.e. everything except this layer's own section.
-    fn load_header(&self) -> Result<Vec<u8>, SfsError>;
+    /// Index 0 = first upper section (L4), etc.
+    /// Implemented as `self.l2.header_slot_for_upper(index + 1)` for the real L3.
+    fn header_slot_for_upper(&self, index: u8) -> HeaderSlotId;
+
+    /// Write a header section by slot ID (pass-through to L2/L1).
+    ///
+    /// `data` is the section payload: `identifier[6] + version[1] + payload`.
+    fn write_header_slot(&self, slot: HeaderSlotId, data: &[u8]) -> Result<(), SfsError>;
+
+    /// Read a header section by slot ID (pass-through to L2/L1).
+    ///
+    /// Returns the section payload (without the 2-byte length prefix).
+    fn read_header_slot(&self, slot: HeaderSlotId) -> Result<Vec<u8>, SfsError>;
 
     /// Run L3 integrity checks. `claimed_streams` are stream IDs that L4
     /// asserts should exist (directory streams + data streams).

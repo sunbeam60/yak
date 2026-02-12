@@ -196,6 +196,19 @@ class Sfs:
         if result != 0:
             _check_error()
 
+    def reserve(self, handle: int, n_bytes: int) -> None:
+        """Pre-allocate storage for a stream."""
+        result = _lib.sfs_reserve(self._handle, handle, n_bytes)
+        if result != 0:
+            _check_error()
+
+    def stream_reserved(self, handle: int) -> int:
+        """Get the reserved capacity of a stream."""
+        result = _lib.sfs_stream_reserved(self._handle, handle)
+        if result < 0:
+            _check_error()
+        return result
+
     # --- Verify ---
 
     def verify(self) -> list[str]:

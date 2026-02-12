@@ -1,9 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Condvar, Mutex};
 
 use crate::block_layer::BlockLayer;
 use crate::stream_layer::StreamLayer;
-use crate::{OpenMode, SfsError};
+use crate::{HeaderSlotId, OpenMode, SfsError};
+
+/// L3 payload size: "pyra  "(6) + version(1) + size(8) + top_block(8) + reserved(8) = 31 bytes.
+const L3_PAYLOAD_SIZE: u16 = 31;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -13,8 +16,8 @@ use crate::{OpenMode, SfsError};
 /// A top_block of u64::MAX means the descriptor is free.
 const FREE_DESCRIPTOR_MARKER: u64 = u64::MAX;
 
-/// Size of a stream descriptor in bytes: u64 size + u64 top_block.
-const DESCRIPTOR_SIZE: u64 = 16;
+/// Size of a stream descriptor in bytes: u64 size + u64 top_block + u64 reserved.
+const DESCRIPTOR_SIZE: u64 = 24;
 
 /// Well-known stream ID for the Streams stream in the lock map.
 /// u64::MAX can never be a valid stream ID (it would require an impossible
@@ -41,6 +44,9 @@ fn block_sentinel(block_index_width: u8) -> u64 {
 struct StreamDescriptor {
     size: u64,
     top_block: u64,
+    /// Allocated capacity in bytes (always a multiple of block_size, or 0).
+    /// Invariant: reserved >= size.
+    reserved: u64,
 }
 
 impl StreamDescriptor {
@@ -48,17 +54,19 @@ impl StreamDescriptor {
         self.top_block == FREE_DESCRIPTOR_MARKER
     }
 
-    fn to_bytes(self) -> [u8; 16] {
-        let mut buf = [0u8; 16];
+    fn to_bytes(self) -> [u8; 24] {
+        let mut buf = [0u8; 24];
         buf[0..8].copy_from_slice(&self.size.to_le_bytes());
         buf[8..16].copy_from_slice(&self.top_block.to_le_bytes());
+        buf[16..24].copy_from_slice(&self.reserved.to_le_bytes());
         buf
     }
 
-    fn from_bytes(data: &[u8; 16]) -> Self {
+    fn from_bytes(data: &[u8; 24]) -> Self {
         StreamDescriptor {
             size: u64::from_le_bytes(data[0..8].try_into().unwrap()),
             top_block: u64::from_le_bytes(data[8..16].try_into().unwrap()),
+            reserved: u64::from_le_bytes(data[16..24].try_into().unwrap()),
         }
     }
 }
@@ -114,8 +122,8 @@ pub struct StreamsFromBlocks<L2: BlockLayer> {
     /// this Mutex is only for safe value access (never contends in practice).
     streams_descriptor: Mutex<StreamDescriptor>,
 
-    /// Cached L4 header blob (loaded during open, updated via store_header).
-    l4_header_cache: Mutex<Vec<u8>>,
+    /// L3's own header slot ID.
+    my_slot: HeaderSlotId,
 
     /// Bookkeeping state: per-stream locks, open handles.
     state: Mutex<StreamsFromBlocksState>,
@@ -194,7 +202,8 @@ fn navigate_to_position<L2: BlockLayer>(
     fan_out: u64,
     block_index_width: u8,
 ) -> Result<(u64, usize), SfsError> {
-    let num_data_blocks = data_blocks_needed(descriptor.size, block_size);
+    let capacity = descriptor.reserved.max(descriptor.size);
+    let num_data_blocks = data_blocks_needed(capacity, block_size);
     let depth = pyramid_depth(num_data_blocks, fan_out);
 
     let data_block_idx = pos / block_size as u64;
@@ -236,12 +245,12 @@ fn ensure_capacity<L2: BlockLayer>(
         return Ok(());
     }
 
-    let current_data_blocks = data_blocks_needed(descriptor.size, block_size);
+    let current_data_blocks = data_blocks_needed(descriptor.reserved, block_size);
     let current_depth = pyramid_depth(current_data_blocks, fan_out);
     let target_depth = pyramid_depth(target_data_blocks, fan_out);
 
     // Handle empty stream: allocate first block
-    if descriptor.size == 0 && descriptor.top_block == 0 {
+    if descriptor.reserved == 0 && descriptor.top_block == 0 {
         if target_depth == 0 {
             // Just need a single data block
             let block = layer2.allocate_block()?;
@@ -256,7 +265,7 @@ fn ensure_capacity<L2: BlockLayer>(
     }
 
     // Grow depth if needed: wrap current top in new redirector layers
-    let effective_current_depth = if descriptor.size == 0 && current_data_blocks == 0 {
+    let effective_current_depth = if descriptor.reserved == 0 && current_data_blocks == 0 {
         // We just allocated a top block above, so we're at depth 0
         0
     } else {
@@ -415,22 +424,17 @@ fn pyramid_write<L2: BlockLayer>(
 
     let end_pos = pos + buf.len() as u64;
 
-    // Ensure we have enough blocks
-    let target_blocks = data_blocks_needed(end_pos, block_size);
-    ensure_capacity(
+    // Ensure we have enough blocks for the write endpoint (or current size, whichever is larger)
+    pyramid_reserve(
         layer2,
         descriptor,
-        target_blocks,
+        end_pos.max(descriptor.size),
         block_size,
         fan_out,
         block_index_width,
     )?;
 
-    // Temporarily set size to end_pos so navigation works for new blocks
     let old_size = descriptor.size;
-    if end_pos > old_size {
-        descriptor.size = end_pos;
-    }
 
     let mut bytes_written = 0;
     let mut current_pos = pos;
@@ -486,8 +490,9 @@ fn pyramid_truncate<L2: BlockLayer>(
 
     if new_len == 0 {
         // Deallocate everything
-        if descriptor.size > 0 && descriptor.top_block != 0 {
-            let old_blocks = data_blocks_needed(descriptor.size, block_size);
+        let capacity = descriptor.reserved.max(descriptor.size);
+        if capacity > 0 && descriptor.top_block != 0 {
+            let old_blocks = data_blocks_needed(capacity, block_size);
             let old_depth = pyramid_depth(old_blocks, fan_out);
             deallocate_tree(
                 layer2,
@@ -499,10 +504,12 @@ fn pyramid_truncate<L2: BlockLayer>(
         }
         descriptor.size = 0;
         descriptor.top_block = 0;
+        descriptor.reserved = 0;
         return Ok(());
     }
 
-    let old_blocks = data_blocks_needed(descriptor.size, block_size);
+    let capacity = descriptor.reserved.max(descriptor.size);
+    let old_blocks = data_blocks_needed(capacity, block_size);
     let new_blocks = data_blocks_needed(new_len, block_size);
     let old_depth = pyramid_depth(old_blocks, fan_out);
     let new_depth = pyramid_depth(new_blocks, fan_out);
@@ -530,7 +537,40 @@ fn pyramid_truncate<L2: BlockLayer>(
     }
     descriptor.top_block = current_top;
     descriptor.size = new_len;
+    descriptor.reserved = new_blocks * block_size as u64;
 
+    Ok(())
+}
+
+/// Pre-allocate blocks so the stream can hold at least `n_bytes` without further allocation.
+/// Does not change the stream's logical size. Errors if `n_bytes < descriptor.size`.
+fn pyramid_reserve<L2: BlockLayer>(
+    layer2: &L2,
+    descriptor: &mut StreamDescriptor,
+    n_bytes: u64,
+    block_size: usize,
+    fan_out: u64,
+    block_index_width: u8,
+) -> Result<(), SfsError> {
+    if n_bytes < descriptor.size {
+        return Err(SfsError::IoError(format!(
+            "cannot reserve {} bytes: stream size is already {}",
+            n_bytes, descriptor.size
+        )));
+    }
+    if n_bytes <= descriptor.reserved {
+        return Ok(()); // Already have enough capacity
+    }
+    let target_blocks = data_blocks_needed(n_bytes, block_size);
+    ensure_capacity(
+        layer2,
+        descriptor,
+        target_blocks,
+        block_size,
+        fan_out,
+        block_index_width,
+    )?;
+    descriptor.reserved = target_blocks * block_size as u64;
     Ok(())
 }
 
@@ -860,7 +900,7 @@ impl<L2: BlockLayer> StreamsFromBlocks<L2> {
         if offset + DESCRIPTOR_SIZE > streams_desc.size {
             return Err(SfsError::NotFound(format!("stream {}", stream_id)));
         }
-        let mut buf = [0u8; 16];
+        let mut buf = [0u8; 24];
         let bs = self.block_size();
         let fo = self.fan_out();
         let biw = self.block_index_width_val();
@@ -885,57 +925,57 @@ impl<L2: BlockLayer> StreamsFromBlocks<L2> {
         Ok(())
     }
 
-    /// Build the L3 header section.
-    fn build_l3_section(streams_desc: &StreamDescriptor) -> Vec<u8> {
-        let data_len: u16 = 8 + 8; // streams_size + streams_top_block
-        let total_len: u16 = 2 + 6 + 1 + data_len; // = 25
-        let mut buf = Vec::with_capacity(total_len as usize);
-        buf.extend_from_slice(&total_len.to_le_bytes());
+    /// Serialize the L3 header (no length prefix).
+    /// Format: | "pyra  ": [u8;6] | version: u8 | size: u64 | top_block: u64 | reserved: u64 |
+    fn serialize_header(streams_desc: &StreamDescriptor) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(L3_PAYLOAD_SIZE as usize);
         buf.extend_from_slice(b"pyra  ");
-        buf.push(0); // version
+        buf.push(1); // version 1: descriptors include reserved field
         buf.extend_from_slice(&streams_desc.size.to_le_bytes());
         buf.extend_from_slice(&streams_desc.top_block.to_le_bytes());
+        buf.extend_from_slice(&streams_desc.reserved.to_le_bytes());
         buf
     }
 
-    /// Parse the L3 header section.
-    fn parse_l3_section(data: &[u8]) -> Result<(StreamDescriptor, usize), SfsError> {
-        if data.len() < 2 {
-            return Err(SfsError::IoError("L3 header too short".to_string()));
-        }
-        let l3_len = u16::from_le_bytes([data[0], data[1]]) as usize;
-        if data.len() < l3_len {
-            return Err(SfsError::IoError("L3 header data too short".to_string()));
-        }
-        if l3_len < 25 {
-            return Err(SfsError::IoError("L3 header section too small".to_string()));
-        }
-        if &data[2..8] != b"pyra  " {
+    /// Deserialize the L3 header (no length prefix).
+    /// Input: 31 bytes — identifier starts at byte 0.
+    fn deserialize_header(data: &[u8]) -> Result<StreamDescriptor, SfsError> {
+        if data.len() < L3_PAYLOAD_SIZE as usize {
             return Err(SfsError::IoError(format!(
-                "expected L3 identifier 'pyra  ', got '{}'",
-                String::from_utf8_lossy(&data[2..8])
+                "L3 payload too short: {} < {}",
+                data.len(),
+                L3_PAYLOAD_SIZE
             )));
         }
-        // offset 8 = version (skip), 9..17 = streams_size, 17..25 = streams_top_block
-        let streams_size = u64::from_le_bytes(data[9..17].try_into().unwrap());
-        let streams_top_block = u64::from_le_bytes(data[17..25].try_into().unwrap());
-        Ok((
-            StreamDescriptor {
-                size: streams_size,
-                top_block: streams_top_block,
-            },
-            l3_len,
-        ))
+        if &data[0..6] != b"pyra  " {
+            return Err(SfsError::IoError(format!(
+                "expected L3 identifier 'pyra  ', got '{}'",
+                String::from_utf8_lossy(&data[0..6])
+            )));
+        }
+        let version = data[6];
+        if version != 1 {
+            return Err(SfsError::IoError(format!(
+                "unsupported L3 version: {} (expected 1; re-create the file)",
+                version
+            )));
+        }
+        // payload[7..15] = streams_size, [15..23] = streams_top_block, [23..31] = streams_reserved
+        let streams_size = u64::from_le_bytes(data[7..15].try_into().unwrap());
+        let streams_top_block = u64::from_le_bytes(data[15..23].try_into().unwrap());
+        let streams_reserved = u64::from_le_bytes(data[23..31].try_into().unwrap());
+        Ok(StreamDescriptor {
+            size: streams_size,
+            top_block: streams_top_block,
+            reserved: streams_reserved,
+        })
     }
 
-    /// Persist the header chain (L3 + cached L4 sections) via L2.
+    /// Persist the L3 header payload to L2 via its slot.
     /// Caller must hold the STREAMS_STREAM_ID lock.
-    fn persist_header(&self, streams_desc: &StreamDescriptor) -> Result<(), SfsError> {
-        let l4_cache = self.l4_header_cache.lock().unwrap();
-        let l3_section = Self::build_l3_section(streams_desc);
-        let mut combined = l3_section;
-        combined.extend_from_slice(&l4_cache);
-        self.layer2.store_header(&combined)
+    fn persist_l3_header(&self, streams_desc: &StreamDescriptor) -> Result<(), SfsError> {
+        let payload = Self::serialize_header(streams_desc);
+        self.layer2.write_header_slot(self.my_slot, &payload)
     }
 }
 
@@ -950,35 +990,37 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
         path: &str,
         block_index_width: u8,
         block_size_shift: u8,
-        upper_layers: &[u8],
+        mut slot_sizes: VecDeque<u16>,
     ) -> Result<Self, SfsError>
     where
         Self: Sized,
     {
-        // Build L3 placeholder section and prepend to upper_layers
+        // Push L3 payload size to front (on-disk order: L3 before L4)
+        slot_sizes.push_front(L3_PAYLOAD_SIZE);
+
+        let layer2 = L2::create(path, block_size_shift, block_index_width, slot_sizes)?;
+        let my_slot = layer2.header_slot_for_upper(0);
+
+        // Write initial L3 payload
         let streams_desc = StreamDescriptor {
             size: 0,
             top_block: 0,
+            reserved: 0,
         };
-        let l3_section = Self::build_l3_section(&streams_desc);
-        let mut combined = l3_section;
-        combined.extend_from_slice(upper_layers);
+        let l3_payload = Self::serialize_header(&streams_desc);
+        layer2.write_header_slot(my_slot, &l3_payload)?;
 
-        let layer2 = L2::create(path, block_size_shift, block_index_width, &combined)?;
-
-        let instance = StreamsFromBlocks {
+        Ok(StreamsFromBlocks {
             layer2,
             streams_descriptor: Mutex::new(streams_desc),
-            l4_header_cache: Mutex::new(upper_layers.to_vec()),
+            my_slot,
             state: Mutex::new(StreamsFromBlocksState {
                 next_handle_id: 0,
                 locks: HashMap::new(),
                 open_handles: HashMap::new(),
             }),
             lock_released: Condvar::new(),
-        };
-
-        Ok(instance)
+        })
     }
 
     fn open(path: &str, mode: OpenMode) -> Result<Self, SfsError>
@@ -986,18 +1028,16 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
         Self: Sized,
     {
         let layer2 = L2::open(path, mode)?;
-        let upper_sections = layer2.load_header()?;
+        let my_slot = layer2.header_slot_for_upper(0);
 
-        // Parse L3 section
-        let (streams_desc, l3_len) = Self::parse_l3_section(&upper_sections)?;
-
-        // The L4 section is everything after L3's section
-        let l4_section = upper_sections[l3_len..].to_vec();
+        // Read and parse L3 payload
+        let l3_data = layer2.read_header_slot(my_slot)?;
+        let streams_desc = Self::deserialize_header(&l3_data)?;
 
         Ok(StreamsFromBlocks {
             layer2,
             streams_descriptor: Mutex::new(streams_desc),
-            l4_header_cache: Mutex::new(l4_section),
+            my_slot,
             state: Mutex::new(StreamsFromBlocksState {
                 next_handle_id: 0,
                 locks: HashMap::new(),
@@ -1059,6 +1099,7 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
                     let new_desc = StreamDescriptor {
                         size: 0,
                         top_block: 0,
+                        reserved: 0,
                     };
                     let offset = new_id * DESCRIPTOR_SIZE;
                     let buf = new_desc.to_bytes();
@@ -1067,14 +1108,15 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
                 }
             };
 
-            // Write the new descriptor (size=0, top_block=0)
+            // Write the new descriptor (size=0, top_block=0, reserved=0)
             let new_desc = StreamDescriptor {
                 size: 0,
                 top_block: 0,
+                reserved: 0,
             };
             self.write_descriptor(&mut streams_desc, stream_id, &new_desc)?;
 
-            self.persist_header(&streams_desc)?;
+            self.persist_l3_header(&streams_desc)?;
 
             Ok(stream_id)
         })();
@@ -1165,7 +1207,7 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
             let result = {
                 let mut streams_desc = self.streams_descriptor.lock().unwrap();
                 self.write_descriptor(&mut streams_desc, info.stream_id, &info.cached_descriptor)?;
-                self.persist_header(&streams_desc)
+                self.persist_l3_header(&streams_desc)
             };
             self.release_lock(STREAMS_STREAM_ID, OpenMode::Write);
             result?;
@@ -1201,11 +1243,12 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
             }
 
             // Deallocate all blocks belonging to the stream
-            if desc.size > 0 && desc.top_block != 0 {
+            let capacity = desc.reserved.max(desc.size);
+            if capacity > 0 && desc.top_block != 0 {
                 let bs = self.block_size();
                 let fo = self.fan_out();
                 let biw = self.block_index_width_val();
-                let num_blocks = data_blocks_needed(desc.size, bs);
+                let num_blocks = data_blocks_needed(capacity, bs);
                 let depth = pyramid_depth(num_blocks, fo);
                 deallocate_tree(&self.layer2, desc.top_block, depth, fo, biw)?;
             }
@@ -1214,9 +1257,10 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
             let free_desc = StreamDescriptor {
                 size: 0,
                 top_block: FREE_DESCRIPTOR_MARKER,
+                reserved: 0,
             };
             self.write_descriptor(&mut streams_desc, id, &free_desc)?;
-            self.persist_header(&streams_desc)?;
+            self.persist_l3_header(&streams_desc)?;
 
             Ok(())
         })();
@@ -1313,27 +1357,56 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
         Ok(())
     }
 
-    fn store_header(&self, upper_layers: &[u8]) -> Result<(), SfsError> {
-        // Cache the L4 header
-        {
-            let mut cache = self.l4_header_cache.lock().unwrap();
-            *cache = upper_layers.to_vec();
-        }
-        self.acquire_lock(STREAMS_STREAM_ID, OpenMode::Read, true)?;
-        let result = {
-            let streams_desc = self.streams_descriptor.lock().unwrap();
-            let l3_section = Self::build_l3_section(&streams_desc);
-            let mut combined = l3_section;
-            combined.extend_from_slice(upper_layers);
-            self.layer2.store_header(&combined)
+    fn reserve(&self, handle: &Self::Handle, n_bytes: u64) -> Result<(), SfsError> {
+        let mut desc = {
+            let state = self.state.lock().unwrap();
+            let info = state
+                .open_handles
+                .get(&handle.0)
+                .ok_or_else(|| SfsError::NotFound("invalid stream handle".to_string()))?;
+            if info.mode != OpenMode::Write {
+                return Err(SfsError::LockConflict(
+                    "stream is not opened for writing".to_string(),
+                ));
+            }
+            info.cached_descriptor
         };
-        self.release_lock(STREAMS_STREAM_ID, OpenMode::Read);
-        result
+
+        let bs = self.block_size();
+        let fo = self.fan_out();
+        let biw = self.block_index_width_val();
+        pyramid_reserve(&self.layer2, &mut desc, n_bytes, bs, fo, biw)?;
+
+        // Update cached descriptor
+        {
+            let mut state = self.state.lock().unwrap();
+            let info = state.open_handles.get_mut(&handle.0).unwrap();
+            info.cached_descriptor = desc;
+        }
+
+        Ok(())
     }
 
-    fn load_header(&self) -> Result<Vec<u8>, SfsError> {
-        // Return the L4 section cached during open()
-        Ok(self.l4_header_cache.lock().unwrap().clone())
+    fn stream_reserved(&self, handle: &Self::Handle) -> Result<u64, SfsError> {
+        let state = self.state.lock().unwrap();
+        let info = state
+            .open_handles
+            .get(&handle.0)
+            .ok_or_else(|| SfsError::NotFound("invalid stream handle".to_string()))?;
+        Ok(info.cached_descriptor.reserved)
+    }
+
+    fn header_slot_for_upper(&self, index: u8) -> HeaderSlotId {
+        // Slot 0 = L3's own, so upper layer index 0 → slot 1 (L4), etc.
+        self.layer2.header_slot_for_upper(index + 1)
+    }
+
+    fn write_header_slot(&self, slot: HeaderSlotId, data: &[u8]) -> Result<(), SfsError> {
+        self.layer2.write_header_slot(slot, data)
+    }
+
+    fn read_header_slot(&self, slot: HeaderSlotId) -> Result<Vec<u8>, SfsError> {
+        self.layer2.read_header_slot(slot)
     }
 
     fn verify(&self, claimed_streams: &[u64]) -> Result<Vec<String>, SfsError> {
@@ -1378,16 +1451,23 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
                         active_on_disk.insert(i);
 
                         // Validate descriptor consistency
-                        if desc.size == 0 && desc.top_block != 0 {
+                        if desc.size == 0 && desc.reserved == 0 && desc.top_block != 0 {
                             issues.push(format!(
                                 "L3: stream {}: size is 0 but top_block is {} (expected 0)",
                                 i, desc.top_block
                             ));
                         }
+                        if desc.reserved < desc.size {
+                            issues.push(format!(
+                                "L3: stream {}: reserved ({}) < size ({}) — invariant violation",
+                                i, desc.reserved, desc.size
+                            ));
+                        }
 
                         // Collect blocks for this stream's pyramid
-                        if desc.size > 0 {
-                            let num_blocks = data_blocks_needed(desc.size, bs);
+                        let capacity = desc.reserved.max(desc.size);
+                        if capacity > 0 {
+                            let num_blocks = data_blocks_needed(capacity, bs);
                             let depth = pyramid_depth(num_blocks, fo);
                             let stream_label = i.to_string();
                             let mut collector = TreeCollector {

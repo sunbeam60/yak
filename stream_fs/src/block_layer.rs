@@ -1,4 +1,6 @@
-use crate::{OpenMode, SfsError};
+use std::collections::VecDeque;
+
+use crate::{HeaderSlotId, OpenMode, SfsError};
 
 /// L2 trait: Block storage abstraction.
 ///
@@ -19,14 +21,14 @@ pub trait BlockLayer: Send + Sync {
     /// (e.g. 12 -> 4096 bytes).
     /// `block_index_width` is the number of bytes used for block indices
     /// on disk (e.g. 2, 4, or 8).
-    /// `upper_layers` contains the accumulated header sections from L3+L4
-    /// (possibly with placeholder values). L2 prepends its own section
-    /// and passes everything down to L1 (or writes to disk).
+    /// `slot_sizes` accumulates payload sizes (NOT including the
+    /// 2-byte length prefix) as they flow down through the layer chain.
+    /// L2 push_front's its own payload size and passes the deque down to L1.
     fn create(
         path: &str,
         block_size_shift: u8,
         block_index_width: u8,
-        upper_layers: &[u8],
+        slot_sizes: VecDeque<u16>,
     ) -> Result<Self, SfsError>
     where
         Self: Sized;
@@ -65,15 +67,21 @@ pub trait BlockLayer: Send + Sync {
     /// Returns the number of bytes actually written.
     fn write_block(&self, index: u64, offset: usize, buf: &[u8]) -> Result<usize, SfsError>;
 
-    /// Store the upper layers' header sections (L3 + L4, each with their own
-    /// length/identifier prefix). L2 prepends the magic and its own section,
-    /// then writes the full SFS header to disk.
-    fn store_header(&self, upper_layers: &[u8]) -> Result<(), SfsError>;
+    /// Get the `HeaderSlotId` for the `index`-th upper layer section.
+    ///
+    /// Index 0 = first upper section (L3), index 1 = next (L4), etc.
+    /// Implemented as `self.l1.header_slot_for_upper(index + 1)` for the real L2.
+    fn header_slot_for_upper(&self, index: u8) -> HeaderSlotId;
 
-    /// Load the upper layers' header sections.
-    /// L2 reads the full header from disk, verifies the magic and its own
-    /// section, then returns the remainder (L3 + L4 sections).
-    fn load_header(&self) -> Result<Vec<u8>, SfsError>;
+    /// Write a header section by slot ID (pass-through to L1).
+    ///
+    /// `data` is the section payload: `identifier[6] + version[1] + payload`.
+    fn write_header_slot(&self, slot: HeaderSlotId, data: &[u8]) -> Result<(), SfsError>;
+
+    /// Read a header section by slot ID (pass-through to L1).
+    ///
+    /// Returns the section payload (without the 2-byte length prefix).
+    fn read_header_slot(&self, slot: HeaderSlotId) -> Result<Vec<u8>, SfsError>;
 
     /// Run L2 integrity checks. `claimed_blocks` are block IDs that upper
     /// layers assert are in use. L2 validates that claimed + free == all blocks,

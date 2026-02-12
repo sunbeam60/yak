@@ -5,7 +5,9 @@ use std::sync::Mutex;
 use fs2::FileExt;
 
 use crate::file_layer::FileLayer;
-use crate::{OpenMode, SfsError};
+use std::collections::VecDeque;
+
+use crate::{HeaderSlotId, OpenMode, SfsError};
 
 /// Magic bytes at the start of every SFS file.
 const MAGIC: &[u8; 9] = b"stream_fs";
@@ -25,6 +27,14 @@ const MAGIC_SIZE: usize = 9 + 1 + 2; // = 12
 /// Size of the L1 header section: | length: u16 | "ondisk" | version: u8 |
 const L1_SECTION_SIZE: usize = 2 + 6 + 1; // = 9
 
+/// Information about one header slot in the slot registry.
+struct SlotInfo {
+    /// Absolute byte offset in the file where this slot's length prefix begins.
+    offset: u64,
+    /// Expected payload length (NOT including the 2-byte length prefix).
+    payload_len: u16,
+}
+
 /// L1 implementation that wraps a real file on disk.
 ///
 /// Creates/opens a single file, acquires an exclusive process-level lock,
@@ -33,14 +43,13 @@ const L1_SECTION_SIZE: usize = 2 + 6 + 1; // = 9
 /// `total_header_length` field).
 pub struct FileOnDisk {
     state: Mutex<fs::File>,
-    upper_layers_offset: u64,
     data_offset: u64,
-    upper_layers_len: usize,
+    slots: Vec<SlotInfo>,
 }
 
 impl FileOnDisk {
     /// Build the magic prefix: "stream_fs"(9) + version(1) + total_header_length(2).
-    fn build_magic(total_header_length: u16) -> [u8; MAGIC_SIZE] {
+    fn serialize_magic_header(total_header_length: u16) -> [u8; MAGIC_SIZE] {
         let mut buf = [0u8; MAGIC_SIZE];
         buf[0..9].copy_from_slice(MAGIC);
         buf[9] = HEADER_FORMAT_VERSION;
@@ -49,7 +58,7 @@ impl FileOnDisk {
     }
 
     /// Build the L1 header section bytes: | length: u16 | "ondisk" | version: u8 |
-    fn build_l1_section() -> [u8; L1_SECTION_SIZE] {
+    fn serialize_header() -> [u8; L1_SECTION_SIZE] {
         let mut buf = [0u8; L1_SECTION_SIZE];
         let total_len = L1_SECTION_SIZE as u16;
         buf[0..2].copy_from_slice(&total_len.to_le_bytes());
@@ -59,8 +68,8 @@ impl FileOnDisk {
     }
 
     /// Parse the full header from a file, validating magic and L1 section.
-    /// Returns (upper_layers_offset, data_offset, upper_layers_data).
-    fn parse_header(file: &mut fs::File) -> Result<(u64, u64, Vec<u8>), SfsError> {
+    /// Returns (data_offset, slot_registry).
+    fn parse_header(file: &mut fs::File) -> Result<(u64, Vec<SlotInfo>), SfsError> {
         file.seek(SeekFrom::Start(0))
             .map_err(|e| SfsError::IoError(e.to_string()))?;
 
@@ -111,19 +120,42 @@ impl FileOnDisk {
 
         let upper_layers_offset = (MAGIC_SIZE + l1_len) as u64;
 
-        // Read all upper layer sections between upper_layers_offset and data_offset.
-        let upper_layers_len = (data_offset - upper_layers_offset) as usize;
-        let mut sections_data = vec![0u8; upper_layers_len];
-        file.read_exact(&mut sections_data).map_err(|e| {
-            SfsError::IoError(format!("failed to read upper layer sections: {}", e))
-        })?;
+        // Rebuild slot registry by walking the length-prefixed sections
+        let mut slots = Vec::new();
+        let mut current_offset = upper_layers_offset;
+        while current_offset < data_offset {
+            let mut len_buf = [0u8; 2];
+            file.read_exact(&mut len_buf).map_err(|e| {
+                SfsError::IoError(format!(
+                    "failed to read section length at offset {}: {}",
+                    current_offset, e
+                ))
+            })?;
+            let section_len = u16::from_le_bytes(len_buf);
+            if section_len < 2 {
+                return Err(SfsError::IoError(format!(
+                    "invalid section length {} at offset {}",
+                    section_len, current_offset
+                )));
+            }
+            let payload_len = section_len - 2;
+            slots.push(SlotInfo {
+                offset: current_offset,
+                payload_len,
+            });
+            // Skip over the payload to reach the next section
+            let skip = payload_len as i64;
+            file.seek(SeekFrom::Current(skip))
+                .map_err(|e| SfsError::IoError(format!("failed to skip section payload: {}", e)))?;
+            current_offset += section_len as u64;
+        }
 
-        Ok((upper_layers_offset, data_offset, sections_data))
+        Ok((data_offset, slots))
     }
 }
 
 impl FileLayer for FileOnDisk {
-    fn create(path: &str, upper_layers: &[u8]) -> Result<Self, SfsError>
+    fn create(path: &str, slot_sizes: VecDeque<u16>) -> Result<Self, SfsError>
     where
         Self: Sized,
     {
@@ -138,24 +170,48 @@ impl FileLayer for FileOnDisk {
             .open(path)
             .map_err(|e| SfsError::IoError(format!("failed to create SFS file: {}", e)))?;
 
-        // Acquire exclusive process lock
+        // Acquire exclusive process lock as we're about to write to this file
         file.try_lock_exclusive().map_err(|e| {
             SfsError::IoError(format!("SFS file is locked by another process: {}", e))
         })?;
 
+        // Sizes arrive in on-disk order [L2, L3, L4] (each layer push_front'd)
         // Compute offsets
+        // now we write our own header (magic + L1) and reserve space for upper layers' sections (length prefix + zeros)
+
+        // compute the total header lefth
         let upper_layers_offset = (MAGIC_SIZE + L1_SECTION_SIZE) as u64;
-        let data_offset = upper_layers_offset + upper_layers.len() as u64;
+        let upper_total: usize = slot_sizes
+            .iter()
+            .map(|&s| 2 + s as usize) //+2 to create 2 byte space for the length prefix of each section
+            .sum();
+        let data_offset = upper_layers_offset + upper_total as u64;
         let total_header_length = data_offset as u16;
 
-        let magic = Self::build_magic(total_header_length);
-        let l1_section = Self::build_l1_section();
+        // build magic and L1 header
+        let magic_header = Self::serialize_magic_header(total_header_length);
+        let l1_header = Self::serialize_header();
 
+        // Build header: magic + L1 + slot placeholders (length prefix + zeros)
         let mut header = Vec::with_capacity(data_offset as usize);
-        header.extend_from_slice(&magic);
-        header.extend_from_slice(&l1_section);
-        header.extend_from_slice(upper_layers);
+        header.extend_from_slice(&magic_header);
+        header.extend_from_slice(&l1_header);
 
+        // add space for the layers' header sections (length prefix + zeroed payloads), and build the slot registry
+        let mut slots = Vec::with_capacity(slot_sizes.len());
+        let mut current_offset = upper_layers_offset;
+        for &payload_len in &slot_sizes {
+            slots.push(SlotInfo {
+                offset: current_offset,
+                payload_len,
+            });
+            let section_len = payload_len + 2;
+            header.extend_from_slice(&section_len.to_le_bytes());
+            header.extend_from_slice(&vec![0u8; payload_len as usize]);
+            current_offset += section_len as u64;
+        }
+
+        // write the header (at this point layer headers are blank, the layers will fill them in later via write_header_slot)
         file.write_all(&header)
             .map_err(|e| SfsError::IoError(format!("failed to write SFS header: {}", e)))?;
         file.flush()
@@ -163,9 +219,8 @@ impl FileLayer for FileOnDisk {
 
         Ok(FileOnDisk {
             state: Mutex::new(file),
-            upper_layers_offset,
             data_offset,
-            upper_layers_len: upper_layers.len(),
+            slots,
         })
     }
 
@@ -195,18 +250,13 @@ impl FileLayer for FileOnDisk {
             })?,
         };
 
-        let (upper_layers_offset, data_offset, upper_layers_data) = Self::parse_header(&mut file)?;
+        let (data_offset, slots) = Self::parse_header(&mut file)?;
 
         Ok(FileOnDisk {
             state: Mutex::new(file),
-            upper_layers_offset,
             data_offset,
-            upper_layers_len: upper_layers_data.len(),
+            slots,
         })
-    }
-
-    fn upper_layers_offset(&self) -> u64 {
-        self.upper_layers_offset
     }
 
     fn data_offset(&self) -> u64 {
@@ -254,41 +304,62 @@ impl FileLayer for FileOnDisk {
         Ok(())
     }
 
-    fn store_header(&self, upper_layers: &[u8]) -> Result<(), SfsError> {
-        if upper_layers.len() != self.upper_layers_len {
+    fn header_slot_for_upper(&self, index: u8) -> HeaderSlotId {
+        HeaderSlotId(index)
+    }
+
+    fn write_header_slot(&self, slot: HeaderSlotId, data: &[u8]) -> Result<(), SfsError> {
+        let idx = slot.0 as usize;
+        if idx >= self.slots.len() {
             return Err(SfsError::IoError(format!(
-                "header size mismatch: expected {} bytes, got {}",
-                self.upper_layers_len,
-                upper_layers.len()
+                "header slot index {} out of range (have {} slots)",
+                idx,
+                self.slots.len()
+            )));
+        }
+        let info = &self.slots[idx];
+        if data.len() != info.payload_len as usize {
+            return Err(SfsError::IoError(format!(
+                "header slot {}: expected {} bytes, got {}",
+                idx,
+                info.payload_len,
+                data.len()
             )));
         }
 
-        // Rewrite the full header in-place
-        let total_header_length = self.data_offset as u16;
-        let magic = Self::build_magic(total_header_length);
-        let l1_section = Self::build_l1_section();
-
-        let mut header = Vec::with_capacity(self.data_offset as usize);
-        header.extend_from_slice(&magic);
-        header.extend_from_slice(&l1_section);
-        header.extend_from_slice(upper_layers);
+        // Write length prefix + payload at the slot offset
+        let section_len = info.payload_len + 2; // total section length including the 2-byte length prefix
+        let mut buf = Vec::with_capacity(section_len as usize);
+        buf.extend_from_slice(&section_len.to_le_bytes());
+        buf.extend_from_slice(data);
 
         let mut file = self.state.lock().unwrap();
-        file.seek(SeekFrom::Start(0))
+        file.seek(SeekFrom::Start(info.offset))
             .map_err(|e| SfsError::IoError(e.to_string()))?;
-        file.write_all(&header)
+        file.write_all(&buf)
             .map_err(|e| SfsError::IoError(e.to_string()))?;
         file.flush().map_err(|e| SfsError::IoError(e.to_string()))?;
         Ok(())
     }
 
-    fn load_header(&self) -> Result<Vec<u8>, SfsError> {
+    fn read_header_slot(&self, slot: HeaderSlotId) -> Result<Vec<u8>, SfsError> {
+        let idx = slot.0 as usize;
+        if idx >= self.slots.len() {
+            return Err(SfsError::IoError(format!(
+                "header slot index {} out of range (have {} slots)",
+                idx,
+                self.slots.len()
+            )));
+        }
+        let info = &self.slots[idx];
+
+        // Read payload bytes (skip the 2-byte length prefix)
         let mut file = self.state.lock().unwrap();
-        file.seek(SeekFrom::Start(self.upper_layers_offset))
+        file.seek(SeekFrom::Start(info.offset + 2))
             .map_err(|e| SfsError::IoError(e.to_string()))?;
-        let mut buf = vec![0u8; self.upper_layers_len];
+        let mut buf = vec![0u8; info.payload_len as usize];
         file.read_exact(&mut buf)
-            .map_err(|e| SfsError::IoError(format!("failed to read header: {}", e)))?;
+            .map_err(|e| SfsError::IoError(format!("failed to read header slot: {}", e)))?;
         Ok(buf)
     }
 

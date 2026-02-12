@@ -18,6 +18,14 @@ pub use stream_layer::StreamLayer;
 pub use streams_from_blocks::StreamsFromBlocks;
 pub use streams_from_files::StreamsFromFiles;
 
+/// Opaque token identifying a header section slot.
+///
+/// Each layer stores its own slot ID and uses it to read/write its header
+/// section independently. Slot IDs are issued by L1 and passed through
+/// upper layers via `header_slot_for_upper(index)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeaderSlotId(pub(crate) u8);
+
 /// Default SFS configuration: single-file SFS with default L1, L2, L3, L4 layers.
 pub type SfsDefault = Sfs<StreamsFromBlocks<BlocksInFile<FileOnDisk>>>;
 
@@ -77,7 +85,7 @@ mod tests {
 
         // Test L3 directly via StreamsFromBlocks
         type L3 = StreamsFromBlocks<BlocksInFile<FileOnDisk>>;
-        let l3 = L3::create(path_str, 4, 12, &[]).unwrap();
+        let l3 = L3::create(path_str, 4, 12, std::collections::VecDeque::new()).unwrap();
 
         // Initially no streams
         assert_eq!(l3.stream_count().unwrap(), 0);
@@ -166,6 +174,67 @@ mod tests {
             let sfs = SfsDefault::open(path_str, OpenMode::Read).unwrap();
             let issues = sfs.verify().unwrap();
             assert!(issues.is_empty(), "Issues found: {:?}", issues);
+            sfs.close();
+        }
+    }
+
+    #[test]
+    fn test_reserve() {
+        let path = std::env::temp_dir().join("sfs_test_reserve.sfs");
+        let _ = std::fs::remove_file(&path);
+        let path_str = path.to_str().unwrap();
+
+        {
+            let sfs = SfsDefault::create(path_str, 4, 12).unwrap();
+            let sh = sfs.create_stream("data.bin").unwrap();
+
+            // Empty stream: reserved = 0
+            assert_eq!(sfs.stream_reserved(&sh).unwrap(), 0);
+
+            // Reserve 8192 bytes (2 blocks of 4096)
+            sfs.reserve(&sh, 8192).unwrap();
+            assert_eq!(sfs.stream_reserved(&sh).unwrap(), 8192);
+            assert_eq!(sfs.stream_length(&sh).unwrap(), 0);
+
+            // Write within reserved capacity
+            let data = vec![0xABu8; 5000];
+            sfs.write(&sh, &data).unwrap();
+            assert_eq!(sfs.stream_length(&sh).unwrap(), 5000);
+            assert_eq!(sfs.stream_reserved(&sh).unwrap(), 8192);
+
+            // Read back
+            sfs.seek(&sh, 0).unwrap();
+            let mut buf = vec![0u8; 5000];
+            sfs.read(&sh, &mut buf).unwrap();
+            assert_eq!(buf, data);
+
+            sfs.close_stream(sh).unwrap();
+
+            // Verify clean (must close stream first so descriptor is flushed)
+            let issues = sfs.verify().unwrap();
+            assert!(issues.is_empty(), "Issues: {:?}", issues);
+
+            sfs.close();
+        }
+
+        // Reopen and verify reserved persists
+        {
+            let sfs = SfsDefault::open(path_str, OpenMode::Write).unwrap();
+            let sh = sfs.open_stream("data.bin", OpenMode::Write).unwrap();
+            assert_eq!(sfs.stream_reserved(&sh).unwrap(), 8192);
+            assert_eq!(sfs.stream_length(&sh).unwrap(), 5000);
+
+            // Truncate clears reservation
+            sfs.truncate(&sh, 0).unwrap();
+            assert_eq!(sfs.stream_reserved(&sh).unwrap(), 0);
+            assert_eq!(sfs.stream_length(&sh).unwrap(), 0);
+
+            sfs.close_stream(sh).unwrap();
+
+            // Verify after close (descriptor must be flushed first)
+            let issues = sfs.verify().unwrap();
+            assert!(issues.is_empty(), "Issues: {:?}", issues);
+
             sfs.close();
         }
     }

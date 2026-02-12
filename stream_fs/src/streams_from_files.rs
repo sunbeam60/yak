@@ -1,11 +1,31 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Condvar, Mutex};
 
 use crate::stream_layer::StreamLayer;
-use crate::{OpenMode, SfsError};
+use crate::{HeaderSlotId, OpenMode, SfsError};
+
+/// L3 mock identifier in the header section.
+const L3_MOCK_IDENTIFIER: &[u8; 6] = b"strfil";
+
+/// L3 mock header version.
+const L3_MOCK_VERSION: u8 = 0;
+
+/// L3 mock payload size: "strfil"(6) + version(1) + next_stream_id(8) = 15 bytes.
+const L3_MOCK_PAYLOAD_SIZE: u16 = 15;
+
+/// Size of the magic prefix: "stream_fs"(9) + version(1) + total_header_length(2).
+const MAGIC_SIZE: usize = 12;
+
+/// Information about one header slot in the slot registry.
+struct SlotInfo {
+    /// Absolute byte offset in the header file where this slot's length prefix begins.
+    offset: u64,
+    /// Expected payload length (NOT including the 2-byte length prefix).
+    payload_len: u16,
+}
 
 /// Handle for an open stream in StreamsFromFiles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -22,6 +42,8 @@ struct LockState {
 struct HandleInfo {
     stream_id: u64,
     mode: OpenMode,
+    /// Tracked reservation (in-memory only, no real pre-allocation for mock).
+    reserved: u64,
 }
 
 /// Bookkeeping state protected by a Mutex.
@@ -37,6 +59,7 @@ struct StreamsState {
 /// When created, makes a directory at the given path. Each stream is stored
 /// as `{id}.stream` inside this directory. A `meta` file tracks the next
 /// available stream ID along with `block_index_width` and `block_size_shift`.
+/// A `header` file stores the SFS header with slot registry.
 ///
 /// Thread-safe: all bookkeeping state is behind a `Mutex`. File I/O uses
 /// ephemeral file handles (opened and closed on each operation) so no
@@ -50,6 +73,7 @@ pub struct StreamsFromFiles {
     block_size_shift: u8,
     state: Mutex<StreamsState>,
     lock_released: Condvar,
+    slots: Vec<SlotInfo>,
 }
 
 impl StreamsFromFiles {
@@ -143,6 +167,7 @@ impl StreamsFromFiles {
             HandleInfo {
                 stream_id: id,
                 mode,
+                reserved: 0,
             },
         );
 
@@ -162,6 +187,16 @@ impl StreamsFromFiles {
         ]);
         Ok((block_index_width, block_size_shift, next_stream_id))
     }
+
+    /// Serialize the L3 mock header (no length prefix).
+    /// Format: | "strfil": [u8;6] | version: u8 | next_stream_id: u64 |
+    fn serialize_header(next_stream_id: u64) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(L3_MOCK_PAYLOAD_SIZE as usize);
+        buf.extend_from_slice(L3_MOCK_IDENTIFIER);
+        buf.push(L3_MOCK_VERSION);
+        buf.extend_from_slice(&next_stream_id.to_le_bytes());
+        buf
+    }
 }
 
 impl StreamLayer for StreamsFromFiles {
@@ -171,13 +206,45 @@ impl StreamLayer for StreamsFromFiles {
         path: &str,
         block_index_width: u8,
         block_size_shift: u8,
-        upper_layers: &[u8],
+        mut slot_sizes: VecDeque<u16>,
     ) -> Result<Self, SfsError> {
         let root = PathBuf::from(path);
         if root.exists() {
             return Err(SfsError::AlreadyExists(root.display().to_string()));
         }
         fs::create_dir(&root).map_err(|e| SfsError::IoError(e.to_string()))?;
+
+        // Push L3's own size to front (on-disk order: L3 first)
+        slot_sizes.push_front(L3_MOCK_PAYLOAD_SIZE);
+
+        // Compute header layout: magic + all sections
+        let sections_total: usize = slot_sizes.iter().map(|&s| 2 + s as usize).sum();
+        let total_header_length = (MAGIC_SIZE + sections_total) as u16;
+
+        // Build header bytes
+        let mut header = Vec::with_capacity(total_header_length as usize);
+        // Magic: "stream_fs" + version + total_header_length
+        header.extend_from_slice(b"stream_fs");
+        header.push(0); // layout version 0
+        header.extend_from_slice(&total_header_length.to_le_bytes());
+
+        // Build slot registry and section placeholders (slot 0 = L3's own)
+        let mut slots = Vec::with_capacity(slot_sizes.len());
+        let mut current_offset = MAGIC_SIZE as u64;
+        for &payload_len in &slot_sizes {
+            slots.push(SlotInfo {
+                offset: current_offset,
+                payload_len,
+            });
+            let section_len = payload_len + 2;
+            header.extend_from_slice(&section_len.to_le_bytes());
+            header.extend_from_slice(&vec![0u8; payload_len as usize]);
+            current_offset += section_len as u64;
+        }
+
+        // Write header file
+        fs::write(root.join("header"), &header)
+            .map_err(|e| SfsError::IoError(format!("failed to write header: {}", e)))?;
 
         let instance = StreamsFromFiles {
             root,
@@ -190,11 +257,14 @@ impl StreamLayer for StreamsFromFiles {
                 open_handles: HashMap::new(),
             }),
             lock_released: Condvar::new(),
+            slots,
         };
-        instance.persist_meta(0)?;
 
-        // Write the initial header (L3 section + upper_layers)
-        instance.store_header(upper_layers)?;
+        // Write L3 payload into slot 0
+        let l3_payload = Self::serialize_header(0);
+        instance.write_header_slot(HeaderSlotId(0), &l3_payload)?;
+
+        instance.persist_meta(0)?;
 
         Ok(instance)
     }
@@ -205,6 +275,44 @@ impl StreamLayer for StreamsFromFiles {
             return Err(SfsError::NotFound(root.display().to_string()));
         }
         let (block_index_width, block_size_shift, next_stream_id) = Self::read_meta(&root)?;
+
+        // Read header file and rebuild slot registry
+        let header_data = fs::read(root.join("header"))
+            .map_err(|e| SfsError::IoError(format!("failed to read header: {}", e)))?;
+
+        if header_data.len() < MAGIC_SIZE
+            || &header_data[0..9] != b"stream_fs"
+            || header_data[9] != 0
+        {
+            return Err(SfsError::IoError("invalid SFS header magic".to_string()));
+        }
+
+        let total_header_length = u16::from_le_bytes([header_data[10], header_data[11]]) as usize;
+
+        // Walk sections to rebuild slot registry
+        let mut slots = Vec::new();
+        let mut pos = MAGIC_SIZE;
+        while pos < total_header_length {
+            if pos + 2 > header_data.len() {
+                return Err(SfsError::IoError(
+                    "header truncated at section length".to_string(),
+                ));
+            }
+            let section_len = u16::from_le_bytes([header_data[pos], header_data[pos + 1]]) as usize;
+            if section_len < 2 {
+                return Err(SfsError::IoError(format!(
+                    "invalid section length {} at offset {}",
+                    section_len, pos
+                )));
+            }
+            let payload_len = (section_len - 2) as u16;
+            slots.push(SlotInfo {
+                offset: pos as u64,
+                payload_len,
+            });
+            pos += section_len;
+        }
+
         Ok(StreamsFromFiles {
             root,
             block_index_width,
@@ -216,6 +324,7 @@ impl StreamLayer for StreamsFromFiles {
                 open_handles: HashMap::new(),
             }),
             lock_released: Condvar::new(),
+            slots,
         })
     }
 
@@ -398,67 +507,103 @@ impl StreamLayer for StreamsFromFiles {
         Ok(())
     }
 
-    fn store_header(&self, upper_layers: &[u8]) -> Result<(), SfsError> {
-        let next_stream_id = {
-            let state = self.state.lock().unwrap();
-            state.next_stream_id
-        };
-
-        // L3 section: | length: u16 | "strfil" | version: u8 | next_stream_id: u64 |
-        let l3_len: u16 = 2 + 6 + 1 + 8; // = 17
-        let total_header_length: u16 = 12 + l3_len + upper_layers.len() as u16;
-
-        let mut header = Vec::new();
-        // Magic: "stream_fs" + version + total_header_length
-        header.extend_from_slice(b"stream_fs");
-        header.push(0); // layout version 0
-        header.extend_from_slice(&total_header_length.to_le_bytes());
-        // L3 section
-        header.extend_from_slice(&l3_len.to_le_bytes());
-        header.extend_from_slice(b"strfil");
-        header.push(0); // version
-        header.extend_from_slice(&next_stream_id.to_le_bytes());
-        // Upper layer sections (L4)
-        header.extend_from_slice(upper_layers);
-
-        fs::write(self.header_path(), &header)
-            .map_err(|e| SfsError::IoError(format!("failed to write header: {}", e)))
+    fn reserve(&self, handle: &Self::Handle, n_bytes: u64) -> Result<(), SfsError> {
+        let mut state = self.state.lock().unwrap();
+        let info = state
+            .open_handles
+            .get_mut(&handle.0)
+            .ok_or_else(|| SfsError::NotFound("invalid stream handle".to_string()))?;
+        if info.mode != OpenMode::Write {
+            return Err(SfsError::LockConflict(
+                "stream is not opened for writing".to_string(),
+            ));
+        }
+        // Check invariant: n_bytes >= current file size
+        let file_len = std::fs::metadata(self.stream_path(info.stream_id))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        if n_bytes < file_len {
+            return Err(SfsError::IoError(format!(
+                "cannot reserve {} bytes: stream size is already {}",
+                n_bytes, file_len
+            )));
+        }
+        // Track reservation (no real allocation in mock)
+        if n_bytes > info.reserved {
+            info.reserved = n_bytes;
+        }
+        Ok(())
     }
 
-    fn load_header(&self) -> Result<Vec<u8>, SfsError> {
-        let path = self.header_path();
-        if !path.exists() {
-            return Ok(Vec::new());
-        }
-        let data = fs::read(&path)
-            .map_err(|e| SfsError::IoError(format!("failed to read header: {}", e)))?;
+    fn stream_reserved(&self, handle: &Self::Handle) -> Result<u64, SfsError> {
+        let state = self.state.lock().unwrap();
+        let info = state
+            .open_handles
+            .get(&handle.0)
+            .ok_or_else(|| SfsError::NotFound("invalid stream handle".to_string()))?;
+        Ok(info.reserved)
+    }
 
-        // Verify magic (bytes 0..9 == "stream_fs", byte 9 == version, bytes 10..12 == total_header_length)
-        if data.len() < 12 || &data[0..9] != b"stream_fs" || data[9] != 0 {
-            return Err(SfsError::IoError("invalid SFS header magic".to_string()));
-        }
+    fn header_slot_for_upper(&self, index: u8) -> HeaderSlotId {
+        // Slot 0 = L3's own section, so upper layer index 0 → slot 1 (L4), etc.
+        HeaderSlotId(index + 1)
+    }
 
-        // Read L3 section length at offset 12, verify "strfil" identifier
-        if data.len() < 14 {
-            return Err(SfsError::IoError(
-                "header too short for L3 section".to_string(),
-            ));
-        }
-        let l3_len = u16::from_le_bytes([data[12], data[13]]) as usize;
-        if data.len() < 12 + l3_len {
-            return Err(SfsError::IoError(
-                "header too short for L3 data".to_string(),
-            ));
-        }
-        if &data[14..20] != b"strfil" {
+    fn write_header_slot(&self, slot: HeaderSlotId, data: &[u8]) -> Result<(), SfsError> {
+        let idx = slot.0 as usize;
+        if idx >= self.slots.len() {
             return Err(SfsError::IoError(format!(
-                "expected L3 identifier 'strfil', got '{}'",
-                String::from_utf8_lossy(&data[14..20])
+                "header slot index {} out of range (have {} slots)",
+                idx,
+                self.slots.len()
+            )));
+        }
+        let info = &self.slots[idx];
+        if data.len() != info.payload_len as usize {
+            return Err(SfsError::IoError(format!(
+                "header slot {}: expected {} bytes, got {}",
+                idx,
+                info.payload_len,
+                data.len()
             )));
         }
 
-        // Return remainder (L4 section and above)
-        Ok(data[12 + l3_len..].to_vec())
+        let section_len = info.payload_len + 2;
+        let mut buf = Vec::with_capacity(section_len as usize);
+        buf.extend_from_slice(&section_len.to_le_bytes());
+        buf.extend_from_slice(data);
+
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .open(self.header_path())
+            .map_err(|e| SfsError::IoError(format!("failed to open header for write: {}", e)))?;
+        file.seek(SeekFrom::Start(info.offset))
+            .map_err(|e| SfsError::IoError(e.to_string()))?;
+        file.write_all(&buf)
+            .map_err(|e| SfsError::IoError(e.to_string()))?;
+        file.flush().map_err(|e| SfsError::IoError(e.to_string()))?;
+        Ok(())
+    }
+
+    fn read_header_slot(&self, slot: HeaderSlotId) -> Result<Vec<u8>, SfsError> {
+        let idx = slot.0 as usize;
+        if idx >= self.slots.len() {
+            return Err(SfsError::IoError(format!(
+                "header slot index {} out of range (have {} slots)",
+                idx,
+                self.slots.len()
+            )));
+        }
+        let info = &self.slots[idx];
+
+        let mut file = fs::File::open(self.header_path())
+            .map_err(|e| SfsError::IoError(format!("failed to open header for read: {}", e)))?;
+        file.seek(SeekFrom::Start(info.offset + 2))
+            .map_err(|e| SfsError::IoError(e.to_string()))?;
+        let mut buf = vec![0u8; info.payload_len as usize];
+        file.read_exact(&mut buf)
+            .map_err(|e| SfsError::IoError(format!("failed to read header slot: {}", e)))?;
+        Ok(buf)
     }
 
     fn verify(&self, claimed_streams: &[u64]) -> Result<Vec<String>, SfsError> {

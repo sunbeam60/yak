@@ -508,3 +508,31 @@ pub extern "C" fn sfs_truncate(handle: *mut c_void, stream: i64, new_len: u64) -
         }
     }
 }
+
+/// Pre-allocate storage for a stream. Returns 0 or -1.
+#[no_mangle]
+pub extern "C" fn sfs_reserve(handle: *mut c_void, stream: i64, n_bytes: u64) -> c_int {
+    let sfs = unsafe { &*(handle as *const Sfs) };
+    let sh = StreamHandle::from_id(stream as u64);
+    match sfs.reserve(&sh, n_bytes) {
+        Ok(()) => 0,
+        Err(e) => {
+            set_last_error(&e.to_string());
+            -1
+        }
+    }
+}
+
+/// Get the reserved capacity of a stream. Returns capacity or -1 on error.
+#[no_mangle]
+pub extern "C" fn sfs_stream_reserved(handle: *mut c_void, stream: i64) -> i64 {
+    let sfs = unsafe { &*(handle as *const Sfs) };
+    let sh = StreamHandle::from_id(stream as u64);
+    match sfs.stream_reserved(&sh) {
+        Ok(r) => r as i64,
+        Err(e) => {
+            set_last_error(&e.to_string());
+            -1
+        }
+    }
+}

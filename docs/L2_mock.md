@@ -73,20 +73,21 @@ Offset  Size  Content
 18       1    version (0x00)
 19       1    block_size_shift (u8)
 20       1    block_index_width (u8)
-21       2    L3 length = 25
+21       2    L3 length = 33
 23       6    "pyra  "
-29       1    version (0x00)
+29       1    version (0x01)
 30       8    streams_size (u64, little-endian)
 38       8    streams_top_block (u64, little-endian)
-46       2    L4 length = 17
-48       6    "filing"
-54       1    version (0x00)
-55       8    root_dir_stream_id (u64, little-endian)
+46       8    streams_reserved (u64, little-endian)
+54       2    L4 length = 17
+56       6    "filing"
+62       1    version (0x00)
+63       8    root_dir_stream_id (u64, little-endian)
 ------  ----
-Total: 63 bytes
+Total: 71 bytes
 ```
 
-The version bytes in each layer section identify the format version of that layer's header data. All layers use version `0x00` for this version. Readers should verify the version byte and reject unknown versions.
+The version bytes in each layer section identify the format version of that layer's header data. L3 uses version `0x01` (descriptor includes `reserved` field); other layers use version `0x00`. Readers should verify the version byte and reject unknown versions.
 
 **Note:** L1 is not present in the mock. When L1 is implemented, it will take over writing the magic and prepend its own section before L2's. The header layout version may be incremented if the format changes.
 

@@ -99,6 +99,8 @@ fn print_bench_usage() {
     eprintln!("Scenarios:");
     eprintln!("  large-write      Write 5 streams of 10MB each");
     eprintln!("  small-write      Write 500 streams of 10KB each");
+    eprintln!("  large-read       Read back 5x10MB + 5x20MB (150MB total)");
+    eprintln!("  small-read       Read back 500 streams of 10KB each");
     eprintln!("  threaded-write   T threads writing streams concurrently");
     eprintln!("  threaded-read    T threads reading streams concurrently");
     eprintln!("  churn            Write then delete many streams (5 rounds)");
@@ -122,6 +124,8 @@ pub fn cmd_bench(args: &[String]) -> Result<(), ()> {
     match bench_args.scenario.as_str() {
         "large-write" => run_large_write(bench_args.bss, bench_args.biw),
         "small-write" => run_small_write(bench_args.bss, bench_args.biw),
+        "large-read" => run_large_read(bench_args.bss, bench_args.biw),
+        "small-read" => run_small_read(bench_args.bss, bench_args.biw),
         "threaded-write" => run_threaded_write(bench_args.bss, bench_args.biw, bench_args.threads),
         "threaded-read" => run_threaded_read(bench_args.bss, bench_args.biw, bench_args.threads),
         "churn" => run_churn(bench_args.bss, bench_args.biw),
@@ -296,6 +300,124 @@ fn run_threaded_read(bss: u8, biw: u8, threads: usize) -> Result<(), ()> {
     }
 }
 
+/// Populate 5×10MB + 5×20MB streams, then read them all back (150MB total).
+fn run_large_read(bss: u8, biw: u8) -> Result<(), ()> {
+    let _guard = CleanupGuard { path: BENCH_FILE };
+
+    let size_10mb = 10 * 1024 * 1024usize;
+    let size_20mb = 20 * 1024 * 1024usize;
+    let streams_per_tier = 5usize;
+
+    // Phase 1: populate
+    {
+        let sfs = Sfs::create(BENCH_FILE, biw, bss).map_err(|e| eprintln!("Error: {}", e))?;
+
+        let buf_10 = make_buffer(size_10mb);
+        for i in 0..streams_per_tier {
+            let name = format!("large_10m_{}.bin", i);
+            let handle = sfs
+                .create_stream(&name)
+                .map_err(|e| eprintln!("Error: {}", e))?;
+            sfs.write(&handle, &buf_10)
+                .map_err(|e| eprintln!("Error: {}", e))?;
+            sfs.close_stream(handle)
+                .map_err(|e| eprintln!("Error: {}", e))?;
+        }
+
+        let buf_20 = make_buffer(size_20mb);
+        for i in 0..streams_per_tier {
+            let name = format!("large_20m_{}.bin", i);
+            let handle = sfs
+                .create_stream(&name)
+                .map_err(|e| eprintln!("Error: {}", e))?;
+            sfs.write(&handle, &buf_20)
+                .map_err(|e| eprintln!("Error: {}", e))?;
+            sfs.close_stream(handle)
+                .map_err(|e| eprintln!("Error: {}", e))?;
+        }
+
+        sfs.close();
+    }
+
+    // Phase 2: read back
+    let sfs =
+        Sfs::open(BENCH_FILE, OpenMode::Read).map_err(|e| eprintln!("Error: {}", e))?;
+
+    for i in 0..streams_per_tier {
+        let name = format!("large_10m_{}.bin", i);
+        let handle = sfs
+            .open_stream(&name, OpenMode::Read)
+            .map_err(|e| eprintln!("Error: {}", e))?;
+        let len = sfs.stream_length(&handle).map_err(|e| eprintln!("Error: {}", e))? as usize;
+        let mut buf = vec![0u8; len];
+        sfs.read(&handle, &mut buf)
+            .map_err(|e| eprintln!("Error: {}", e))?;
+        sfs.close_stream(handle)
+            .map_err(|e| eprintln!("Error: {}", e))?;
+    }
+
+    for i in 0..streams_per_tier {
+        let name = format!("large_20m_{}.bin", i);
+        let handle = sfs
+            .open_stream(&name, OpenMode::Read)
+            .map_err(|e| eprintln!("Error: {}", e))?;
+        let len = sfs.stream_length(&handle).map_err(|e| eprintln!("Error: {}", e))? as usize;
+        let mut buf = vec![0u8; len];
+        sfs.read(&handle, &mut buf)
+            .map_err(|e| eprintln!("Error: {}", e))?;
+        sfs.close_stream(handle)
+            .map_err(|e| eprintln!("Error: {}", e))?;
+    }
+
+    sfs.close();
+    Ok(())
+}
+
+/// Populate 500 streams of 10KB, then read them all back.
+fn run_small_read(bss: u8, biw: u8) -> Result<(), ()> {
+    let _guard = CleanupGuard { path: BENCH_FILE };
+
+    let stream_count = 500usize;
+    let stream_size = 10 * 1024usize;
+
+    // Phase 1: populate
+    {
+        let sfs = Sfs::create(BENCH_FILE, biw, bss).map_err(|e| eprintln!("Error: {}", e))?;
+        let buf = make_buffer(stream_size);
+        for i in 0..stream_count {
+            let name = format!("stream_{:04}.bin", i);
+            let handle = sfs
+                .create_stream(&name)
+                .map_err(|e| eprintln!("Error: {}", e))?;
+            sfs.write(&handle, &buf)
+                .map_err(|e| eprintln!("Error: {}", e))?;
+            sfs.close_stream(handle)
+                .map_err(|e| eprintln!("Error: {}", e))?;
+        }
+        sfs.close();
+    }
+
+    // Phase 2: read back
+    let sfs =
+        Sfs::open(BENCH_FILE, OpenMode::Read).map_err(|e| eprintln!("Error: {}", e))?;
+
+    for i in 0..stream_count {
+        let name = format!("stream_{:04}.bin", i);
+        let handle = sfs
+            .open_stream(&name, OpenMode::Read)
+            .map_err(|e| eprintln!("Error: {}", e))?;
+        let len = sfs.stream_length(&handle).map_err(|e| eprintln!("Error: {}", e))? as usize;
+        let mut buf = vec![0u8; len];
+        sfs.read(&handle, &mut buf)
+            .map_err(|e| eprintln!("Error: {}", e))?;
+        sfs.close_stream(handle)
+            .map_err(|e| eprintln!("Error: {}", e))?;
+    }
+
+    sfs.close();
+    Ok(())
+}
+
 /// Write 20 streams of 512KB then delete them all, repeated 5 times.
 fn run_churn(bss: u8, biw: u8) -> Result<(), ()> {
     let _guard = CleanupGuard { path: BENCH_FILE };
@@ -335,6 +457,12 @@ fn run_all(bss: u8, biw: u8, threads: usize) -> Result<(), ()> {
 
     eprintln!("[small-write]");
     run_small_write(bss, biw)?;
+
+    eprintln!("[large-read]");
+    run_large_read(bss, biw)?;
+
+    eprintln!("[small-read]");
+    run_small_read(bss, biw)?;
 
     eprintln!("[threaded-write]");
     run_threaded_write(bss, biw, threads)?;

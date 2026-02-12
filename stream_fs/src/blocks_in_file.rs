@@ -197,63 +197,8 @@ impl<L1: FileLayer> BlockLayer for BlocksInFile<L1> {
     }
 
     fn allocate_block(&self) -> Result<u64, SfsError> {
-        let mut state = self.state.lock().unwrap();
-        let block_size = self.block_size();
-        let sentinel = self.sentinel();
-
-        if state.free_list_head != sentinel {
-            // Pop from free list
-            let block_id = state.free_list_head;
-
-            // Read the next-free pointer from this block
-            let biw = self.block_index_width as usize;
-            let mut next_buf = [0u8; 8];
-            self.layer1
-                .read(self.block_offset(block_id), &mut next_buf[..biw])?;
-            let next_free = u64::from_le_bytes(next_buf);
-
-            state.free_list_head = next_free;
-            let total = state.total_blocks;
-
-            // Zero the entire block
-            let zeros = vec![0u8; block_size];
-            self.layer1.write(self.block_offset(block_id), &zeros)?;
-
-            // Persist updated L2 header
-            drop(state);
-            self.persist_l2_header(total, next_free)?;
-
-            Ok(block_id)
-        } else {
-            // Extend file with a new block
-            let block_id = state.total_blocks;
-
-            // Index overflow protection
-            if block_id >= sentinel {
-                return Err(SfsError::IoError(format!(
-                    "block index overflow: next block {} >= sentinel {} for block_index_width={}",
-                    block_id, sentinel, self.block_index_width
-                )));
-            }
-
-            // Grow the file to accommodate the new block
-            let new_file_len = self.block_offset(block_id) + block_size as u64;
-            self.layer1.set_len(new_file_len)?;
-
-            // Zero the new block (file set_len may not zero on all platforms)
-            let zeros = vec![0u8; block_size];
-            self.layer1.write(self.block_offset(block_id), &zeros)?;
-
-            state.total_blocks += 1;
-            let total = state.total_blocks;
-            let free = state.free_list_head;
-            drop(state);
-
-            // Persist updated L2 header
-            self.persist_l2_header(total, free)?;
-
-            Ok(block_id)
-        }
+        let blocks = self.allocate_blocks(1)?;
+        Ok(blocks[0])
     }
 
     fn allocate_blocks(&self, count: u64) -> Result<Vec<u64>, SfsError> {

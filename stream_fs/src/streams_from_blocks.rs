@@ -1028,16 +1028,16 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
         Self: Sized,
     {
         let layer2 = L2::open(path, mode)?;
-        let my_slot = layer2.header_slot_for_upper(0);
+        let my_header_slot = layer2.header_slot_for_upper(0);
 
         // Read and parse L3 payload
-        let l3_data = layer2.read_header_slot(my_slot)?;
-        let streams_desc = Self::deserialize_header(&l3_data)?;
+        let header_buffer = layer2.read_header_slot(my_header_slot)?;
+        let streams_desc = Self::deserialize_header(&header_buffer)?;
 
         Ok(StreamsFromBlocks {
             layer2,
             streams_descriptor: Mutex::new(streams_desc),
-            my_slot,
+            my_slot: my_header_slot,
             state: Mutex::new(StreamsFromBlocksState {
                 next_handle_id: 0,
                 locks: HashMap::new(),

@@ -142,32 +142,32 @@ impl<L1: FileLayer> BlockLayer for BlocksInFile<L1> {
         let my_slot = layer1.header_slot_for_upper(0);
 
         // Read L2 payload via slot (no length prefix)
-        let payload = layer1.read_header_slot(my_slot)?;
+        let header_buffer = layer1.read_header_slot(my_slot)?;
 
-        if payload.len() < L2_PAYLOAD_SIZE as usize {
+        if header_buffer.len() < L2_PAYLOAD_SIZE as usize {
             return Err(SfsError::IoError(format!(
                 "L2 payload too short: {} < {}",
-                payload.len(),
+                header_buffer.len(),
                 L2_PAYLOAD_SIZE
             )));
         }
 
-        if &payload[P_ID_OFFSET..P_VERSION_OFFSET] != L2_IDENTIFIER {
+        if &header_buffer[P_ID_OFFSET..P_VERSION_OFFSET] != L2_IDENTIFIER {
             return Err(SfsError::IoError(format!(
                 "expected L2 identifier 'blocks', got '{}'",
-                String::from_utf8_lossy(&payload[P_ID_OFFSET..P_VERSION_OFFSET])
+                String::from_utf8_lossy(&header_buffer[P_ID_OFFSET..P_VERSION_OFFSET])
             )));
         }
 
-        let block_size_shift = payload[P_BSS_OFFSET];
-        let block_index_width = payload[P_BIW_OFFSET];
+        let block_size_shift = header_buffer[P_BSS_OFFSET];
+        let block_index_width = header_buffer[P_BIW_OFFSET];
         let total_blocks = u64::from_le_bytes(
-            payload[P_TOTAL_BLOCKS_OFFSET..P_FREE_LIST_OFFSET]
+            header_buffer[P_TOTAL_BLOCKS_OFFSET..P_FREE_LIST_OFFSET]
                 .try_into()
                 .unwrap(),
         );
         let free_list_head = u64::from_le_bytes(
-            payload[P_FREE_LIST_OFFSET..L2_PAYLOAD_SIZE as usize]
+            header_buffer[P_FREE_LIST_OFFSET..L2_PAYLOAD_SIZE as usize]
                 .try_into()
                 .unwrap(),
         );

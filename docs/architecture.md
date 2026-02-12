@@ -326,7 +326,7 @@ Accordingly, the lifetime of a new and growing data stream is as follows:
    3. The first index in this new top block is, of course, the index of the old top block (Fig 4, block 140, observe index 15). The second index in the new top block is the new redirector block (Fig 4, block 140, observe index 11). In this way, we've increased the height of the data structure by one more.
 5. As more and more stream data is written, the level of redirector blocks grow, from 0 (no redirectors), to 1 and beyond. The more data blocks we need to store, the "taller" the hierarchy of redirector blocks becomes.
 
-The corollary case of a truncated stream is relatively simple; only the left, symmetrical part of the pyramid is kept; all blocks no longer needed are returned.
+The corollary case of a truncated stream is relatively simple; start at the new top (most often a redirector node)
 
 ```ASCII
 ```

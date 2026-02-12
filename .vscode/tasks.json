@@ -278,6 +278,188 @@
                 "reveal": "always",
                 "panel": "shared"
             }
+        },
+        {
+            "label": "cargo-build-profiling",
+            "type": "shell",
+            "command": "cargo",
+            "args": [
+                "build",
+                "--profile",
+                "profiling",
+                "--package",
+                "sfs_cl"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "env": {
+                    "PATH": "${env:PATH};C:/Users/bjorn/.cargo/bin"
+                }
+            },
+            "problemMatcher": [
+                "$rustc"
+            ],
+            "group": "build",
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared"
+            }
+        },
+        {
+            "label": "samply-bench-all",
+            "type": "shell",
+            "command": "samply",
+            "args": [
+                "record",
+                "${workspaceFolder}/target/profiling/sfs.exe",
+                "bench",
+                "all"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "env": {
+                    "PATH": "${env:PATH};C:/Users/bjorn/.cargo/bin"
+                }
+            },
+            "dependsOn": [
+                "cargo-build-profiling"
+            ],
+            "problemMatcher": [],
+            "group": "test",
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared"
+            }
+        },
+        {
+            "label": "samply-bench-large-write",
+            "type": "shell",
+            "command": "samply",
+            "args": [
+                "record",
+                "${workspaceFolder}/target/profiling/sfs.exe",
+                "bench",
+                "large-write"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "env": {
+                    "PATH": "${env:PATH};C:/Users/bjorn/.cargo/bin"
+                }
+            },
+            "dependsOn": [
+                "cargo-build-profiling"
+            ],
+            "problemMatcher": [],
+            "group": "test",
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared"
+            }
+        },
+        {
+            "label": "samply-bench-small-write",
+            "type": "shell",
+            "command": "samply",
+            "args": [
+                "record",
+                "${workspaceFolder}/target/profiling/sfs.exe",
+                "bench",
+                "small-write"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "env": {
+                    "PATH": "${env:PATH};C:/Users/bjorn/.cargo/bin"
+                }
+            },
+            "dependsOn": [
+                "cargo-build-profiling"
+            ],
+            "problemMatcher": [],
+            "group": "test",
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared"
+            }
+        },
+        {
+            "label": "samply-bench-threaded-write",
+            "type": "shell",
+            "command": "samply",
+            "args": [
+                "record",
+                "${workspaceFolder}/target/profiling/sfs.exe",
+                "bench",
+                "threaded-write"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "env": {
+                    "PATH": "${env:PATH};C:/Users/bjorn/.cargo/bin"
+                }
+            },
+            "dependsOn": [
+                "cargo-build-profiling"
+            ],
+            "problemMatcher": [],
+            "group": "test",
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared"
+            }
+        },
+        {
+            "label": "samply-bench-threaded-read",
+            "type": "shell",
+            "command": "samply",
+            "args": [
+                "record",
+                "${workspaceFolder}/target/profiling/sfs.exe",
+                "bench",
+                "threaded-read"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "env": {
+                    "PATH": "${env:PATH};C:/Users/bjorn/.cargo/bin"
+                }
+            },
+            "dependsOn": [
+                "cargo-build-profiling"
+            ],
+            "problemMatcher": [],
+            "group": "test",
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared"
+            }
+        },
+        {
+            "label": "samply-bench-churn",
+            "type": "shell",
+            "command": "samply",
+            "args": [
+                "record",
+                "${workspaceFolder}/target/profiling/sfs.exe",
+                "bench",
+                "churn"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "env": {
+                    "PATH": "${env:PATH};C:/Users/bjorn/.cargo/bin"
+                }
+            },
+            "dependsOn": [
+                "cargo-build-profiling"
+            ],
+            "problemMatcher": [],
+            "group": "test",
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared"
+            }
         }
     ]
 }

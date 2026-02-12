@@ -17,3 +17,6 @@ __pycache__/
 # Temp/test directories
 /temp/
 *.sfs/
+
+# Profiling output
+profile.json.gz

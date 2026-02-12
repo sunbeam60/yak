@@ -15,3 +15,7 @@ publish = false
 
 [workspace.dependencies]
 stream_fs = { path = "stream_fs", version = "0.1.0" }
+
+[profile.profiling]
+inherits = "release"
+debug = true

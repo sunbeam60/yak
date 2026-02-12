@@ -69,9 +69,6 @@ pub trait FileLayer: Send + Sync {
     /// or to shrink it.
     fn set_len(&self, len: u64) -> Result<(), SfsError>;
 
-    /// Flush all writes to disk.
-    fn flush(&self) -> Result<(), SfsError>;
-
     /// Get the `HeaderSlotId` for the `index`-th upper layer section.
     ///
     /// Index 0 = first upper section (L2), index 1 = next (L3), etc.

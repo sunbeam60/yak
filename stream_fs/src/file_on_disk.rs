@@ -67,62 +67,58 @@ impl FileOnDisk {
         buf
     }
 
-    /// Parse the full header from a file, validating magic and L1 section.
-    /// Returns (data_offset, slot_registry).
+    /// Read and validate the magic prefix: "stream_fs"(9) + version(1) + total_header_length(2).
+    /// Returns `data_offset` (= total_header_length).
+    fn deserialize_magic_header(file: &mut fs::File) -> Result<u64, SfsError> {
+        let mut buf = [0u8; MAGIC_SIZE];
+        file.read_exact(&mut buf)
+            .map_err(|e| SfsError::IoError(format!("failed to read SFS header magic: {}", e)))?;
+
+        if &buf[0..9] != MAGIC {
+            return Err(SfsError::IoError("not an SFS file (bad magic)".to_string()));
+        }
+        if buf[9] != HEADER_FORMAT_VERSION {
+            return Err(SfsError::IoError(format!(
+                "unsupported header format version: {}",
+                buf[9]
+            )));
+        }
+
+        let total_header_length = u16::from_le_bytes([buf[10], buf[11]]);
+        Ok(total_header_length as u64)
+    }
+
+    /// Validate the L1 header payload: | "ondisk" | version: u8 |.
+    /// `payload` is the section bytes WITHOUT the 2-byte length prefix.
+    fn deserialize_header(payload: &[u8]) -> Result<(), SfsError> {
+        let expected_payload = L1_SECTION_SIZE - 2; // identifier(6) + version(1)
+        if payload.len() < expected_payload {
+            return Err(SfsError::IoError(format!(
+                "L1 header payload too short: {} < {}",
+                payload.len(),
+                expected_payload
+            )));
+        }
+        if &payload[0..6] != L1_IDENTIFIER {
+            return Err(SfsError::IoError(format!(
+                "expected L1 identifier 'ondisk', got '{}'",
+                String::from_utf8_lossy(&payload[0..6])
+            )));
+        }
+        Ok(())
+    }
+
+    /// Read magic and walk all layer sections into the slot registry.
+    /// Returns (data_offset, slot_registry). Does NOT validate any layer headers.
     fn parse_header(file: &mut fs::File) -> Result<(u64, Vec<SlotInfo>), SfsError> {
         file.seek(SeekFrom::Start(0))
             .map_err(|e| SfsError::IoError(e.to_string()))?;
 
-        // Read magic prefix: "stream_fs" + version + total_header_length
-        let mut magic_buf = [0u8; MAGIC_SIZE];
-        file.read_exact(&mut magic_buf)
-            .map_err(|e| SfsError::IoError(format!("failed to read SFS header magic: {}", e)))?;
+        let data_offset = Self::deserialize_magic_header(file)?;
 
-        if &magic_buf[0..9] != MAGIC {
-            return Err(SfsError::IoError("not an SFS file (bad magic)".to_string()));
-        }
-        if magic_buf[9] != HEADER_FORMAT_VERSION {
-            return Err(SfsError::IoError(format!(
-                "unsupported header format version: {}",
-                magic_buf[9]
-            )));
-        }
-
-        let total_header_length = u16::from_le_bytes([magic_buf[10], magic_buf[11]]);
-        let data_offset = total_header_length as u64;
-
-        // Read L1 section
-        let mut l1_len_buf = [0u8; 2];
-        file.read_exact(&mut l1_len_buf)
-            .map_err(|e| SfsError::IoError(format!("failed to read L1 section length: {}", e)))?;
-        let l1_len = u16::from_le_bytes(l1_len_buf) as usize;
-
-        if l1_len < L1_SECTION_SIZE {
-            return Err(SfsError::IoError(format!(
-                "L1 section too short: {} < {}",
-                l1_len, L1_SECTION_SIZE
-            )));
-        }
-
-        // Read the rest of the L1 section (identifier + version)
-        let l1_remaining = l1_len - 2; // we already read the length
-        let mut l1_body = vec![0u8; l1_remaining];
-        file.read_exact(&mut l1_body)
-            .map_err(|e| SfsError::IoError(format!("failed to read L1 section body: {}", e)))?;
-
-        // Validate L1 identifier
-        if &l1_body[0..6] != L1_IDENTIFIER {
-            return Err(SfsError::IoError(format!(
-                "expected L1 identifier 'ondisk', got '{}'",
-                String::from_utf8_lossy(&l1_body[0..6])
-            )));
-        }
-
-        let upper_layers_offset = (MAGIC_SIZE + l1_len) as u64;
-
-        // Rebuild slot registry by walking the length-prefixed sections
+        // Walk all layer sections (including L1) into the slot registry
         let mut slots = Vec::new();
-        let mut current_offset = upper_layers_offset;
+        let mut current_offset = MAGIC_SIZE as u64;
         while current_offset < data_offset {
             let mut len_buf = [0u8; 2];
             file.read_exact(&mut len_buf).map_err(|e| {
@@ -197,8 +193,12 @@ impl FileLayer for FileOnDisk {
         header.extend_from_slice(&magic_header);
         header.extend_from_slice(&l1_header);
 
-        // add space for the layers' header sections (length prefix + zeroed payloads), and build the slot registry
-        let mut slots = Vec::with_capacity(slot_sizes.len());
+        // Build slot registry: slot 0 = L1, then upper layers
+        let mut slots = Vec::with_capacity(1 + slot_sizes.len());
+        slots.push(SlotInfo {
+            offset: MAGIC_SIZE as u64,
+            payload_len: (L1_SECTION_SIZE - 2) as u16,
+        });
         let mut current_offset = upper_layers_offset;
         for &payload_len in &slot_sizes {
             slots.push(SlotInfo {
@@ -214,8 +214,6 @@ impl FileLayer for FileOnDisk {
         // write the header (at this point layer headers are blank, the layers will fill them in later via write_header_slot)
         file.write_all(&header)
             .map_err(|e| SfsError::IoError(format!("failed to write SFS header: {}", e)))?;
-        file.flush()
-            .map_err(|e| SfsError::IoError(format!("failed to flush SFS header: {}", e)))?;
 
         Ok(FileOnDisk {
             state: Mutex::new(file),
@@ -250,7 +248,22 @@ impl FileLayer for FileOnDisk {
             })?,
         };
 
+        // pull out layer header information
         let (data_offset, slots) = Self::parse_header(&mut file)?;
+
+        // Validate L1's own header (slot 0)
+        if slots.is_empty() {
+            return Err(SfsError::IoError(
+                "no header sections found after magic".to_string(),
+            ));
+        }
+        let l1_slot = &slots[0];
+        file.seek(SeekFrom::Start(l1_slot.offset + 2))
+            .map_err(|e| SfsError::IoError(e.to_string()))?;
+        let mut l1_payload = vec![0u8; l1_slot.payload_len as usize];
+        file.read_exact(&mut l1_payload)
+            .map_err(|e| SfsError::IoError(format!("failed to read L1 header: {}", e)))?;
+        Self::deserialize_header(&l1_payload)?;
 
         Ok(FileOnDisk {
             state: Mutex::new(file),
@@ -298,14 +311,8 @@ impl FileLayer for FileOnDisk {
         Ok(())
     }
 
-    fn flush(&self) -> Result<(), SfsError> {
-        let mut file = self.state.lock().unwrap();
-        file.flush().map_err(|e| SfsError::IoError(e.to_string()))?;
-        Ok(())
-    }
-
     fn header_slot_for_upper(&self, index: u8) -> HeaderSlotId {
-        HeaderSlotId(index)
+        HeaderSlotId(index + 1) // slot 0 is L1's own header; upper layers start at slot 1
     }
 
     fn write_header_slot(&self, slot: HeaderSlotId, data: &[u8]) -> Result<(), SfsError> {
@@ -338,7 +345,6 @@ impl FileLayer for FileOnDisk {
             .map_err(|e| SfsError::IoError(e.to_string()))?;
         file.write_all(&buf)
             .map_err(|e| SfsError::IoError(e.to_string()))?;
-        file.flush().map_err(|e| SfsError::IoError(e.to_string()))?;
         Ok(())
     }
 

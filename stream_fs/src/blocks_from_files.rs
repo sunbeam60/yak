@@ -389,7 +389,6 @@ impl BlockLayer for BlocksFromFiles {
             .map_err(|e| SfsError::IoError(e.to_string()))?;
         file.write_all(&buf)
             .map_err(|e| SfsError::IoError(e.to_string()))?;
-        file.flush().map_err(|e| SfsError::IoError(e.to_string()))?;
         Ok(())
     }
 

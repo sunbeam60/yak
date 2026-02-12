@@ -340,15 +340,16 @@ fn run_large_read(bss: u8, biw: u8) -> Result<(), ()> {
     }
 
     // Phase 2: read back
-    let sfs =
-        Sfs::open(BENCH_FILE, OpenMode::Read).map_err(|e| eprintln!("Error: {}", e))?;
+    let sfs = Sfs::open(BENCH_FILE, OpenMode::Read).map_err(|e| eprintln!("Error: {}", e))?;
 
     for i in 0..streams_per_tier {
         let name = format!("large_10m_{}.bin", i);
         let handle = sfs
             .open_stream(&name, OpenMode::Read)
             .map_err(|e| eprintln!("Error: {}", e))?;
-        let len = sfs.stream_length(&handle).map_err(|e| eprintln!("Error: {}", e))? as usize;
+        let len = sfs
+            .stream_length(&handle)
+            .map_err(|e| eprintln!("Error: {}", e))? as usize;
         let mut buf = vec![0u8; len];
         sfs.read(&handle, &mut buf)
             .map_err(|e| eprintln!("Error: {}", e))?;
@@ -361,7 +362,9 @@ fn run_large_read(bss: u8, biw: u8) -> Result<(), ()> {
         let handle = sfs
             .open_stream(&name, OpenMode::Read)
             .map_err(|e| eprintln!("Error: {}", e))?;
-        let len = sfs.stream_length(&handle).map_err(|e| eprintln!("Error: {}", e))? as usize;
+        let len = sfs
+            .stream_length(&handle)
+            .map_err(|e| eprintln!("Error: {}", e))? as usize;
         let mut buf = vec![0u8; len];
         sfs.read(&handle, &mut buf)
             .map_err(|e| eprintln!("Error: {}", e))?;
@@ -398,15 +401,16 @@ fn run_small_read(bss: u8, biw: u8) -> Result<(), ()> {
     }
 
     // Phase 2: read back
-    let sfs =
-        Sfs::open(BENCH_FILE, OpenMode::Read).map_err(|e| eprintln!("Error: {}", e))?;
+    let sfs = Sfs::open(BENCH_FILE, OpenMode::Read).map_err(|e| eprintln!("Error: {}", e))?;
 
     for i in 0..stream_count {
         let name = format!("stream_{:04}.bin", i);
         let handle = sfs
             .open_stream(&name, OpenMode::Read)
             .map_err(|e| eprintln!("Error: {}", e))?;
-        let len = sfs.stream_length(&handle).map_err(|e| eprintln!("Error: {}", e))? as usize;
+        let len = sfs
+            .stream_length(&handle)
+            .map_err(|e| eprintln!("Error: {}", e))? as usize;
         let mut buf = vec![0u8; len];
         sfs.read(&handle, &mut buf)
             .map_err(|e| eprintln!("Error: {}", e))?;

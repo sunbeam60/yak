@@ -1,4 +1,9 @@
+use std::cell::RefCell;
+use std::num::NonZeroUsize;
 use std::sync::Mutex;
+
+use lru::LruCache;
+use thread_local::ThreadLocal;
 
 use crate::block_layer::BlockLayer;
 use crate::file_layer::FileLayer;
@@ -22,6 +27,14 @@ const L2_IDENTIFIER: &[u8; 6] = b"blocks";
 /// L2 header version.
 const L2_VERSION: u8 = 0;
 
+/// Maximum memory budget for the per-thread block cache (in bytes).
+/// Each thread gets its own independent LRU cache up to this size.
+const BLOCK_CACHE_BUDGET_BYTES: usize = 2 * 1024 * 1024;
+
+/// Maximum entry count for the per-thread block cache.
+/// Prevents excessive LRU overhead when block sizes are very small.
+const BLOCK_CACHE_MAX_ENTRIES: usize = 4096;
+
 /// Bookkeeping state protected by a Mutex.
 struct BlocksInFileState {
     total_blocks: u64,
@@ -36,8 +49,13 @@ struct BlocksInFileState {
 /// (or sentinel for end of list). `free_list_head` in the L2 header section
 /// points to the first free block.
 ///
+/// Includes a per-thread write-through LRU block cache. Reads check the cache
+/// first; misses read a full block from L1 and cache it. Writes go to L1
+/// immediately and update the cached copy if present.
+///
 /// Thread-safe: bookkeeping state is behind a `Mutex`. File I/O goes through
-/// L1 which has its own internal mutex.
+/// L1 which has its own internal mutex. The block cache is thread-local
+/// (no cross-thread synchronization needed).
 pub struct BlocksInFile<L1: FileLayer> {
     layer1: L1,
     block_size_shift: u8,
@@ -45,6 +63,11 @@ pub struct BlocksInFile<L1: FileLayer> {
     state: Mutex<BlocksInFileState>,
     /// L2's own header slot ID.
     my_slot: HeaderSlotId,
+    /// Per-thread LRU cache of full block contents.
+    /// Key: block index. Value: full block as Vec<u8>.
+    block_cache: ThreadLocal<RefCell<LruCache<u64, Vec<u8>>>>,
+    /// Precomputed cache capacity (entry count) for this instance's block size.
+    cache_capacity: NonZeroUsize,
 }
 
 impl<L1: FileLayer> BlocksInFile<L1> {
@@ -88,6 +111,20 @@ impl<L1: FileLayer> BlocksInFile<L1> {
 
     fn block_size(&self) -> usize {
         1 << self.block_size_shift
+    }
+
+    /// Get or create the calling thread's block cache.
+    fn thread_cache(&self) -> &RefCell<LruCache<u64, Vec<u8>>> {
+        self.block_cache
+            .get_or(|| RefCell::new(LruCache::new(self.cache_capacity)))
+    }
+
+    /// Compute cache entry count from block size.
+    fn compute_cache_capacity(block_size_shift: u8) -> NonZeroUsize {
+        let block_size = 1usize << block_size_shift;
+        let by_budget = BLOCK_CACHE_BUDGET_BYTES / block_size;
+        let entries = by_budget.clamp(1, BLOCK_CACHE_MAX_ENTRIES);
+        NonZeroUsize::new(entries).unwrap()
     }
 }
 
@@ -134,6 +171,8 @@ impl<L1: FileLayer> BlockLayer for BlocksInFile<L1> {
                 free_list_head: sentinel,
             }),
             my_slot,
+            block_cache: ThreadLocal::new(),
+            cache_capacity: Self::compute_cache_capacity(block_size_shift),
         })
     }
 
@@ -181,6 +220,8 @@ impl<L1: FileLayer> BlockLayer for BlocksInFile<L1> {
                 free_list_head,
             }),
             my_slot,
+            block_cache: ThreadLocal::new(),
+            cache_capacity: Self::compute_cache_capacity(block_size_shift),
         })
     }
 
@@ -260,6 +301,16 @@ impl<L1: FileLayer> BlockLayer for BlocksInFile<L1> {
         drop(state);
         self.persist_l2_header(total, free)?;
 
+        // Phase 5: evict allocated blocks from thread-local cache.
+        // These blocks may have stale data from a previous incarnation
+        // (recycled from the free list).
+        {
+            let mut cache = self.thread_cache().borrow_mut();
+            for &block_id in &result {
+                cache.pop(&block_id);
+            }
+        }
+
         Ok(result)
     }
 
@@ -280,6 +331,10 @@ impl<L1: FileLayer> BlockLayer for BlocksInFile<L1> {
 
         // Persist updated L2 header
         self.persist_l2_header(total, new_head)?;
+
+        // Evict deallocated block from thread-local cache.
+        // Block content is now a free-list pointer, not useful data.
+        self.thread_cache().borrow_mut().pop(&index);
 
         Ok(())
     }
@@ -303,8 +358,28 @@ impl<L1: FileLayer> BlockLayer for BlocksInFile<L1> {
             )));
         }
 
-        let file_offset = self.block_offset(index) + offset as u64;
-        self.layer1.read(file_offset, buf)
+        let mut cache = self.thread_cache().borrow_mut();
+
+        // Cache hit: serve from cached full block
+        if let Some(cached_block) = cache.get(&index) {
+            buf.copy_from_slice(&cached_block[offset..offset + buf.len()]);
+            return Ok(buf.len());
+        }
+
+        // Cache miss: read full block from L1
+        let mut full_block = vec![0u8; block_size];
+        let file_offset = self.block_offset(index);
+        let n = self.layer1.read(file_offset, &mut full_block)?;
+
+        // Copy requested sub-region to caller's buffer
+        buf.copy_from_slice(&full_block[offset..offset + buf.len()]);
+
+        // Only cache if we got a complete block read
+        if n == block_size {
+            cache.put(index, full_block);
+        }
+
+        Ok(buf.len())
     }
 
     fn write_block(&self, index: u64, offset: usize, buf: &[u8]) -> Result<usize, SfsError> {
@@ -318,9 +393,24 @@ impl<L1: FileLayer> BlockLayer for BlocksInFile<L1> {
             )));
         }
 
+        // Write through to L1 first
         let file_offset = self.block_offset(index) + offset as u64;
         self.layer1.write(file_offset, buf)?;
+
+        // Update cache if this block is cached (keep cache coherent for same-thread reads)
+        let mut cache = self.thread_cache().borrow_mut();
+        if let Some(cached_block) = cache.get_mut(&index) {
+            cached_block[offset..offset + buf.len()].copy_from_slice(buf);
+        }
+        // If not in cache, don't insert — we only have partial data
+
         Ok(buf.len())
+    }
+
+    fn invalidate_block_cache(&self) {
+        if let Some(cache_cell) = self.block_cache.get() {
+            cache_cell.borrow_mut().clear();
+        }
     }
 
     fn header_slot_for_upper(&self, index: u8) -> HeaderSlotId {

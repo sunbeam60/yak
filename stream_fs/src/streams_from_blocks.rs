@@ -857,6 +857,7 @@ impl<L2: BlockLayer> StreamsFromBlocks<L2> {
             self.release_lock(id, mode);
             return Err(e);
         }
+        self.layer2.invalidate_block_cache();
         let desc_result = {
             let streams_desc = self.streams_descriptor.lock().unwrap();
             self.read_descriptor(&streams_desc, id)
@@ -1062,6 +1063,7 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
         // we're about to create a new stream, so we need find an available stream descriptor from the Streams stream
         // therefore we need to acquire the STREAMS_STREAM_ID write lock to ensure exclusive access while we scan for a free descriptor and potentially extend the stream. This is the main reason for the STREAMS_STREAM_ID lock: it protects the integrity of the stream descriptors in the Streams stream.
         self.acquire_lock(STREAMS_STREAM_ID, OpenMode::Write, true)?;
+        self.layer2.invalidate_block_cache();
 
         let result = (|| -> Result<u64, SfsError> {
             // we should never block on this call. The Mutex is just to satisfy Rust's safety guarantees around shared mutable access to the descriptor, but in practice we always hold the STREAMS_STREAM_ID write lock when accessing it, so there is no contention.
@@ -1135,6 +1137,7 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
         {
             return false;
         }
+        self.layer2.invalidate_block_cache();
         let result = {
             let streams_desc = self.streams_descriptor.lock().unwrap();
             let offset = id * DESCRIPTOR_SIZE;
@@ -1153,6 +1156,7 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
 
     fn stream_count(&self) -> Result<u64, SfsError> {
         self.acquire_lock(STREAMS_STREAM_ID, OpenMode::Read, true)?;
+        self.layer2.invalidate_block_cache();
         let result = {
             let streams_desc = self.streams_descriptor.lock().unwrap();
             let num_slots = streams_desc.size / DESCRIPTOR_SIZE;
@@ -1171,6 +1175,7 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
 
     fn stream_ids(&self) -> Result<Vec<u64>, SfsError> {
         self.acquire_lock(STREAMS_STREAM_ID, OpenMode::Read, true)?;
+        self.layer2.invalidate_block_cache();
         let result = {
             let streams_desc = self.streams_descriptor.lock().unwrap();
             let num_slots = streams_desc.size / DESCRIPTOR_SIZE;
@@ -1207,6 +1212,7 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
         // If writer, flush cached descriptor back to Streams stream
         if info.mode == OpenMode::Write {
             self.acquire_lock(STREAMS_STREAM_ID, OpenMode::Write, true)?;
+            self.layer2.invalidate_block_cache();
             let result = {
                 let mut streams_desc = self.streams_descriptor.lock().unwrap();
                 self.write_descriptor(&mut streams_desc, info.stream_id, &info.cached_descriptor)?;
@@ -1237,6 +1243,7 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
         }
 
         self.acquire_lock(STREAMS_STREAM_ID, OpenMode::Write, true)?;
+        self.layer2.invalidate_block_cache();
 
         let result = (|| -> Result<(), SfsError> {
             let mut streams_desc = self.streams_descriptor.lock().unwrap();

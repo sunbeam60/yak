@@ -95,6 +95,14 @@ pub trait BlockLayer: Send + Sync {
     /// Returns the section payload (without the 2-byte length prefix).
     fn read_header_slot(&self, slot: HeaderSlotId) -> Result<Vec<u8>, SfsError>;
 
+    /// Invalidate the calling thread's block cache.
+    ///
+    /// Used by L3 to ensure cross-thread coherency for shared data
+    /// structures (e.g., the Streams stream). Implementations that
+    /// maintain a per-thread cache should clear it so subsequent reads
+    /// go to the backing store. The default implementation is a no-op.
+    fn invalidate_block_cache(&self) {}
+
     /// Run L2 integrity checks. `claimed_blocks` are block IDs that upper
     /// layers assert are in use. L2 validates that claimed + free == all blocks,
     /// with no overlaps, no orphans, and no free-list cycles.

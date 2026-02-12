@@ -12,3 +12,5 @@ categories = ["filesystem", "data-structures"]
 
 [dependencies]
 fs2 = "0.4.3"
+thread_local = "1.1"
+lru = "0.12"

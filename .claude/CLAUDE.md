@@ -10,7 +10,7 @@
 Before committing, at all times present & allow edits to the commit message to the user. Do not include "co-authored by Claude" message.
 Humans will use the extension Todo Tree extension. It's good practice to use //TODO: and //FIXME: comments where appropriate, to give humans an overview over possible improvements or concerns in the code. Literal constants in code should be avoided. It's brittle and humans don't deal well with them. Minimize the use of defined constants to as few places as possible.
 
-Readability of the code for humans is important. If constants are being added, explain a comment what the constant signifies.
+Readability of the code for humans is important. If constants are being added, explain in a comment what the constant signifies.
 
 ## Architecture
 Please read the [architecture](./../docs/architecture.md) for a comprehensive overview of SFS. This architecture must be respected - if it cannot, please stop, inform and ask for directions.
@@ -19,6 +19,7 @@ Whenever you are updating .md files, do not ever change ./../docs/architecture.m
 
 ## Performance and memory
 This is a low level library. Memory allocations should be minimized when possible. Performance matters.
+Samply is used for profiling release builds. Please see ./.vscode/tasks.json for how they are defined.
 
 ## Workspace harness
 Whenever you make changes, they must be in sync across the four key projects:

@@ -266,6 +266,115 @@ class TestThreadSafety:
         f.close()
         assert not errors, "Thread errors:\n" + "\n".join(errors)
 
+    def test_concurrent_read_write_mixed(self, tmp_path, burn_seconds):
+        """Reader and writer threads operate concurrently on independent streams.
+
+        10 reader threads repeatedly open/read/verify pre-populated streams.
+        10 writer threads create, write, verify, and delete new streams.
+        """
+        NUM_READERS = 10
+        NUM_WRITERS = 10
+        TOTAL_MIXED_THREADS = NUM_READERS + NUM_WRITERS
+
+        sfs_path = str(tmp_path / "mixed.sfs")
+        f = sfs.Sfs.create(sfs_path)
+
+        # Setup: pre-populate streams for readers
+        read_streams = []
+        for i in range(NUM_READERS):
+            name = f"read_stream_{i}"
+            content = f"read-{i}:".encode() + bytes(range(256)) * (i + 1)
+            h = f.create_stream(name)
+            f.write(h, content)
+            f.close_stream(h)
+            read_streams.append((name, content))
+
+        # Setup: per-writer directories
+        for i in range(NUM_WRITERS):
+            f.mkdir(f"writer_{i}")
+
+        errors = []
+        barrier = threading.Barrier(TOTAL_MIXED_THREADS)
+
+        def reader_thread(tid):
+            rounds = 0
+            try:
+                barrier.wait(timeout=5)
+                deadline = time.monotonic() + burn_seconds
+
+                while time.monotonic() < deadline:
+                    for name, expected in read_streams:
+                        h = f.open_stream(name, sfs.OpenMode.READ)
+                        length = f.stream_length(h)
+                        assert length == len(expected), (
+                            f"Reader T{tid} r{rounds}: {name} length {length} != {len(expected)}"
+                        )
+                        data = f.read(h, length)
+                        assert data == expected, (
+                            f"Reader T{tid} r{rounds}: {name} content mismatch"
+                        )
+                        f.close_stream(h)
+                    rounds += 1
+
+            except Exception as e:
+                errors.append(f"Reader {tid} (round {rounds}): {e}")
+
+        def writer_thread(tid):
+            rounds = 0
+            try:
+                barrier.wait(timeout=5)
+                deadline = time.monotonic() + burn_seconds
+
+                while time.monotonic() < deadline:
+                    name = f"writer_{tid}/s{rounds}"
+                    content = f"w{tid}r{rounds}:".encode() + b"\xCD" * 200
+
+                    h = f.create_stream(name)
+                    f.write(h, content)
+                    f.close_stream(h)
+
+                    # Verify
+                    h = f.open_stream(name, sfs.OpenMode.READ)
+                    data = f.read(h, len(content) + 1)
+                    assert data == content, (
+                        f"Writer T{tid} r{rounds}: verify failed"
+                    )
+                    f.close_stream(h)
+
+                    f.delete_stream(name)
+                    rounds += 1
+
+            except Exception as e:
+                errors.append(f"Writer {tid} (round {rounds}): {e}")
+
+        threads = []
+        for i in range(NUM_READERS):
+            t = threading.Thread(target=reader_thread, args=(i,))
+            threads.append(t)
+        for i in range(NUM_WRITERS):
+            t = threading.Thread(target=writer_thread, args=(i,))
+            threads.append(t)
+
+        t0 = time.perf_counter()
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=burn_seconds + 30)
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+
+        import sys
+        print(f"  mixed read+write: {elapsed_ms:.0f} ms", file=sys.stderr)
+
+        # Post-mortem: verify original read streams are intact
+        for name, expected in read_streams:
+            h = f.open_stream(name, sfs.OpenMode.READ)
+            data = f.read(h, len(expected))
+            assert data == expected, f"Post-mortem: {name} content corrupted"
+            f.close_stream(h)
+
+        f.close()
+        assert not errors, "Thread errors:\n" + "\n".join(errors)
+
     def test_shared_instance_concurrent_writes(self, sfs_path, burn_seconds):
         """One Sfs instance shared across 40 threads, each writing its own stream in a loop."""
         f = sfs.Sfs.open(sfs_path, sfs.OpenMode.WRITE)

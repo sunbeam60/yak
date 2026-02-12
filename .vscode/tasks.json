@@ -488,6 +488,32 @@
             }
         },
         {
+            "label": "samply-bench-threaded-mixed",
+            "type": "shell",
+            "command": "samply",
+            "args": [
+                "record",
+                "${workspaceFolder}/target/profiling/sfs.exe",
+                "bench",
+                "threaded-mixed"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "env": {
+                    "PATH": "${env:PATH};C:/Users/bjorn/.cargo/bin"
+                }
+            },
+            "dependsOn": [
+                "cargo-build-profiling"
+            ],
+            "problemMatcher": [],
+            "group": "test",
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared"
+            }
+        },
+        {
             "label": "samply-bench-churn",
             "type": "shell",
             "command": "samply",

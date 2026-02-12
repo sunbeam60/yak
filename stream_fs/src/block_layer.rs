@@ -54,6 +54,18 @@ pub trait BlockLayer: Send + Sync {
     /// value for `block_index_width` (see Index Overflow Protection).
     fn allocate_block(&self) -> Result<u64, SfsError>;
 
+    /// Allocate multiple blocks at once. Returns a vector of block indices.
+    /// All block contents are zeroed. The default implementation calls
+    /// `allocate_block` in a loop; implementations may override to batch
+    /// file growth and header persistence for better performance.
+    fn allocate_blocks(&self, count: u64) -> Result<Vec<u64>, SfsError> {
+        let mut result = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            result.push(self.allocate_block()?);
+        }
+        Ok(result)
+    }
+
     /// Deallocate a block, returning it for future reuse.
     fn deallocate_block(&self, index: u64) -> Result<(), SfsError>;
 

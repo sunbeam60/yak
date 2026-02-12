@@ -294,18 +294,21 @@ fn ensure_capacity<L2: BlockLayer>(
     } else {
         current_data_blocks
     };
-    for block_idx in effective_current..target_data_blocks {
-        let new_data_block = layer2.allocate_block()?;
-        // Navigate to the correct slot and write the new block index
-        write_block_at_index(
-            layer2,
-            descriptor,
-            block_idx,
-            new_data_block,
-            fan_out,
-            block_index_width,
-            target_depth,
-        )?;
+    let blocks_needed = target_data_blocks - effective_current;
+    if blocks_needed > 0 {
+        let new_blocks = layer2.allocate_blocks(blocks_needed)?;
+        for (i, &new_data_block) in new_blocks.iter().enumerate() {
+            let block_idx = effective_current + i as u64;
+            write_block_at_index(
+                layer2,
+                descriptor,
+                block_idx,
+                new_data_block,
+                fan_out,
+                block_index_width,
+                target_depth,
+            )?;
+        }
     }
 
     Ok(())

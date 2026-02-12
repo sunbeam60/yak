@@ -256,6 +256,68 @@ impl<L1: FileLayer> BlockLayer for BlocksInFile<L1> {
         }
     }
 
+    fn allocate_blocks(&self, count: u64) -> Result<Vec<u64>, SfsError> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut state = self.state.lock().unwrap();
+        let block_size = self.block_size();
+        let sentinel = self.sentinel();
+        let biw = self.block_index_width as usize;
+        let mut result = Vec::with_capacity(count as usize);
+
+        // Phase 1: drain free list
+        while (result.len() as u64) < count && state.free_list_head != sentinel {
+            let block_id = state.free_list_head;
+            let mut next_buf = [0u8; 8];
+            self.layer1
+                .read(self.block_offset(block_id), &mut next_buf[..biw])?;
+            state.free_list_head = u64::from_le_bytes(next_buf);
+            result.push(block_id);
+        }
+
+        // Phase 2: grow file once for all remaining blocks
+        let remaining = count as usize - result.len();
+        if remaining > 0 {
+            let first_new_id = state.total_blocks;
+
+            // Index overflow protection
+            if first_new_id + remaining as u64 > sentinel {
+                return Err(SfsError::IoError(format!(
+                    "block index overflow: need {} blocks but only {} available before sentinel {}",
+                    remaining,
+                    sentinel - first_new_id,
+                    sentinel
+                )));
+            }
+
+            // Single set_len to grow file for all new blocks at once
+            let last_new_id = first_new_id + remaining as u64;
+            let new_file_len = self.block_offset(last_new_id);
+            self.layer1.set_len(new_file_len)?;
+
+            for i in 0..remaining as u64 {
+                result.push(first_new_id + i);
+            }
+            state.total_blocks += remaining as u64;
+        }
+
+        // Phase 3: zero all allocated blocks
+        let zeros = vec![0u8; block_size];
+        for &block_id in &result {
+            self.layer1.write(self.block_offset(block_id), &zeros)?;
+        }
+
+        // Phase 4: persist L2 header once
+        let total = state.total_blocks;
+        let free = state.free_list_head;
+        drop(state);
+        self.persist_l2_header(total, free)?;
+
+        Ok(result)
+    }
+
     fn deallocate_block(&self, index: u64) -> Result<(), SfsError> {
         let mut state = self.state.lock().unwrap();
 

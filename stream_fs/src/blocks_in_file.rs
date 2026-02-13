@@ -27,9 +27,9 @@ const L2_IDENTIFIER: &[u8; 6] = b"blocks";
 /// L2 header version.
 const L2_VERSION: u8 = 0;
 
-/// Maximum memory budget for the per-thread block cache (in bytes).
+/// Default memory budget (in bytes) for the per-thread block cache.
 /// Each thread gets its own independent LRU cache up to this size.
-const BLOCK_CACHE_BUDGET_BYTES: usize = 2 * 1024 * 1024;
+pub const DEFAULT_CACHE_BUDGET_BYTES: usize = 2 * 1024 * 1024;
 
 /// Maximum entry count for the per-thread block cache.
 /// Prevents excessive LRU overhead when block sizes are very small.
@@ -56,7 +56,7 @@ struct BlocksInFileState {
 /// Thread-safe: bookkeeping state is behind a `Mutex`. File I/O goes through
 /// L1 which has its own internal mutex. The block cache is thread-local
 /// (no cross-thread synchronization needed).
-pub struct BlocksInFile<L1: FileLayer> {
+pub struct BlocksInFile<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> {
     layer1: L1,
     block_size_shift: u8,
     block_index_width: u8,
@@ -70,7 +70,7 @@ pub struct BlocksInFile<L1: FileLayer> {
     cache_capacity: NonZeroUsize,
 }
 
-impl<L1: FileLayer> BlocksInFile<L1> {
+impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlocksInFile<L1, CACHE_BUDGET_BYTES> {
     /// Compute the sentinel value for the configured block_index_width.
     fn sentinel(&self) -> u64 {
         block_sentinel(self.block_index_width)
@@ -122,7 +122,7 @@ impl<L1: FileLayer> BlocksInFile<L1> {
     /// Compute cache entry count from block size.
     fn compute_cache_capacity(block_size_shift: u8) -> NonZeroUsize {
         let block_size = 1usize << block_size_shift;
-        let by_budget = BLOCK_CACHE_BUDGET_BYTES / block_size;
+        let by_budget = CACHE_BUDGET_BYTES / block_size;
         let entries = by_budget.clamp(1, BLOCK_CACHE_MAX_ENTRIES);
         NonZeroUsize::new(entries).unwrap()
     }
@@ -138,7 +138,9 @@ fn block_sentinel(block_index_width: u8) -> u64 {
     }
 }
 
-impl<L1: FileLayer> BlockLayer for BlocksInFile<L1> {
+impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlockLayer
+    for BlocksInFile<L1, CACHE_BUDGET_BYTES>
+{
     fn create(
         path: &str,
         block_size_shift: u8,
@@ -304,7 +306,7 @@ impl<L1: FileLayer> BlockLayer for BlocksInFile<L1> {
         // Phase 5: evict allocated blocks from thread-local cache.
         // These blocks may have stale data from a previous incarnation
         // (recycled from the free list).
-        {
+        if CACHE_BUDGET_BYTES > 0 {
             let mut cache = self.thread_cache().borrow_mut();
             for &block_id in &result {
                 cache.pop(&block_id);
@@ -334,7 +336,9 @@ impl<L1: FileLayer> BlockLayer for BlocksInFile<L1> {
 
         // Evict deallocated block from thread-local cache.
         // Block content is now a free-list pointer, not useful data.
-        self.thread_cache().borrow_mut().pop(&index);
+        if CACHE_BUDGET_BYTES > 0 {
+            self.thread_cache().borrow_mut().pop(&index);
+        }
 
         Ok(())
     }
@@ -358,15 +362,17 @@ impl<L1: FileLayer> BlockLayer for BlocksInFile<L1> {
             )));
         }
 
-        let mut cache = self.thread_cache().borrow_mut();
+        if CACHE_BUDGET_BYTES > 0 {
+            let mut cache = self.thread_cache().borrow_mut();
 
-        // Cache hit: serve from cached full block
-        if let Some(cached_block) = cache.get(&index) {
-            buf.copy_from_slice(&cached_block[offset..offset + buf.len()]);
-            return Ok(buf.len());
+            // Cache hit: serve from cached full block
+            if let Some(cached_block) = cache.get(&index) {
+                buf.copy_from_slice(&cached_block[offset..offset + buf.len()]);
+                return Ok(buf.len());
+            }
         }
 
-        // Cache miss: read full block from L1
+        // Cache miss (or cache disabled): read full block from L1
         let mut full_block = vec![0u8; block_size];
         let file_offset = self.block_offset(index);
         let n = self.layer1.read(file_offset, &mut full_block)?;
@@ -374,9 +380,9 @@ impl<L1: FileLayer> BlockLayer for BlocksInFile<L1> {
         // Copy requested sub-region to caller's buffer
         buf.copy_from_slice(&full_block[offset..offset + buf.len()]);
 
-        // Only cache if we got a complete block read
-        if n == block_size {
-            cache.put(index, full_block);
+        // Only cache if caching is enabled and we got a complete block read
+        if CACHE_BUDGET_BYTES > 0 && n == block_size {
+            self.thread_cache().borrow_mut().put(index, full_block);
         }
 
         Ok(buf.len())
@@ -398,18 +404,22 @@ impl<L1: FileLayer> BlockLayer for BlocksInFile<L1> {
         self.layer1.write(file_offset, buf)?;
 
         // Update cache if this block is cached (keep cache coherent for same-thread reads)
-        let mut cache = self.thread_cache().borrow_mut();
-        if let Some(cached_block) = cache.get_mut(&index) {
-            cached_block[offset..offset + buf.len()].copy_from_slice(buf);
+        if CACHE_BUDGET_BYTES > 0 {
+            let mut cache = self.thread_cache().borrow_mut();
+            if let Some(cached_block) = cache.get_mut(&index) {
+                cached_block[offset..offset + buf.len()].copy_from_slice(buf);
+            }
+            // If not in cache, don't insert — we only have partial data
         }
-        // If not in cache, don't insert — we only have partial data
 
         Ok(buf.len())
     }
 
     fn invalidate_block_cache(&self) {
-        if let Some(cache_cell) = self.block_cache.get() {
-            cache_cell.borrow_mut().clear();
+        if CACHE_BUDGET_BYTES > 0 {
+            if let Some(cache_cell) = self.block_cache.get() {
+                cache_cell.borrow_mut().clear();
+            }
         }
     }
 

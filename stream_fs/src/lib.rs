@@ -10,7 +10,7 @@ mod streams_from_files;
 
 pub use block_layer::BlockLayer;
 pub use blocks_from_files::BlocksFromFiles;
-pub use blocks_in_file::BlocksInFile;
+pub use blocks_in_file::{BlocksInFile, DEFAULT_CACHE_BUDGET_BYTES};
 pub use file_layer::FileLayer;
 pub use file_on_disk::FileOnDisk;
 pub use sfs::{DirEntry, EntryType, OpenMode, Sfs, SfsError, StreamHandle};
@@ -27,7 +27,7 @@ pub use streams_from_files::StreamsFromFiles;
 pub struct HeaderSlotId(pub(crate) u8);
 
 /// Default SFS configuration: single-file SFS with default L1, L2, L3, L4 layers.
-pub type SfsDefault = Sfs<StreamsFromBlocks<BlocksInFile<FileOnDisk>>>;
+pub type SfsDefault = Sfs<StreamsFromBlocks<BlocksInFile<FileOnDisk, DEFAULT_CACHE_BUDGET_BYTES>>>;
 
 /// Block-file-backed streams (L2 mock, debugging/testing tool).
 pub type SfsBlockFileBacked = Sfs<StreamsFromBlocks<BlocksFromFiles>>;
@@ -84,7 +84,7 @@ mod tests {
         let path_str = path.to_str().unwrap();
 
         // Test L3 directly via StreamsFromBlocks
-        type L3 = StreamsFromBlocks<BlocksInFile<FileOnDisk>>;
+        type L3 = StreamsFromBlocks<BlocksInFile<FileOnDisk, DEFAULT_CACHE_BUDGET_BYTES>>;
         let l3 = L3::create(path_str, 4, 12, std::collections::VecDeque::new()).unwrap();
 
         // Initially no streams
@@ -174,6 +174,55 @@ mod tests {
             let sfs = SfsDefault::open(path_str, OpenMode::Read).unwrap();
             let issues = sfs.verify().unwrap();
             assert!(issues.is_empty(), "Issues found: {:?}", issues);
+            sfs.close();
+        }
+    }
+
+    #[test]
+    fn test_no_cache() {
+        let path = std::env::temp_dir().join("sfs_test_no_cache.sfs");
+        let _ = std::fs::remove_file(&path);
+        let path_str = path.to_str().unwrap();
+
+        type SfsNoCache = Sfs<StreamsFromBlocks<BlocksInFile<FileOnDisk, 0>>>;
+
+        // Create, write, read back, verify — all without block cache
+        {
+            let sfs = SfsNoCache::create(path_str, 4, 12).unwrap();
+            sfs.mkdir("docs").unwrap();
+
+            let sh = sfs.create_stream("hello.txt").unwrap();
+            sfs.write(&sh, b"Hello, no cache!").unwrap();
+            sfs.close_stream(sh).unwrap();
+
+            // Multi-block write to exercise allocate_blocks path
+            let sh = sfs.create_stream("docs/big.bin").unwrap();
+            let data: Vec<u8> = (0..10000).map(|i| (i & 0xFF) as u8).collect();
+            sfs.write(&sh, &data).unwrap();
+            sfs.seek(&sh, 0).unwrap();
+            let mut buf = vec![0u8; 10000];
+            let n = sfs.read(&sh, &mut buf).unwrap();
+            assert_eq!(n, 10000);
+            assert_eq!(buf, data);
+            sfs.close_stream(sh).unwrap();
+
+            let issues = sfs.verify().unwrap();
+            assert!(issues.is_empty(), "Issues: {:?}", issues);
+            sfs.close();
+        }
+
+        // Reopen and verify persistence
+        {
+            let sfs = SfsNoCache::open(path_str, OpenMode::Read).unwrap();
+            let sh = sfs.open_stream("hello.txt", OpenMode::Read).unwrap();
+            let mut buf = vec![0u8; 16];
+            let n = sfs.read(&sh, &mut buf).unwrap();
+            assert_eq!(n, 16);
+            assert_eq!(&buf, b"Hello, no cache!");
+            sfs.close_stream(sh).unwrap();
+
+            let issues = sfs.verify().unwrap();
+            assert!(issues.is_empty(), "Issues: {:?}", issues);
             sfs.close();
         }
     }

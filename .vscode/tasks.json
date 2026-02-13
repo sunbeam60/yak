@@ -246,12 +246,29 @@
         },
         {
             "label": "copy-release-binaries",
-            "type": "process",
-            "command": "powershell",
-            "args": [
-                "-Command",
-                "$branch = (git -C '${workspaceFolder}' branch --show-current).Trim().Replace('/','-'); if ($branch -eq 'master') { $name = 'sfs.exe' } else { $name = 'sfs-' + $branch + '.exe' }; New-Item -ItemType Directory -Force -Path '${env:USERPROFILE}/bin'; Copy-Item '${workspaceFolder}/target/release/sfs.exe' ('${env:USERPROFILE}/bin/' + $name) -Force; Copy-Item '${workspaceFolder}/target/release/stream_fs_c.dll' '${env:USERPROFILE}/bin/stream_fs_c.dll' -Force; Write-Host ('Release binary copied to ~/bin/' + $name)"
-            ],
+            "type": "shell",
+            "command": "echo unsupported platform",
+            "windows": {
+                "command": "powershell",
+                "args": [
+                    "-Command",
+                    "$branch = (git -C '${workspaceFolder}' branch --show-current).Trim().Replace('/','-'); if ($branch -eq 'master') { $name = 'sfs.exe' } else { $name = 'sfs-' + $branch + '.exe' }; New-Item -ItemType Directory -Force -Path '${env:USERPROFILE}/bin'; Copy-Item '${workspaceFolder}/target/release/sfs.exe' ('${env:USERPROFILE}/bin/' + $name) -Force; Copy-Item '${workspaceFolder}/target/release/stream_fs_c.dll' '${env:USERPROFILE}/bin/stream_fs_c.dll' -Force; Write-Host ('Release binary copied to ~/bin/' + $name)"
+                ]
+            },
+            "osx": {
+                "command": "bash",
+                "args": [
+                    "-c",
+                    "branch=$(git -C '${workspaceFolder}' branch --show-current | tr '/' '-') && if [ \"$branch\" = \"master\" ]; then name=sfs; else name=sfs-$branch; fi && mkdir -p ~/.local/bin && cp '${workspaceFolder}/target/release/sfs' ~/.local/bin/$name && cp '${workspaceFolder}/target/release/libstream_fs_c.dylib' ~/.local/bin/libstream_fs_c.dylib && echo \"Release binary copied to ~/.local/bin/$name\""
+                ]
+            },
+            "linux": {
+                "command": "bash",
+                "args": [
+                    "-c",
+                    "branch=$(git -C '${workspaceFolder}' branch --show-current | tr '/' '-') && if [ \"$branch\" = \"master\" ]; then name=sfs; else name=sfs-$branch; fi && mkdir -p ~/.local/bin && cp '${workspaceFolder}/target/release/sfs' ~/.local/bin/$name && cp '${workspaceFolder}/target/release/libstream_fs_c.so' ~/.local/bin/libstream_fs_c.so && echo \"Release binary copied to ~/.local/bin/$name\""
+                ]
+            },
             "options": {
                 "cwd": "${workspaceFolder}"
             },

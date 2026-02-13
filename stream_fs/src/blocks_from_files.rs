@@ -297,7 +297,13 @@ impl BlockLayer for BlocksFromFiles {
         Ok(())
     }
 
-    fn read_block(&self, index: u64, offset: usize, buf: &mut [u8]) -> Result<usize, SfsError> {
+    fn read_block(
+        &self,
+        index: u64,
+        offset: usize,
+        buf: &mut [u8],
+        _cache: bool,
+    ) -> Result<usize, SfsError> {
         if index >= self.sentinel() {
             return Err(SfsError::IoError(format!(
                 "read_block: block index {} is >= sentinel {} (block_index_width={})",
@@ -327,7 +333,13 @@ impl BlockLayer for BlocksFromFiles {
         Ok(n)
     }
 
-    fn write_block(&self, index: u64, offset: usize, buf: &[u8]) -> Result<usize, SfsError> {
+    fn write_block(
+        &self,
+        index: u64,
+        offset: usize,
+        buf: &[u8],
+        _cache: bool,
+    ) -> Result<usize, SfsError> {
         let block_size = self.block_size();
         if offset + buf.len() > block_size {
             return Err(SfsError::IoError(format!(

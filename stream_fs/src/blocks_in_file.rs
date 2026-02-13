@@ -343,7 +343,13 @@ impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlockLayer
         Ok(())
     }
 
-    fn read_block(&self, index: u64, offset: usize, buf: &mut [u8]) -> Result<usize, SfsError> {
+    fn read_block(
+        &self,
+        index: u64,
+        offset: usize,
+        buf: &mut [u8],
+        cache: bool,
+    ) -> Result<usize, SfsError> {
         if index >= self.sentinel() {
             return Err(SfsError::IoError(format!(
                 "read_block: block index {} is >= sentinel {} (block_index_width={})",
@@ -362,17 +368,17 @@ impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlockLayer
             )));
         }
 
-        if CACHE_BUDGET_BYTES > 0 {
-            let mut cache = self.thread_cache().borrow_mut();
+        if cache && CACHE_BUDGET_BYTES > 0 {
+            let mut lru = self.thread_cache().borrow_mut();
 
             // Cache hit: serve from cached full block
-            if let Some(cached_block) = cache.get(&index) {
+            if let Some(cached_block) = lru.get(&index) {
                 buf.copy_from_slice(&cached_block[offset..offset + buf.len()]);
                 return Ok(buf.len());
             }
         }
 
-        // Cache miss (or cache disabled): read full block from L1
+        // Cache miss (or cache disabled/bypassed): read full block from L1
         let mut full_block = vec![0u8; block_size];
         let file_offset = self.block_offset(index);
         let n = self.layer1.read(file_offset, &mut full_block)?;
@@ -380,15 +386,21 @@ impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlockLayer
         // Copy requested sub-region to caller's buffer
         buf.copy_from_slice(&full_block[offset..offset + buf.len()]);
 
-        // Only cache if caching is enabled and we got a complete block read
-        if CACHE_BUDGET_BYTES > 0 && n == block_size {
+        // Only cache if caller requested caching and we got a complete block read
+        if cache && CACHE_BUDGET_BYTES > 0 && n == block_size {
             self.thread_cache().borrow_mut().put(index, full_block);
         }
 
         Ok(buf.len())
     }
 
-    fn write_block(&self, index: u64, offset: usize, buf: &[u8]) -> Result<usize, SfsError> {
+    fn write_block(
+        &self,
+        index: u64,
+        offset: usize,
+        buf: &[u8],
+        cache: bool,
+    ) -> Result<usize, SfsError> {
         let block_size = self.block_size();
         if offset + buf.len() > block_size {
             return Err(SfsError::IoError(format!(
@@ -403,10 +415,10 @@ impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlockLayer
         let file_offset = self.block_offset(index) + offset as u64;
         self.layer1.write(file_offset, buf)?;
 
-        // Update cache if this block is cached (keep cache coherent for same-thread reads)
-        if CACHE_BUDGET_BYTES > 0 {
-            let mut cache = self.thread_cache().borrow_mut();
-            if let Some(cached_block) = cache.get_mut(&index) {
+        // Update cache if caller requested caching and block is already cached
+        if cache && CACHE_BUDGET_BYTES > 0 {
+            let mut lru = self.thread_cache().borrow_mut();
+            if let Some(cached_block) = lru.get_mut(&index) {
                 cached_block[offset..offset + buf.len()].copy_from_slice(buf);
             }
             // If not in cache, don't insert — we only have partial data

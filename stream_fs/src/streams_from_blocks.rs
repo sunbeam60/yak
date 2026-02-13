@@ -173,7 +173,7 @@ fn read_block_index<L2: BlockLayer>(
     let biw = block_index_width as usize;
     let offset = (slot as usize) * biw;
     let mut buf = [0u8; 8];
-    layer2.read_block(redirector_block, offset, &mut buf[..biw])?;
+    layer2.read_block(redirector_block, offset, &mut buf[..biw], true)?;
     Ok(u64::from_le_bytes(buf))
 }
 
@@ -188,7 +188,7 @@ fn write_block_index<L2: BlockLayer>(
     let biw = block_index_width as usize;
     let offset = (slot as usize) * biw;
     let bytes = index.to_le_bytes();
-    layer2.write_block(redirector_block, offset, &bytes[..biw])?;
+    layer2.write_block(redirector_block, offset, &bytes[..biw], true)?;
     Ok(())
 }
 
@@ -282,7 +282,7 @@ fn ensure_capacity<L2: BlockLayer>(
         let invalid_bytes = block_sentinel(block_index_width).to_le_bytes();
         for slot in 1..fan_out {
             let offset = (slot as usize) * biw;
-            layer2.write_block(new_redirector, offset, &invalid_bytes[..biw])?;
+            layer2.write_block(new_redirector, offset, &invalid_bytes[..biw], true)?;
         }
         current_top = new_redirector;
     }
@@ -347,7 +347,7 @@ fn write_block_at_index<L2: BlockLayer>(
             let invalid_bytes = block_sentinel(block_index_width).to_le_bytes();
             for s in 0..fan_out {
                 let offset = (s as usize) * biw;
-                layer2.write_block(child, offset, &invalid_bytes[..biw])?;
+                layer2.write_block(child, offset, &invalid_bytes[..biw], true)?;
             }
             write_block_index(layer2, current_block, slot, child, block_index_width)?;
         }
@@ -398,6 +398,7 @@ fn pyramid_read<L2: BlockLayer>(
             data_block,
             offset,
             &mut buf[bytes_read..bytes_read + chunk_len],
+            false,
         )?;
         bytes_read += n;
         current_pos += n as u64;
@@ -458,6 +459,7 @@ fn pyramid_write<L2: BlockLayer>(
             data_block,
             offset,
             &buf[bytes_written..bytes_written + chunk_len],
+            false,
         )?;
         bytes_written += n;
         current_pos += n as u64;

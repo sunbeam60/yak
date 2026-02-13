@@ -71,13 +71,29 @@ pub trait BlockLayer: Send + Sync {
 
     /// Read from a block at the given offset within the block.
     /// `offset + buf.len()` must not exceed `block_size`.
+    /// When `cache` is true, the block may be served from and stored in the
+    /// block cache. When false, the cache is bypassed entirely.
     /// Returns the number of bytes actually read.
-    fn read_block(&self, index: u64, offset: usize, buf: &mut [u8]) -> Result<usize, SfsError>;
+    fn read_block(
+        &self,
+        index: u64,
+        offset: usize,
+        buf: &mut [u8],
+        cache: bool,
+    ) -> Result<usize, SfsError>;
 
     /// Write to a block at the given offset within the block.
     /// `offset + buf.len()` must not exceed `block_size`.
+    /// When `cache` is true, any cached copy of this block is kept coherent.
+    /// When false, the cache is not consulted or updated.
     /// Returns the number of bytes actually written.
-    fn write_block(&self, index: u64, offset: usize, buf: &[u8]) -> Result<usize, SfsError>;
+    fn write_block(
+        &self,
+        index: u64,
+        offset: usize,
+        buf: &[u8],
+        cache: bool,
+    ) -> Result<usize, SfsError>;
 
     /// Get the `HeaderSlotId` for the `index`-th upper layer section.
     ///

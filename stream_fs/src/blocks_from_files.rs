@@ -281,9 +281,10 @@ impl BlockLayer for BlocksFromFiles {
             .map_err(|e| SfsError::IoError(format!("failed to create block {}: {}", id, e)))?;
 
         state.next_block_id += 1;
-        let next_id = state.next_block_id;
+        // Persist before releasing the mutex, so other threads cannot observe
+        // the updated in-memory state until the metadata is written.
+        self.persist_meta(state.next_block_id)?;
         drop(state);
-        self.persist_meta(next_id)?;
         Ok(id)
     }
 

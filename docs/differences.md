@@ -4,33 +4,12 @@ Last reviewed: 2026-02-14
 
 # Major Differences
 
-## L2 doesn't flush before exiting critical section
+## L2 doesn't fsync before exiting critical section
 Architecture says (architecture.md line 400, "Thread safety in L2" section): "before code exits the critical section that modifies the free block list, changes to the file are flushed to disk."
 
-Code: Both `allocate_blocks` and `deallocate_block` drop the mutex *before* calling `persist_l2_header()`. The header write happens, but it is not guaranteed to be on disk before other threads see the updated in-memory state. No `flush()` call exists anywhere in the L1 trait or its implementation. A crash between the mutex release and the header persist could leave the free list inconsistent.
+Code: `allocate_blocks` and `deallocate_block` now persist the L2 header *inside* the mutex, so no thread can observe updated in-memory state before the header write completes. However, there is no `fsync()` call — the write reaches the OS page cache but is not guaranteed durable on disk. A power loss or kernel panic (not a normal process crash) could leave the free list inconsistent. This is an accepted trade-off: SFS is explicitly not ACID, and fsync would impose significant performance cost for durability guarantees most users don't need.
 
 # Minor Differences
-
-## L1 uses explicit offsets, not a read/write head
-Architecture says (architecture.md lines 412-419, "L1 API" section) L1 should expose: "Position the read/write head", "Writing to a file", "Reading from a file"
-
-Code: `FileLayer::read(&self, offset: u64, buf)` and `write(&self, offset: u64, data)` take explicit offsets. No head position concept exists. This is arguably better (stateless, thread-safe), but differs from the described API.
-
-## L2 header stores block_size_shift, not block size in bytes
-Architecture says (architecture.md line 161, header layout diagram): "L2: length | L2 identifier | L2 version | block size (bytes) | block index size (bytes)"
-
-Code: Stores `bss: u8` (shift exponent) and `biw: u8` (width in bytes). The block size is derived as `1 << bss`. More compact but not the literal "block size in bytes" described in the architecture.
-
-## L2 batch allocation skips free-list linking
-Architecture says (architecture.md line 393, "Reusing blocks" section): "L2 instead expands by one or more free blocks, links them together by writing the index of the next block into the start of each block, and then allocates a free block from this newly formed list."
-
-Code: `allocate_blocks(count)` grows the file once for all needed blocks and returns them directly without first chaining them into the free list. This is more efficient (fewer writes) but skips the described mechanism of linking new blocks into a free list before allocating from it.
-
-## Condvar instead of RwLock for Streams stream
-Architecture says (architecture.md lines 360-362, "Thread safety in L3" section): "it is guarded to prevent multiple threads attempting to modify this stream at the same time. If one thread is modifying the Streams stream, and another thread needs to do the same at the same time, the second thread is put to sleep until the first thread is done with the modification."
-Note: the previously quoted text ("protecting this stream by either a reader/writer or a RWLock") does not appear in the current architecture.md. The architecture describes the behaviour but does not name a specific synchronisation primitive.
-
-Code: Uses `Condvar + Mutex` with a `HashMap<u64, LockState>` instead of RwLock. This was a deliberate redesign to unify blocking/non-blocking lock acquisition. Achieves the same goal differently.
 
 ## BlocksFromFiles mock has no free list
 Architecture says (architecture.md lines 385-393, "Reusing blocks" section) L2 must maintain a free list.
@@ -52,21 +31,33 @@ Architecture originally said: "In debug builds, L2 must maintain tracking over w
 
 Code: Instead of `#[cfg(debug_assertions)]` runtime tracking, a `verify()` chain (L4 -> L3 -> L2 -> L1) validates cross-layer integrity on demand. L4 walks the directory tree to collect stream IDs, L3 walks pyramid structures to collect block IDs, L2 cross-checks against the free list. This is arguably better: it catches orphaned blocks, free-list cycles, and stream/block mismatches in any build, not just debug builds.
 
+## L1 head position vs offsets — RESOLVED
+Previously listed as minor. Architecture updated: L1 API (architecture.md lines 412-419) no longer describes a read/write head. The offset-based API (`read(&self, offset, buf)`, `write(&self, offset, data)`) is now the intended design.
+
+## L2 header stores shift exponent — RESOLVED
+Previously listed as minor. Architecture updated: header layout diagram (architecture.md line 161) now says `block size shift | block index size shift`, matching the implementation's `bss: u8` and `biw: u8` fields.
+
+## L2 batch allocation skips free-list linking — RESOLVED
+Previously listed as minor. Architecture updated: (architecture.md line 393) now says "L2 instead expands creates the missing blocks and returns these", no longer mandating that new blocks be linked into the free list before allocation.
+
+## Condvar instead of RwLock for Streams stream — RESOLVED
+Previously listed as minor. Architecture (architecture.md lines 360-362) describes the required behaviour (mutual exclusion, sleeping threads) but does not prescribe a specific synchronisation primitive. The `Condvar + Mutex` implementation achieves exactly the described behaviour.
+
 # Summary Table
 
 |     | Area              | Architecture                  | Code                              | Severity |
 | --- | ----------------- | ----------------------------- | --------------------------------- | -------- |
 | 1   | Sfs::close        | Flush open handles            | close() + Drop impl              | Resolved |
-| 2   | L2 flush          | Before mutex release          | After mutex release, no flush()   | Major    |
-| 3   | L1 head position  | Explicit head API             | Offset-based (stateless)          | Minor    |
-| 4   | L2 block size     | Bytes in header               | Shift exponent                    | Minor    |
-| 5   | L2 batch alloc    | Link into free list, then use | Direct return, skip free list     | Minor    |
-| 6   | Streams lock      | RwLock                        | Condvar+Mutex                     | Minor    |
+| 2   | L2 flush          | Flushed to disk               | Written inside mutex, no fsync    | Minor    |
+| 3   | L1 head position  | Offset-based (updated)        | Offset-based (stateless)          | Resolved |
+| 4   | L2 block size     | Shift exponent (updated)      | Shift exponent                    | Resolved |
+| 5   | L2 batch alloc    | Direct return (updated)       | Direct return, skip free list     | Resolved |
+| 6   | Streams lock      | Behaviour-based (no primitive) | Condvar+Mutex                    | Resolved |
 | 7   | Mock free list    | Required                      | Mock skips it                     | Minor    |
 | 8   | L4 reserve        | Required                      | Implemented                       | Resolved |
 | 9   | L2 debug tracking | Required in debug builds      | verify() chain instead            | Resolved |
 
-Items 3 and 6 were conscious implementation trade-offs that are arguably better than the architecture describes. Items 1, 8, and 9 are resolved. Item 2 is the remaining genuine gap — it could cause free-list corruption on crash during concurrent use.
+Items 2 and 7 are minor gaps. Item 2 (no fsync) is an accepted trade-off — the mutex ordering is now correct, and only a kernel panic or power loss could cause inconsistency. Item 7 is acceptable (mock-only divergence). All other items are resolved, either by code changes or by architecture updates.
 
 # Conformance notes
 

@@ -297,11 +297,11 @@ impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlockLayer
             self.layer1.write(self.block_offset(block_id), &zeros)?;
         }
 
-        // Phase 4: persist L2 header once
-        let total = state.total_blocks;
-        let free = state.free_list_head;
+        // Phase 4: persist L2 header before releasing the mutex, so other
+        // threads cannot observe the updated in-memory state until the header
+        // is written.
+        self.persist_l2_header(state.total_blocks, state.free_list_head)?;
         drop(state);
-        self.persist_l2_header(total, free)?;
 
         // Phase 5: evict allocated blocks from thread-local cache.
         // These blocks may have stale data from a previous incarnation
@@ -327,12 +327,12 @@ impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlockLayer
 
         // Update free_list_head to point to this block
         state.free_list_head = index;
-        let total = state.total_blocks;
-        let new_head = state.free_list_head;
-        drop(state);
 
-        // Persist updated L2 header
-        self.persist_l2_header(total, new_head)?;
+        // Persist updated L2 header before releasing the mutex, so other
+        // threads cannot observe the updated in-memory state until the header
+        // is written.
+        self.persist_l2_header(state.total_blocks, state.free_list_head)?;
+        drop(state);
 
         // Evict deallocated block from thread-local cache.
         // Block content is now a free-list pointer, not useful data.

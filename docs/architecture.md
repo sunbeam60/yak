@@ -79,9 +79,9 @@ Layer 2 manages blocks. It provides to Layer 3 a new, unused block when requeste
 
 In short, Layer 2 answers the question: Can you build numbered blocks out of a storage abstraction that behaves like a file?
 
-### Layer 1: File system abstraction
+### Layer 1: File abstraction
 
-At this layer, real file system access is shielded away from Layer 2. This layer can create a storage representation that acts like a fie on the underlying storage system, which it wraps away in some handle that is provided to Layer 2. At Layer 1, functions exist to create a storage representation, write to it, read from it, reposition the reading/writing head and shorten the storage representation. Layer 2 never touches the underlying file system directly; instead of works with Layer 1 to modify the underlying SFS storage.
+At this layer, real file system access is shielded away from Layer 2. This layer can create a storage representation that acts like a file on the underlying storage system, which it wraps away in some handle that is provided to Layer 2. At Layer 1, functions exist to create a storage representation, write to it, read from it, reposition the reading/writing head, reading/writing layer header data and shorten the storage representation. Layer 2 never touches the underlying file system directly; instead of works with Layer 1 to modify the underlying SFS storage.
 
 In short, Layer 1 answers the question: Can the underlying storage be represented like a file, which can be locked, written to and read from.
 
@@ -94,6 +94,8 @@ Because Layer 4 and Layer 1 operate on the same constructs - files and directori
 This reveals some interesting opportunities, such as:
 
 - One SFS file could be operating on top of a real file system, using very large blocks (say 512 kb). Large data streams could be written directly to this SFS file. For smaller data streams, a stream inside this SFS file (say "small_files.sfs") could operate with much smaller blocks (say 4 kb) to store small files. Whenever this small_files SFS file needed to expand to accommodate more small files, it would grow the small_files.efs data stream, in effect obtaining more 512 kb blocks to parcel out to in 1 kb increments.
+
+- In addition to stream names stored in directory blocks at L4, an "extended attribute" stream could tie a property-value system together with the streams, hiding the properties away from the normal stream hierarchy.
 
 - One SFS with large-ish blocks (e.g. 64 kb) file could use a custom Layer 2 (block storage layer) that, instead of storing its blocks through a Layer 1 file representation like normal, compressed and stored the 64 kb blocks it handled in an SFS file (with each block simply given its block number as a name) with much smaller blocks (say 4kb), thereby enabling real-time, transparent compression/decompression (and possibly encryption) of blocks.
 
@@ -151,26 +153,24 @@ An API is provided to create a new SFS file. This takes in a L3 type, a L2 type 
 
 An API is also provided to open an existing SFS file, also taking in L3, L2 and L1 types. When opening a file, a caller must specify either for reading - in which case other processes can also open the file for reading - or for writing - in which no other process can. This is handled by L1 file locking calls.
 
-When the four layers instantiate for creation, they each pass down a header (in layer order 4, 3, 2 and 1) as a byte array. Ultimately, on L1, the file is created writing out the byte arrays in the oppositive order (1, 2, 3 and then 4). What these headers contain is up to each layer, but all layer headers must start with a length descriptor. In a normal SFS file that uses the layers defined by the SfsDefault type, the layout is as follows:
+When the four layers instantiate for creation, they request through L1 a "header slot", indicating how much data the layer needs to store in its header. When the header slot has been allocated by L1, each layer can read and write their header slot, passing in a byte array. What these headers contain is up to each layer; L1 transparently manages slot reading/writing and the guarding of the integrity of the headers. In a normal SFS file that uses the layers defined by the SfsDefault type, the layout is as follows:
 
 ```
-Magic: File magic header | header layout version | total header length
+Magic: File magic header | header layout version | total layer header length
 L1: length | L1 identifier | L1 version
-L2: length | L2 identifier | L2 version | block size (bytes) | block index size (bytes)
+L2: length | L2 identifier | L2 version | block size shift | block index size shift
 L3: length | L3 identifier | L3 version | Streams stream descriptor
 L4: length | L4 identifier | L4 version | root directory stream index
 ```
 
-The `total header length` in the magic section records the total size of all headers, which equals the data offset where block data begins in the file (immediately after L4's section). Any layer can read this from the magic section to find the definitive boundary between headers and data.
+The `total layer header length` in the magic section records the total size of all the layer headers, which equals the data offset where block data begins in the file (immediately after L4's section). 
 
 When a SFS file is opened, L1 (as it opens the file) checks the file magic header and the header layout version to ensure it can read the headers. This ensures that:
 
 * This is indeed an SFS file, and
 * The layout of the headers follows a form that the code can read (in this version it's simply "the length of all headers is stored immediately after the version number" and "each layer header is preceded by a length")
 
-Assuming that it can, it reads the entire header section in and reads the L1 header section (whose length is encoded in the section's length field) so it can validate the L1 identifier.
-
-Each layer pops a header from the stack and compares it to what this layer expects to find, reading in the necessary information from the header to initialise this layer.
+Assuming that it can, L1 continues and provides to the upper layer an ability for each layer to locate its header slot, so they can read their own headers to initialse.
 
 If all layers have found a header they are capable of handling, the file has successfully opened.
 
@@ -201,7 +201,7 @@ Two types of streams exist inside of an SFS file: Directory streams and data str
 
 Data streams contain the data that a caller has written to the SFS file, with no padding, nothing added, nothing taken away.
 
-Directory streams associate stream identifiers with a name, using a "stream entry" structure, e.g.
+Directory streams are used to provide an addressing system for the data streams. It associates stream identifiers with a name, using a "stream entry" structure, e.g.
 
 | Stream entry no. | Stream identifier | Name              |
 | ---------------- | ----------------- | ----------------- |
@@ -218,13 +218,13 @@ When an existing SFS file is opened, it reads the root directory stream index nu
 
 #### Stream entry management
 
-Since stream entries can have variable length names, when they are serialised to a directory stream, each entry has its length prepended, so that the stream entries look as follows:
+Since stream entries can have variable length names, when they are serialised to a directory stream, each entry has its length prepended (2 bytes, providing space for 64k of naming), so that the stream entries look as follows:
 
 ```
 | length | identifier | name.............. | length | identifier | name.... | length | identifier | name......................| length | identifier | name... |
 ```
 
-The length field for each entry includes its own size, i.e. if the length field was a uint16, the stream identifier a uint32 and the name was 12 bytes, the length would be 2 + 4 + 12 = 18 bytes.
+The length field for each entry includes its own size, i.e. since the length field is a uint16, the stream identifier a uint32 and the name was 12 bytes, the length would be 2 + 4 + 12 = 18 bytes.
 
 When an entry is deleted from this stream, all the following entries are copied upwards in the stream and the stream is shortened, i.e.:
 
@@ -326,14 +326,11 @@ Accordingly, the lifetime of a new and growing data stream is as follows:
    3. The first index in this new top block is, of course, the index of the old top block (Fig 4, block 140, observe index 15). The second index in the new top block is the new redirector block (Fig 4, block 140, observe index 11). In this way, we've increased the height of the data structure by one more.
 5. As more and more stream data is written, the level of redirector blocks grow, from 0 (no redirectors), to 1 and beyond. The more data blocks we need to store, the "taller" the hierarchy of redirector blocks becomes.
 
-The corollary case of a truncated stream is relatively simple; start at the new top (most often a redirector node)
-
-```ASCII
-```
+The corollary case of a truncated stream is relatively simple; start at the new top (most often a redirector node), free everything not associated with the redirector hierarchy from this node downward. If, at the end, the top node is a redirector node with only one entry, also free this node. Finally, point the stream decription's "top block" to point to the top of the new node hiearrchy.
 
 #### Rationale
 
-The "pyramid shaped" block linking layout has a number of advantages:
+The "pyramid" block linking layout has a number of advantages:
 
 * The number of redirection blocks are kept minimal and for very small data streams even kept at 0.
 * The lookup time for finding a random point in the stream is O(log n).
@@ -342,11 +339,11 @@ The "pyramid shaped" block linking layout has a number of advantages:
 * Even with relatively small block sizes a *large* data stream can be tracked with low depth of tracking blocks. For example, if blocks are 4 kb and uint32 indices, an SFS stream can can grow to 4+ GB before needing a third redirector level.
 
 #### Reserved length
-For clarity of explanation, the explanation above does not deal with reserved capacity of a stream. A stream can be extended into being longer than needed to store the data in the stream. This enables long writes to pre-allocate the necessary blocks instead of the stream going through iterative enlargement, and it often promotes data blocks being allocated next to each other.
+For clarity of explanation, the explanation above does not deal with reserved capacity of a stream. A stream can be extended into being longer than needed to store the data in the stream. This enables long writes to pre-allocate the necessary blocks instead of the stream going through a slower, more iterative enlargement, and it often promotes data blocks being allocated next to each other.
 
 So while the explanation above is correct, it leaves out the fact that a stream descriptor actually has 3 fields: Top block, size and reserved, and that the resulting pyramid can therefore be larger than it needs to be to strictly hold the user-written data.
 
-When a stream is truncated, all blocks - including those in any extended reserve - are returned as free blocks.
+When a stream is truncated, all blocks - including those in any extended reserve - are returned as free blocks, in effect making the stream's size and reserved size very near to each other (reserved will include the unwritten space in the last data block).
 
 ### Tracking streams in L3
 
@@ -354,7 +351,7 @@ L3 has a list of Stream Descriptors for all streams that exist. This list itself
 
 When a new stream is created by a caller, we need to create a new Stream Descriptor. All Stream Descriptors are written into the Streams stream, which is expanded and contracted like every other stream. The Streams stream is of course initialised with 0 Stream Descriptors, because no other streams exist. As other streams are created, the Streams stream expands to hold these other Stream Descriptors.
 
-Eventually some streams are deleted and the Stream Descriptor in Streams is marked free by writing a magic 0xFFFF.... value in the Top Block (this of course means the very highest block available in the SFS file cannot be used as its index is used to denote something special).
+Eventually some streams are deleted and the associated Stream Descriptor in Streams is marked free by writing a magic 0xFFFF.... value in the Top Block (this of course means the very highest block available in the SFS file cannot be used as its index is used to denote something special).
 
 One possible optimization is to maintain a free list of streams. For now, a sequential scan of the Streams stream for a free stream descriptor is acceptable. If a free stream descriptor is not found, the Streams stream is enlarged (written to) with a new, unused stream descriptor.
 
@@ -362,7 +359,7 @@ One possible optimization is to maintain a free list of streams. For now, a sequ
 
 Streams must be opened and closed like regular files before they can written to and read from, including the Streams stream. This is to track that there is at most one active writer (with no readers) or many active readers (with no writer). The list of active readers and writers per stream, which is not exposed directly to L4, but kept internally and found from the stream handle that L3 exposes to L4, must be guarded with mutex to avoid the multi-threaded creation of simultaneous readers and writer.
 
-Since the Streams stream will be accessed by multiple threads (for example, to create a writable stream in two separate threads, ie.e two writers, one in each thread), the Streams stream must be protected. We cannot do this using a regular writer handle, as that will fail, rather than wait, if other threads have got readers on the Streams stream. So instead we must separate the concern of having a cursor into a stream (which is used to walk the block hierarchy of redirectors - if any - until arriving at a data block) and protecting this stream by either a reader/writer or a RWLock, where the calling thread awaits access to the Streams stream. In other words, it is now the handle to the stream that knows how to walk the block hierarchy, because we need similar functionality in the Streams stream (which we will access "raw", using the RWLock).
+The Streams stream need modication every time a stream is created or deleted. Because many threads can do that at the same time, it is guarded to prevent multiple threads attempting to modify this stream at the same time. If one thread is modifying the Streams stream, and another thread needs to do the same at the same time, the second thread is put to sleep until the first thread is done with the modification. A separate, non-public L3 API enables L4 to read and write in a blocking fashion to ensure multiple threads do modifications to the Streams stream in an orderly fashion.
 
 ## L2: Blocks
 
@@ -381,27 +378,34 @@ L2's API, which is used by L3, concerns itself with creating, managing and retur
 
 The management of blocks in L2 assumes nothing about "transactions" that modify multiple blocks. It is assumed that L3, where streams are managed, will appropriately handle access to a stream by multiple threads and that block writes are dispatched by L3 in the right order. Only a single writer can exist per stream at a time (as per SFS's thread/process safety constraints) so any writes to blocks in a stream will be guarded by L3.
 
-Which block is allocated to which stream is untracked in L2. It is assumed that L3 remembers what blocks it has been given and what blocks it is handing back. In release builds, L2 doesn't perform any checking what whether it *should* be writing a block, or returning a block to the free list. In other words, L3 is responsible for the integrity of block management. In debug builds, however, L2 must maintain tracking over which blocks it believes are in use and check, when asked to write, read or deallocate a block that the block has previously been allocated.
+Which block is allocated to which stream is untracked in L2. It is assumed that L3 remembers what blocks it has been given and what blocks it is handing back. L2 doesn't perform any checking what whether it *should* be writing a block, or returning a block to the free list. In other words, L3 is responsible for the integrity of blocks only being assigned to one stream, or available.
 
 #### Reusing blocks
 
 When a block is deallocated, it will often be in the middle of the underlying file that L1 is managing. For efficiency, blocks are reused by way of keeping a free list of blocks.
 
-L2 has a "first free" block index, which points to the first free block it's aware of (using 0xFFFF... to indicate there isn't a free block available). At the beginning of that first free block is written the index of the next free block, which is turn points to the next free block, and so on, until there are no more free blocks, indicated by 0xFFFF...
+L2 has a "first free" block index in its L2 header, which points to the first free block in the SFS file (using 0xFFFF... when there is no free block available). In the first bytes of of first free block is written the index of the next free block, which is turn points to the next free block, and so on, until there are no more free blocks, indicated by 0xFFFF...
 
-In that way, when L2 initialises on a new file, it writes 0xFFFF... in the "first free" block index.
+In that way, when L2 initialises on a new file, it writes 0xFFFF... in the "first free" block index, because there are no free blocks in the SFS file.
 
 When a block is deallocated, Layer two writes the block index of the previously "first free" block into the deallocated block (even if that is 0xFFFF as that would then terminate the linked list of blocks) and writes the index of the deallocated block into the "first free".
 
-Similarly, when a new block needs allocating, L2 looks up the "first free block" and, if it's not 0xFFFF..., reads the index of the next free block from this block, placing it in the "first free" variable before returning the index of the previous "first free" block. If the "first free" is 0xFFFF, however, L2 instead expands by one or more free blocks, links them together by writing the index of the next block into the start of each block, and then allocates a free block.
+Similarly, when a new block needs allocating, L2 looks up the "first free block" and, if it's not 0xFFFF..., reads the index of the next free block from this block, placing it in the "first free" variable before returning the index of the previous "first free" block. If the "first free" is 0xFFFF, however, L2 instead expands creates the missing blocks and returns these.
+
+### Block caching
+L2 will often be requested to write and (especially) read the same block over and over again. This is most often the case when data is being written or read to a larger stream (i.e. a stream that must use redirector blocks) and the redirector blocks need constant access to locate the data in the stream. L2 therefore manages a write-through cache of blocks and it provides to L3 a way to use this write-through cache for some blocks, while not for others. As L3 writes or reads redirector blocks, it asks L2 to place and read these blocks in the write through cache. Then, when L3 comes to read the redirector blocks, it is instead served from the in-memory cache and placed in the read-through cache before being written to disk. The actual data written/read to a stream circumvents the read-through cache, under the assumption that callers know what data they've placed in the SFS file (and therefore won't be asking the SFS file to read that data again) and, when reading, receive a copy of the data stream into their memory bufffer and therefore won't asking to read the same data again.
 
 ### Thread safety in L2
 
 Since multiple threads can attempt to allocate or deallocate blocks at the same time (because different streams from the same SFS file can be opened for writing at the same time), changes to the "first free" variable and associated changes to the underlying SFS file are protected by a mutex - and before code exits the critical section that modifies the free block list, changes to the file are flushed to disk.
 
+The read-through cache is thread-local, i.e. each thread has its own cache. If multiple threads could write to a stream at the same time (which they cannot according to the SFS library's thread safety constraints), this thread-local approach wouldn't work. But since we've defined that only one thread will be writing to one stream at a time, a thread local approach ensures correctness without the need for additional threading synchronization.
+
 ## L1: File system
 
 L1 deals with accessing an underlying file system. Most commonly this would be a real file-system, but adapters could be written for other situations, like writing an SFS file to memory. 
+
+In addition L1 deals with writing, reading and verifying SFS file "magic headers" to enable checking that a valid SFS file has been opened and to allow each layer above L1 to write their management data outside the regular block format.
 
 ### L1 API
 
@@ -409,9 +413,10 @@ L1's API should expose the functions necessary to wrap actual file system calls 
 
 * Creating a file, locking it for exclusive writing
 * Opening a file, locking it either for reading or exclusive writing
-* Position the read/write head
 * Writing to a file
 * Reading from a file
+* Writing a layer header
+* Reading a layer header
 
 ### Thread & process safety in L1
 

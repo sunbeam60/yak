@@ -106,6 +106,7 @@ fn print_bench_usage() {
     eprintln!("  threaded-read    T threads reading streams concurrently");
     eprintln!("  threaded-mixed   T/2 readers + T/2 writers concurrently");
     eprintln!("  churn            Write then delete many streams (5 rounds)");
+    eprintln!("  single-stream    Write + read one 64MB stream (contiguous I/O test)");
     eprintln!("  all              Run all scenarios in sequence");
     eprintln!();
     eprintln!("Options:");
@@ -132,6 +133,7 @@ pub fn cmd_bench(args: &[String]) -> Result<(), ()> {
         "threaded-read" => run_threaded_read(bench_args.bss, bench_args.biw, bench_args.threads),
         "threaded-mixed" => run_threaded_mixed(bench_args.bss, bench_args.biw, bench_args.threads),
         "churn" => run_churn(bench_args.bss, bench_args.biw),
+        "single-stream" => run_single_stream(bench_args.bss, bench_args.biw),
         "all" => run_all(bench_args.bss, bench_args.biw, bench_args.threads),
         other => {
             eprintln!("Unknown bench scenario: {}", other);
@@ -577,6 +579,56 @@ fn run_threaded_mixed(bss: u8, biw: u8, threads: usize) -> Result<(), ()> {
     }
 }
 
+/// Write one large stream then read it back. Times write and read separately.
+/// Designed to measure contiguous block I/O performance.
+fn run_single_stream(bss: u8, biw: u8) -> Result<(), ()> {
+    let _guard = CleanupGuard { path: BENCH_FILE };
+
+    let stream_size = 64 * 1024 * 1024usize; // 64 MB
+    let buf = make_buffer(stream_size);
+
+    // Phase 1: write
+    let sfs = Sfs::create(BENCH_FILE, biw, bss).map_err(|e| eprintln!("Error: {}", e))?;
+    let handle = sfs
+        .create_stream("big.bin")
+        .map_err(|e| eprintln!("Error: {}", e))?;
+
+    let t_write = Instant::now();
+    sfs.write(&handle, &buf)
+        .map_err(|e| eprintln!("Error: {}", e))?;
+    let write_ms = t_write.elapsed().as_secs_f64() * 1000.0;
+
+    sfs.close_stream(handle)
+        .map_err(|e| eprintln!("Error: {}", e))?;
+    sfs.close().map_err(|e| eprintln!("Error closing: {}", e))?;
+
+    // Phase 2: reopen and read back
+    let sfs = Sfs::open(BENCH_FILE, OpenMode::Read).map_err(|e| eprintln!("Error: {}", e))?;
+    let handle = sfs
+        .open_stream("big.bin", OpenMode::Read)
+        .map_err(|e| eprintln!("Error: {}", e))?;
+    let len = sfs
+        .stream_length(&handle)
+        .map_err(|e| eprintln!("Error: {}", e))? as usize;
+    let mut read_buf = vec![0u8; len];
+
+    let t_read = Instant::now();
+    let n = sfs
+        .read(&handle, &mut read_buf)
+        .map_err(|e| eprintln!("Error: {}", e))?;
+    let read_ms = t_read.elapsed().as_secs_f64() * 1000.0;
+
+    sfs.close_stream(handle)
+        .map_err(|e| eprintln!("Error: {}", e))?;
+    sfs.close().map_err(|e| eprintln!("Error closing: {}", e))?;
+
+    let mb = stream_size as f64 / (1024.0 * 1024.0);
+    eprintln!("  write: {:.0} ms  ({:.1} MB/s)", write_ms, mb / (write_ms / 1000.0));
+    eprintln!("  read:  {:.0} ms  ({:.1} MB/s)  [{} bytes]", read_ms, mb / (read_ms / 1000.0), n);
+
+    Ok(())
+}
+
 /// Run all scenarios in sequence.
 fn run_all(bss: u8, biw: u8, threads: usize) -> Result<(), ()> {
     eprintln!("[large-write]");
@@ -602,6 +654,9 @@ fn run_all(bss: u8, biw: u8, threads: usize) -> Result<(), ()> {
 
     eprintln!("[churn]");
     run_churn(bss, biw)?;
+
+    eprintln!("[single-stream]");
+    run_single_stream(bss, biw)?;
 
     Ok(())
 }

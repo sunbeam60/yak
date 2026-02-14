@@ -95,6 +95,66 @@ pub trait BlockLayer: Send + Sync {
         cache: bool,
     ) -> Result<usize, SfsError>;
 
+    /// Read across a run of contiguous block indices in a single operation.
+    ///
+    /// Reads `buf.len()` bytes starting at `offset` within block `start_index`,
+    /// continuing through consecutive blocks as needed. The caller must ensure
+    /// that blocks `start_index` through
+    /// `start_index + (offset + buf.len() - 1) / block_size` are contiguous
+    /// on the underlying storage.
+    ///
+    /// The default implementation splits into per-block `read_block()` calls.
+    /// `BlocksInFile` overrides this with a single L1 read.
+    fn read_contiguous_blocks(
+        &self,
+        start_index: u64,
+        offset: usize,
+        buf: &mut [u8],
+    ) -> Result<usize, SfsError> {
+        let bs = self.block_size();
+        let mut bytes_read = 0;
+        let mut block = start_index;
+        let mut off = offset;
+        while bytes_read < buf.len() {
+            let chunk = (buf.len() - bytes_read).min(bs - off);
+            let n = self.read_block(block, off, &mut buf[bytes_read..bytes_read + chunk], false)?;
+            bytes_read += n;
+            block += 1;
+            off = 0;
+        }
+        Ok(bytes_read)
+    }
+
+    /// Write across a run of contiguous block indices in a single operation.
+    ///
+    /// Writes `buf.len()` bytes starting at `offset` within block `start_index`,
+    /// continuing through consecutive blocks as needed. The caller must ensure
+    /// that blocks `start_index` through
+    /// `start_index + (offset + buf.len() - 1) / block_size` are contiguous
+    /// on the underlying storage.
+    ///
+    /// The default implementation splits into per-block `write_block()` calls.
+    /// `BlocksInFile` overrides this with a single L1 write.
+    fn write_contiguous_blocks(
+        &self,
+        start_index: u64,
+        offset: usize,
+        buf: &[u8],
+    ) -> Result<usize, SfsError> {
+        let bs = self.block_size();
+        let mut bytes_written = 0;
+        let mut block = start_index;
+        let mut off = offset;
+        while bytes_written < buf.len() {
+            let chunk = (buf.len() - bytes_written).min(bs - off);
+            let n = self.write_block(block, off, &buf[bytes_written..bytes_written + chunk], false)?;
+            bytes_written += n;
+            block += 1;
+            off = 0;
+        }
+        Ok(bytes_written)
+    }
+
     /// Get the `HeaderSlotId` for the `index`-th upper layer section.
     ///
     /// Index 0 = first upper section (L3), index 1 = next (L4), etc.

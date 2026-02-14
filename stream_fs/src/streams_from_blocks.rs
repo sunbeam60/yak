@@ -192,27 +192,34 @@ fn write_block_index<L2: BlockLayer>(
     Ok(())
 }
 
-/// Navigate the pyramid to find the data block and offset for a byte position.
-/// Returns (data_block_index, offset_within_block).
-fn navigate_to_position<L2: BlockLayer>(
+/// Scan the leaf redirector to find a run of contiguous physical block indices
+/// starting at `data_block_idx`. Returns (first_physical_block, run_length).
+///
+/// For depth 0 streams (single data block), returns (top_block, 1).
+/// For depth 1+, navigates to the leaf redirector containing `data_block_idx`,
+/// then scans forward for consecutive indices (e.g. 100, 101, 102...).
+fn scan_leaf_run<L2: BlockLayer>(
     layer2: &L2,
     descriptor: &StreamDescriptor,
-    pos: u64,
+    data_block_idx: u64,
     block_size: usize,
     fan_out: u64,
     block_index_width: u8,
-) -> Result<(u64, usize), SfsError> {
+) -> Result<(u64, u64), SfsError> {
     let capacity = descriptor.reserved.max(descriptor.size);
     let num_data_blocks = data_blocks_needed(capacity, block_size);
     let depth = pyramid_depth(num_data_blocks, fan_out);
 
-    let data_block_idx = pos / block_size as u64;
-    let offset_in_block = (pos % block_size as u64) as usize;
+    if depth == 0 {
+        // Single data block — top_block IS the data block
+        return Ok((descriptor.top_block, 1));
+    }
 
+    // Navigate to the leaf redirector (stop one level above data blocks)
     let mut current_block = descriptor.top_block;
     let mut remaining_idx = data_block_idx;
 
-    for level in (0..depth).rev() {
+    for level in (1..depth).rev() {
         let span = fan_out.pow(level);
         let slot = remaining_idx / span;
         remaining_idx %= span;
@@ -220,14 +227,52 @@ fn navigate_to_position<L2: BlockLayer>(
         let child = read_block_index(layer2, current_block, slot, block_index_width)?;
         if child == block_sentinel(block_index_width) {
             return Err(SfsError::IoError(format!(
-                "navigating pyramid: found invalid block at depth {}, slot {}",
+                "scan_leaf_run: invalid block at depth {}, slot {}",
                 level, slot
             )));
         }
         current_block = child;
     }
 
-    Ok((current_block, offset_in_block))
+    // current_block is the leaf redirector; remaining_idx is the slot within it
+    let start_slot = remaining_idx;
+
+    // Read the tail of the redirector from start_slot onward in a single cached read
+    let biw = block_index_width as usize;
+    let start_offset = start_slot as usize * biw;
+    let max_slots_remaining = num_data_blocks - data_block_idx;
+    let slots_in_redirector = fan_out - start_slot;
+    let slots_to_scan = slots_in_redirector.min(max_slots_remaining) as usize;
+    let scan_bytes = slots_to_scan * biw;
+    let mut redir_buf = vec![0u8; scan_bytes];
+    layer2.read_block(current_block, start_offset, &mut redir_buf, true)?;
+
+    // Decode the first index
+    let mut idx_buf = [0u8; 8];
+    idx_buf[..biw].copy_from_slice(&redir_buf[..biw]);
+    let first_block = u64::from_le_bytes(idx_buf);
+    let sentinel = block_sentinel(block_index_width);
+
+    if first_block == sentinel {
+        return Err(SfsError::IoError(format!(
+            "scan_leaf_run: sentinel at data_block_idx {}",
+            data_block_idx
+        )));
+    }
+
+    // Scan forward for consecutive physical block indices
+    let mut run_length: u64 = 1;
+    for i in 1..slots_to_scan {
+        idx_buf = [0u8; 8];
+        idx_buf[..biw].copy_from_slice(&redir_buf[i * biw..(i + 1) * biw]);
+        let idx = u64::from_le_bytes(idx_buf);
+        if idx != first_block + run_length || idx == sentinel {
+            break;
+        }
+        run_length += 1;
+    }
+
+    Ok((first_block, run_length))
 }
 
 /// Ensure the pyramid has enough blocks allocated to cover `target_data_blocks`.
@@ -384,26 +429,32 @@ fn pyramid_read<L2: BlockLayer>(
     let mut current_pos = pos;
 
     while bytes_read < to_read {
-        let (data_block, offset) = navigate_to_position(
+        let data_block_idx = current_pos / block_size as u64;
+        let offset_in_block = (current_pos % block_size as u64) as usize;
+
+        // Scan the leaf redirector for a run of contiguous physical blocks
+        let (first_phys_block, run_length) = scan_leaf_run(
             layer2,
             descriptor,
-            current_pos,
+            data_block_idx,
             block_size,
             fan_out,
             block_index_width,
         )?;
 
-        let chunk_len = (to_read - bytes_read).min(block_size - offset);
-        let n = layer2.read_block(
-            data_block,
-            offset,
-            &mut buf[bytes_read..bytes_read + chunk_len],
-            false,
+        // How many bytes are available in this contiguous run from our position?
+        let bytes_in_run = run_length as usize * block_size - offset_in_block;
+        let chunk = (to_read - bytes_read).min(bytes_in_run);
+
+        let n = layer2.read_contiguous_blocks(
+            first_phys_block,
+            offset_in_block,
+            &mut buf[bytes_read..bytes_read + chunk],
         )?;
         bytes_read += n;
         current_pos += n as u64;
 
-        if n < chunk_len {
+        if n < chunk {
             break; // Short read
         }
     }
@@ -443,28 +494,34 @@ fn pyramid_write<L2: BlockLayer>(
     let mut bytes_written = 0;
     let mut current_pos = pos;
 
-    // write the data, possibly over multiple blocks
+    // Write the data, using contiguous block runs where possible
     while bytes_written < buf.len() {
-        let (data_block, offset) = navigate_to_position(
+        let data_block_idx = current_pos / block_size as u64;
+        let offset_in_block = (current_pos % block_size as u64) as usize;
+
+        // Scan the leaf redirector for a run of contiguous physical blocks
+        let (first_phys_block, run_length) = scan_leaf_run(
             layer2,
             descriptor,
-            current_pos,
+            data_block_idx,
             block_size,
             fan_out,
             block_index_width,
         )?;
 
-        let chunk_len = (buf.len() - bytes_written).min(block_size - offset);
-        let n = layer2.write_block(
-            data_block,
-            offset,
-            &buf[bytes_written..bytes_written + chunk_len],
-            false,
+        // How many bytes are available in this contiguous run from our position?
+        let bytes_in_run = run_length as usize * block_size - offset_in_block;
+        let chunk = (buf.len() - bytes_written).min(bytes_in_run);
+
+        let n = layer2.write_contiguous_blocks(
+            first_phys_block,
+            offset_in_block,
+            &buf[bytes_written..bytes_written + chunk],
         )?;
         bytes_written += n;
         current_pos += n as u64;
 
-        if n < chunk_len {
+        if n < chunk {
             break;
         }
     }

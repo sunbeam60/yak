@@ -264,6 +264,7 @@ impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlockLayer
             state.free_list_head = u64::from_le_bytes(next_buf);
             result.push(block_id);
         }
+        let free_list_count = result.len();
 
         // Phase 2: grow file once for all remaining blocks
         let remaining = count as usize - result.len();
@@ -291,10 +292,13 @@ impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlockLayer
             state.total_blocks += remaining as u64;
         }
 
-        // Phase 3: zero all allocated blocks
-        let zeros = vec![0u8; block_size];
-        for &block_id in &result {
-            self.layer1.write(self.block_offset(block_id), &zeros)?;
+        // Phase 3: zero free-list blocks only (file-growth blocks are already
+        // zero from set_len — guaranteed on Linux, macOS, and Windows)
+        if free_list_count > 0 {
+            let zeros = vec![0u8; block_size];
+            for &block_id in &result[..free_list_count] {
+                self.layer1.write(self.block_offset(block_id), &zeros)?;
+            }
         }
 
         // Phase 4: persist L2 header before releasing the mutex, so other
@@ -424,6 +428,27 @@ impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlockLayer
             // If not in cache, don't insert — we only have partial data
         }
 
+        Ok(buf.len())
+    }
+
+    fn read_contiguous_blocks(
+        &self,
+        start_index: u64,
+        offset: usize,
+        buf: &mut [u8],
+    ) -> Result<usize, SfsError> {
+        let file_offset = self.block_offset(start_index) + offset as u64;
+        self.layer1.read(file_offset, buf)
+    }
+
+    fn write_contiguous_blocks(
+        &self,
+        start_index: u64,
+        offset: usize,
+        buf: &[u8],
+    ) -> Result<usize, SfsError> {
+        let file_offset = self.block_offset(start_index) + offset as u64;
+        self.layer1.write(file_offset, buf)?;
         Ok(buf.len())
     }
 

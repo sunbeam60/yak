@@ -192,30 +192,39 @@ fn write_block_index<L2: BlockLayer>(
     Ok(())
 }
 
-/// Scan the leaf redirector to find a run of contiguous physical block indices
-/// starting at `data_block_idx`. Returns (first_physical_block, run_length).
+/// Fill an entire redirector block with sentinel values in a single write.
+/// Since the sentinel for any block_index_width is all-0xFF bytes,
+/// filling the entire block with 0xFF is correct regardless of slot width.
+fn fill_sentinel<L2: BlockLayer>(
+    layer2: &L2,
+    block: u64,
+    block_size: usize,
+    block_index_width: u8,
+) -> Result<usize, SfsError> {
+    let _ = block_index_width; // sentinel is always all-0xFF regardless of width
+    let buf = vec![0xFFu8; block_size];
+    layer2.write_block(block, 0, &buf, true)
+}
+
+/// Navigate from root to the leaf redirector containing `data_block_idx`.
+/// Returns the block ID of the leaf redirector.
 ///
-/// For depth 0 streams (single data block), returns (top_block, 1).
-/// For depth 1+, navigates to the leaf redirector containing `data_block_idx`,
-/// then scans forward for consecutive indices (e.g. 100, 101, 102...).
-fn scan_leaf_run<L2: BlockLayer>(
+/// For depth 1, the root IS the leaf — returns `descriptor.top_block`.
+/// For depth >= 2, walks through intermediate redirector levels.
+///
+/// Precondition: depth >= 1 (depth 0 has no redirectors).
+fn navigate_to_leaf<L2: BlockLayer>(
     layer2: &L2,
     descriptor: &StreamDescriptor,
     data_block_idx: u64,
-    block_size: usize,
+    depth: u32,
     fan_out: u64,
     block_index_width: u8,
-) -> Result<(u64, u64), SfsError> {
-    let capacity = descriptor.reserved.max(descriptor.size);
-    let num_data_blocks = data_blocks_needed(capacity, block_size);
-    let depth = pyramid_depth(num_data_blocks, fan_out);
-
-    if depth == 0 {
-        // Single data block — top_block IS the data block
-        return Ok((descriptor.top_block, 1));
+) -> Result<u64, SfsError> {
+    if depth <= 1 {
+        return Ok(descriptor.top_block);
     }
 
-    // Navigate to the leaf redirector (stop one level above data blocks)
     let mut current_block = descriptor.top_block;
     let mut remaining_idx = data_block_idx;
 
@@ -227,44 +236,51 @@ fn scan_leaf_run<L2: BlockLayer>(
         let child = read_block_index(layer2, current_block, slot, block_index_width)?;
         if child == block_sentinel(block_index_width) {
             return Err(SfsError::IoError(format!(
-                "scan_leaf_run: invalid block at depth {}, slot {}",
+                "navigate_to_leaf: invalid block at depth {}, slot {}",
                 level, slot
             )));
         }
         current_block = child;
     }
 
-    // current_block is the leaf redirector; remaining_idx is the slot within it
-    let start_slot = remaining_idx;
+    Ok(current_block)
+}
 
-    // Read the tail of the redirector from start_slot onward in a single cached read
+/// Scan a pre-read leaf redirector buffer for a contiguous run of physical
+/// block indices starting at `start_slot`. Returns (first_physical_block, run_length).
+///
+/// The buffer must contain the full leaf block (block_size bytes).
+/// `max_slots` caps how many slots to scan (remaining data blocks in stream).
+/// No allocation, no I/O — purely in-memory.
+fn scan_run_from_buffer(
+    leaf_buf: &[u8],
+    start_slot: u64,
+    max_slots: u64,
+    block_index_width: u8,
+) -> Result<(u64, u64), SfsError> {
     let biw = block_index_width as usize;
-    let start_offset = start_slot as usize * biw;
-    let max_slots_remaining = num_data_blocks - data_block_idx;
-    let slots_in_redirector = fan_out - start_slot;
-    let slots_to_scan = slots_in_redirector.min(max_slots_remaining) as usize;
-    let scan_bytes = slots_to_scan * biw;
-    let mut redir_buf = vec![0u8; scan_bytes];
-    layer2.read_block(current_block, start_offset, &mut redir_buf, true)?;
+    let offset = start_slot as usize * biw;
+    let sentinel = block_sentinel(block_index_width);
 
     // Decode the first index
     let mut idx_buf = [0u8; 8];
-    idx_buf[..biw].copy_from_slice(&redir_buf[..biw]);
+    idx_buf[..biw].copy_from_slice(&leaf_buf[offset..offset + biw]);
     let first_block = u64::from_le_bytes(idx_buf);
-    let sentinel = block_sentinel(block_index_width);
 
     if first_block == sentinel {
         return Err(SfsError::IoError(format!(
-            "scan_leaf_run: sentinel at data_block_idx {}",
-            data_block_idx
+            "scan_run_from_buffer: sentinel at slot {}",
+            start_slot
         )));
     }
 
     // Scan forward for consecutive physical block indices
     let mut run_length: u64 = 1;
+    let slots_to_scan = max_slots as usize;
     for i in 1..slots_to_scan {
+        let pos = offset + i * biw;
         idx_buf = [0u8; 8];
-        idx_buf[..biw].copy_from_slice(&redir_buf[i * biw..(i + 1) * biw]);
+        idx_buf[..biw].copy_from_slice(&leaf_buf[pos..pos + biw]);
         let idx = u64::from_le_bytes(idx_buf);
         if idx != first_block + run_length || idx == sentinel {
             break;
@@ -273,6 +289,77 @@ fn scan_leaf_run<L2: BlockLayer>(
     }
 
     Ok((first_block, run_length))
+}
+
+/// Write data block indices into leaf redirectors in batches.
+///
+/// Instead of writing each data block's index one at a time (with a full
+/// pyramid navigation per block), this groups blocks by their parent leaf
+/// redirector and writes all indices for each leaf in a single `write_block`
+/// call. Intermediate redirectors are allocated on demand and sentinel-filled
+/// in one call each.
+fn batch_fill_leaf_redirectors<L2: BlockLayer>(
+    layer2: &L2,
+    descriptor: &StreamDescriptor,
+    new_blocks: &[u64],
+    starting_data_block_idx: u64,
+    fan_out: u64,
+    block_index_width: u8,
+    depth: u32,
+) -> Result<(), SfsError> {
+    if depth == 0 || new_blocks.is_empty() {
+        return Ok(());
+    }
+
+    let block_size = layer2.block_size();
+    let biw = block_index_width as usize;
+    let sentinel = block_sentinel(block_index_width);
+    let mut i: usize = 0;
+
+    while i < new_blocks.len() {
+        let data_block_idx = starting_data_block_idx + i as u64;
+
+        // Navigate from root to the leaf redirector for this data_block_idx,
+        // allocating intermediate redirectors as needed.
+        let mut current_block = descriptor.top_block;
+        let mut remaining_idx = data_block_idx;
+
+        for level in (1..depth).rev() {
+            let span = fan_out.pow(level);
+            let slot = remaining_idx / span;
+            remaining_idx %= span;
+
+            let mut child = read_block_index(layer2, current_block, slot, block_index_width)?;
+            if child == sentinel {
+                // Allocate new intermediate redirector, fill with sentinels
+                child = layer2.allocate_block()?;
+                fill_sentinel(layer2, child, block_size, block_index_width)?;
+                write_block_index(layer2, current_block, slot, child, block_index_width)?;
+            }
+            current_block = child;
+        }
+
+        // current_block is the leaf redirector; remaining_idx is the start slot
+        let start_slot = remaining_idx as usize;
+        let slots_available = fan_out as usize - start_slot;
+        let blocks_remaining = new_blocks.len() - i;
+        let batch_size = slots_available.min(blocks_remaining);
+
+        // Build a buffer of block indices for this batch
+        let mut buf = Vec::with_capacity(batch_size * biw);
+        for j in 0..batch_size {
+            let bytes = new_blocks[i + j].to_le_bytes();
+            buf.extend_from_slice(&bytes[..biw]);
+        }
+
+        // Write all indices to the leaf in one call
+        let offset = start_slot * biw;
+        layer2.write_block(current_block, offset, &buf, true)?;
+
+        i += batch_size;
+    }
+
+    Ok(())
 }
 
 /// Ensure the pyramid has enough blocks allocated to cover `target_data_blocks`.
@@ -320,15 +407,9 @@ fn ensure_capacity<L2: BlockLayer>(
     let mut current_top = descriptor.top_block;
     for _ in effective_current_depth..target_depth {
         let new_redirector = layer2.allocate_block()?;
-        // The new redirector's first slot points to the old top
+        // Fill entire redirector with sentinels, then set slot 0 to old top
+        fill_sentinel(layer2, new_redirector, block_size, block_index_width)?;
         write_block_index(layer2, new_redirector, 0, current_top, block_index_width)?;
-        // Fill remaining slots with block_sentinel(block_index_width) (already zeroed, but we need 0xFF)
-        let biw = block_index_width as usize;
-        let invalid_bytes = block_sentinel(block_index_width).to_le_bytes();
-        for slot in 1..fan_out {
-            let offset = (slot as usize) * biw;
-            layer2.write_block(new_redirector, offset, &invalid_bytes[..biw], true)?;
-        }
         current_top = new_redirector;
     }
     descriptor.top_block = current_top;
@@ -342,66 +423,17 @@ fn ensure_capacity<L2: BlockLayer>(
     let blocks_needed = target_data_blocks - effective_current;
     if blocks_needed > 0 {
         let new_blocks = layer2.allocate_blocks(blocks_needed)?;
-        for (i, &new_data_block) in new_blocks.iter().enumerate() {
-            let block_idx = effective_current + i as u64;
-            write_block_at_index(
-                layer2,
-                descriptor,
-                block_idx,
-                new_data_block,
-                fan_out,
-                block_index_width,
-                target_depth,
-            )?;
-        }
+        batch_fill_leaf_redirectors(
+            layer2,
+            descriptor,
+            &new_blocks,
+            effective_current,
+            fan_out,
+            block_index_width,
+            target_depth,
+        )?;
     }
 
-    Ok(())
-}
-
-/// Write a data block index into the correct pyramid slot for `data_block_idx`.
-fn write_block_at_index<L2: BlockLayer>(
-    layer2: &L2,
-    descriptor: &StreamDescriptor,
-    data_block_idx: u64,
-    new_block: u64,
-    fan_out: u64,
-    block_index_width: u8,
-    depth: u32,
-) -> Result<(), SfsError> {
-    if depth == 0 {
-        // Top is the data block itself; nothing to write in a redirector
-        return Ok(());
-    }
-
-    let mut current_block = descriptor.top_block;
-    let mut remaining_idx = data_block_idx;
-
-    // Navigate down to the parent redirector of the data block
-    for level in (1..depth).rev() {
-        let span = fan_out.pow(level);
-        let slot = remaining_idx / span;
-        remaining_idx %= span;
-
-        let mut child = read_block_index(layer2, current_block, slot, block_index_width)?;
-        if child == block_sentinel(block_index_width) {
-            // Need to allocate a new redirector at this level
-            child = layer2.allocate_block()?;
-            // Fill with block_sentinel(block_index_width)
-            let biw = block_index_width as usize;
-            let invalid_bytes = block_sentinel(block_index_width).to_le_bytes();
-            for s in 0..fan_out {
-                let offset = (s as usize) * biw;
-                layer2.write_block(child, offset, &invalid_bytes[..biw], true)?;
-            }
-            write_block_index(layer2, current_block, slot, child, block_index_width)?;
-        }
-        current_block = child;
-    }
-
-    // We're at the bottom redirector; write the data block index
-    let slot = remaining_idx;
-    write_block_index(layer2, current_block, slot, new_block, block_index_width)?;
     Ok(())
 }
 
@@ -425,24 +457,48 @@ fn pyramid_read<L2: BlockLayer>(
         return Ok(0);
     }
 
+    let capacity = descriptor.reserved.max(descriptor.size);
+    let num_data_blocks = data_blocks_needed(capacity, block_size);
+    let depth = pyramid_depth(num_data_blocks, fan_out);
+
+    // Depth 0: single data block, no redirectors
+    if depth == 0 {
+        let offset_in_block = (pos % block_size as u64) as usize;
+        return layer2.read_contiguous_blocks(
+            descriptor.top_block,
+            offset_in_block,
+            &mut buf[..to_read],
+        );
+    }
+
+    // Depth >= 1: use leaf caching to avoid re-navigating the same leaf
     let mut bytes_read = 0;
     let mut current_pos = pos;
+    let mut cached_leaf_start: u64 = u64::MAX;
+    let mut leaf_buf = vec![0u8; block_size];
 
     while bytes_read < to_read {
         let data_block_idx = current_pos / block_size as u64;
         let offset_in_block = (current_pos % block_size as u64) as usize;
 
-        // Scan the leaf redirector for a run of contiguous physical blocks
-        let (first_phys_block, run_length) = scan_leaf_run(
-            layer2,
-            descriptor,
-            data_block_idx,
-            block_size,
-            fan_out,
-            block_index_width,
-        )?;
+        // Which leaf does this data block belong to?
+        let leaf_start = (data_block_idx / fan_out) * fan_out;
 
-        // How many bytes are available in this contiguous run from our position?
+        // Only navigate and read the leaf when we cross a leaf boundary
+        if leaf_start != cached_leaf_start {
+            let leaf_block = navigate_to_leaf(
+                layer2, descriptor, data_block_idx, depth, fan_out, block_index_width,
+            )?;
+            layer2.read_block(leaf_block, 0, &mut leaf_buf, true)?;
+            cached_leaf_start = leaf_start;
+        }
+
+        // Scan for contiguous run within the cached leaf buffer
+        let slot_in_leaf = data_block_idx - leaf_start;
+        let max_slots = (num_data_blocks - data_block_idx).min(fan_out - slot_in_leaf);
+        let (first_phys_block, run_length) =
+            scan_run_from_buffer(&leaf_buf, slot_in_leaf, max_slots, block_index_width)?;
+
         let bytes_in_run = run_length as usize * block_size - offset_in_block;
         let chunk = (to_read - bytes_read).min(bytes_in_run);
 
@@ -491,25 +547,52 @@ fn pyramid_write<L2: BlockLayer>(
 
     let old_size = descriptor.size;
 
+    // Compute depth after reserve (pyramid structure is now stable for this write)
+    let capacity = descriptor.reserved.max(descriptor.size);
+    let num_data_blocks = data_blocks_needed(capacity, block_size);
+    let depth = pyramid_depth(num_data_blocks, fan_out);
+
+    // Depth 0: single data block, no redirectors
+    if depth == 0 {
+        let offset_in_block = (pos % block_size as u64) as usize;
+        let n = layer2.write_contiguous_blocks(
+            descriptor.top_block,
+            offset_in_block,
+            buf,
+        )?;
+        let actual_end = pos + n as u64;
+        descriptor.size = actual_end.max(old_size);
+        return Ok(n);
+    }
+
+    // Depth >= 1: use leaf caching to avoid re-navigating the same leaf
     let mut bytes_written = 0;
     let mut current_pos = pos;
+    let mut cached_leaf_start: u64 = u64::MAX;
+    let mut leaf_buf = vec![0u8; block_size];
 
-    // Write the data, using contiguous block runs where possible
     while bytes_written < buf.len() {
         let data_block_idx = current_pos / block_size as u64;
         let offset_in_block = (current_pos % block_size as u64) as usize;
 
-        // Scan the leaf redirector for a run of contiguous physical blocks
-        let (first_phys_block, run_length) = scan_leaf_run(
-            layer2,
-            descriptor,
-            data_block_idx,
-            block_size,
-            fan_out,
-            block_index_width,
-        )?;
+        // Which leaf does this data block belong to?
+        let leaf_start = (data_block_idx / fan_out) * fan_out;
 
-        // How many bytes are available in this contiguous run from our position?
+        // Only navigate and read the leaf when we cross a leaf boundary
+        if leaf_start != cached_leaf_start {
+            let leaf_block = navigate_to_leaf(
+                layer2, descriptor, data_block_idx, depth, fan_out, block_index_width,
+            )?;
+            layer2.read_block(leaf_block, 0, &mut leaf_buf, true)?;
+            cached_leaf_start = leaf_start;
+        }
+
+        // Scan for contiguous run within the cached leaf buffer
+        let slot_in_leaf = data_block_idx - leaf_start;
+        let max_slots = (num_data_blocks - data_block_idx).min(fan_out - slot_in_leaf);
+        let (first_phys_block, run_length) =
+            scan_run_from_buffer(&leaf_buf, slot_in_leaf, max_slots, block_index_width)?;
+
         let bytes_in_run = run_length as usize * block_size - offset_in_block;
         let chunk = (buf.len() - bytes_written).min(bytes_in_run);
 
@@ -528,11 +611,7 @@ fn pyramid_write<L2: BlockLayer>(
 
     // Update size to reflect actual write extent
     let actual_end = pos + bytes_written as u64;
-    if actual_end > old_size {
-        descriptor.size = actual_end;
-    } else {
-        descriptor.size = old_size;
-    }
+    descriptor.size = actual_end.max(old_size);
 
     Ok(bytes_written)
 }

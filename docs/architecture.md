@@ -81,7 +81,7 @@ In short, Layer 2 answers the question: Can you build numbered blocks out of a s
 
 ### Layer 1: File abstraction
 
-At this layer, real file system access is shielded away from Layer 2. This layer can create a storage representation that acts like a file on the underlying storage system, which it wraps away in some handle that is provided to Layer 2. At Layer 1, functions exist to create a storage representation, write to it, read from it, reposition the reading/writing head, reading/writing layer header data and shorten the storage representation. Layer 2 never touches the underlying file system directly; instead of works with Layer 1 to modify the underlying SFS storage.
+At this layer, real file system access is shielded away from Layer 2. This layer can create a storage representation that acts like a file on the underlying storage system, which it wraps away in some handle that is provided to Layer 2. At Layer 1, functions exist to create a storage representation, write to it, read from it, read/write layer header data and shorten the storage representation. Layer 2 never touches the underlying file system directly; instead of works with Layer 1 to modify the underlying SFS storage.
 
 In short, Layer 1 answers the question: Can the underlying storage be represented like a file, which can be locked, written to and read from.
 
@@ -224,7 +224,7 @@ Since stream entries can have variable length names, when they are serialised to
 | length | identifier | name.............. | length | identifier | name.... | length | identifier | name......................| length | identifier | name... |
 ```
 
-The length field for each entry includes its own size, i.e. since the length field is a uint16, the stream identifier a uint32 and the name was 12 bytes, the length would be 2 + 4 + 12 = 18 bytes.
+The length field for each entry includes its own size, i.e. with the length field is a uint16, the stream identifier a uint32 (it can be between 2-8 bytes) and the name was 12 bytes, the length would be 2 + 4 + 12 = 18 bytes.
 
 When an entry is deleted from this stream, all the following entries are copied upwards in the stream and the stream is shortened, i.e.:
 
@@ -393,13 +393,13 @@ When a block is deallocated, Layer two writes the block index of the previously 
 Similarly, when a new block needs allocating, L2 looks up the "first free block" and, if it's not 0xFFFF..., reads the index of the next free block from this block, placing it in the "first free" variable before returning the index of the previous "first free" block. If the "first free" is 0xFFFF, however, L2 instead expands creates the missing blocks and returns these.
 
 ### Block caching
-L2 will often be requested to write and (especially) read the same block over and over again. This is most often the case when data is being written or read to a larger stream (i.e. a stream that must use redirector blocks) and the redirector blocks need constant access to locate the data in the stream. L2 therefore manages a write-through cache of blocks and it provides to L3 a way to use this write-through cache for some blocks, while not for others. As L3 writes or reads redirector blocks, it asks L2 to place and read these blocks in the write through cache. Then, when L3 comes to read the redirector blocks, it is instead served from the in-memory cache and placed in the read-through cache before being written to disk. The actual data written/read to a stream circumvents the read-through cache, under the assumption that callers know what data they've placed in the SFS file (and therefore won't be asking the SFS file to read that data again) and, when reading, receive a copy of the data stream into their memory bufffer and therefore won't asking to read the same data again.
+L2 will often be requested to write and (especially) read the same block over and over again. This is most often the case when data is being written or read to a larger stream (i.e. a stream that must use redirector blocks) and the redirector blocks need constant access to locate the data in the stream. L2 therefore manages a write-through cache of blocks and it provides to L3 a way to use this write-through cache for some blocks, while not for others. As L3 writes or reads redirector blocks, it asks L2 to place and read these blocks in the write through cache. Then, when L3 comes to read the redirector blocks, it is instead served from the in-memory cache and placed in the write-through cache before being written to disk. The actual data written/read to a stream circumvents the write-through cache, under the assumption that callers know what data they've placed in the SFS file (and therefore won't be asking the SFS file to read that data again) and, when reading, receive a copy of the data stream into their memory bufffer and therefore won't asking to read the same data again.
 
 ### Thread safety in L2
 
-Since multiple threads can attempt to allocate or deallocate blocks at the same time (because different streams from the same SFS file can be opened for writing at the same time), changes to the "first free" variable and associated changes to the underlying SFS file are protected by a mutex - and before code exits the critical section that modifies the free block list, changes to the file are flushed to disk.
+Since multiple threads can attempt to allocate or deallocate blocks at the same time (because different streams from the same SFS file can be opened for writing at the same time), changes to the "first free" variable and associated changes to the underlying SFS file are protected by a mutex - and before code exits the critical section that modifies the free block list, changes to the file are written to disk so they're visible by other threads in the same process.
 
-The read-through cache is thread-local, i.e. each thread has its own cache. If multiple threads could write to a stream at the same time (which they cannot according to the SFS library's thread safety constraints), this thread-local approach wouldn't work. But since we've defined that only one thread will be writing to one stream at a time, a thread local approach ensures correctness without the need for additional threading synchronization.
+The write-through cache is thread-local, i.e. each thread has its own cache. If multiple threads could write to a stream at the same time (which they cannot according to the SFS library's thread safety constraints), this thread-local approach wouldn't work. But since we've defined that only one thread will be writing to one stream at a time, a thread local approach ensures correctness without the need for additional threading synchronization.
 
 ## L1: File system
 

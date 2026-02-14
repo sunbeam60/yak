@@ -107,6 +107,7 @@ fn print_bench_usage() {
     eprintln!("  threaded-mixed   T/2 readers + T/2 writers concurrently");
     eprintln!("  churn            Write then delete many streams (5 rounds)");
     eprintln!("  single-stream    Write + read one 64MB stream (contiguous I/O test)");
+    eprintln!("  warm-read        Write then read 2750x10KB streams (same instance, warm cache)");
     eprintln!("  all              Run all scenarios in sequence");
     eprintln!();
     eprintln!("Options:");
@@ -134,6 +135,7 @@ pub fn cmd_bench(args: &[String]) -> Result<(), ()> {
         "threaded-mixed" => run_threaded_mixed(bench_args.bss, bench_args.biw, bench_args.threads),
         "churn" => run_churn(bench_args.bss, bench_args.biw),
         "single-stream" => run_single_stream(bench_args.bss, bench_args.biw),
+        "warm-read" => run_warm_read(bench_args.bss, bench_args.biw),
         "all" => run_all(bench_args.bss, bench_args.biw, bench_args.threads),
         other => {
             eprintln!("Unknown bench scenario: {}", other);
@@ -629,6 +631,51 @@ fn run_single_stream(bss: u8, biw: u8) -> Result<(), ()> {
     Ok(())
 }
 
+/// Write 2750 streams of 10KB, then read them all back using the same Sfs instance.
+/// This tests the benefit of warm block caches across many open/read/close cycles.
+fn run_warm_read(bss: u8, biw: u8) -> Result<(), ()> {
+    let _guard = CleanupGuard { path: BENCH_FILE };
+
+    let stream_count = 2750usize;
+    let stream_size = 10 * 1024usize;
+
+    let sfs = Sfs::create(BENCH_FILE, biw, bss).map_err(|e| eprintln!("Error: {}", e))?;
+    let buf = make_buffer(stream_size);
+
+    // Phase 1: populate (not timed)
+    for i in 0..stream_count {
+        let name = format!("stream_{:04}.bin", i);
+        let handle = sfs
+            .create_stream(&name)
+            .map_err(|e| eprintln!("Error: {}", e))?;
+        sfs.write(&handle, &buf)
+            .map_err(|e| eprintln!("Error: {}", e))?;
+        sfs.close_stream(handle)
+            .map_err(|e| eprintln!("Error: {}", e))?;
+    }
+
+    // Phase 2: read back with warm cache (timed)
+    let t0 = Instant::now();
+    for i in 0..stream_count {
+        let name = format!("stream_{:04}.bin", i);
+        let handle = sfs
+            .open_stream(&name, OpenMode::Read)
+            .map_err(|e| eprintln!("Error: {}", e))?;
+        let len = sfs
+            .stream_length(&handle)
+            .map_err(|e| eprintln!("Error: {}", e))? as usize;
+        let mut read_buf = vec![0u8; len];
+        sfs.read(&handle, &mut read_buf)
+            .map_err(|e| eprintln!("Error: {}", e))?;
+        sfs.close_stream(handle)
+            .map_err(|e| eprintln!("Error: {}", e))?;
+    }
+    eprintln!("  elapsed: {:.0} ms", t0.elapsed().as_secs_f64() * 1000.0);
+
+    sfs.close().map_err(|e| eprintln!("Error closing: {}", e))?;
+    Ok(())
+}
+
 /// Run all scenarios in sequence.
 fn run_all(bss: u8, biw: u8, threads: usize) -> Result<(), ()> {
     eprintln!("[large-write]");
@@ -657,6 +704,9 @@ fn run_all(bss: u8, biw: u8, threads: usize) -> Result<(), ()> {
 
     eprintln!("[single-stream]");
     run_single_stream(bss, biw)?;
+
+    eprintln!("[warm-read]");
+    run_warm_read(bss, biw)?;
 
     Ok(())
 }

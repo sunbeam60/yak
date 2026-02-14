@@ -25,7 +25,8 @@
       "Bash(git push:*)",
       "Bash(C:/Python311/python.exe -m pytest:*)",
       "Bash(cargo check:*)",
-      "Bash(cargo fmt:*)"
+      "Bash(cargo fmt:*)",
+      "Bash(cargo clippy:*)"
     ]
   }
 }

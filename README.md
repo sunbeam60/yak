@@ -4,7 +4,7 @@ A layered file system implementation in Rust that provides a "file system in a f
 
 ## Project Status
 
-**L1: ✅ COMPLETE** (120/120 Python tests + 5 cargo tests)
+**All layers complete** (132 Python tests + 7 cargo tests)
 
 SFS now operates as a true single-file filesystem. All four layers are implemented:
 - ✅ L1 (`FileOnDisk`) — single-file backend with process-level locking via `fs2`
@@ -48,20 +48,27 @@ python -m pytest tests/ -v --burn-seconds=1
 # Create an SFS file
 sfs create mydata.sfs
 
-# Create a directory
+# Directory operations
 sfs mkdir mydata.sfs documents
-
-# Import a file as a stream
-sfs put mydata.sfs localfile.txt documents/readme.txt
+sfs rmdir mydata.sfs documents
+sfs mv-dir mydata.sfs old_name new_name
 
 # List contents (use -r for recursive)
 sfs ls mydata.sfs documents
 
-# Read a stream
+# Stream operations
+sfs put mydata.sfs localfile.txt documents/readme.txt
+sfs get mydata.sfs documents/readme.txt localfile.txt
 sfs cat mydata.sfs documents/readme.txt
+sfs rm mydata.sfs documents/readme.txt
+sfs mv mydata.sfs documents/old.txt documents/new.txt
+sfs info mydata.sfs documents/readme.txt
 
 # Verify integrity
 sfs verify mydata.sfs
+
+# Run benchmarks
+sfs bench <scenario>
 ```
 
 ## Project Structure
@@ -76,12 +83,7 @@ docs/            - Architecture and design documentation
 
 ## Documentation
 
-- [Architecture Overview](docs/architecture.md) - Complete 4-layer architecture
-- [L1 Design](docs/L1.md) - Current phase: single-file backend with FileOnDisk and BlocksInFile
-- [L2 Mock Design](docs/L2_mock.md) - BlockLayer trait and StreamsFromBlocks pyramid linking
-- [L3 Mock Design](docs/L3_mock.md) - StreamLayer trait and StreamsFromFiles
-- [L4 Mock Design](docs/L4_mock.md) - Initial phase: filing abstraction API
-- [Architecture Differences](docs/differences.md) - Divergences from the architecture spec
+- [Architecture Overview](docs/architecture.md) - Complete 4-layer architecture and implementation notes
 - [Project Instructions](.claude/CLAUDE.md) - Development guidelines
 
 ## Architecture Layers
@@ -95,13 +97,13 @@ SFS is built in 4 layers, implemented bottom-up using a "mock first" approach:
 
 ## Current Implementation
 
-SFS operates as a true single-file filesystem (`SfsDefault = Sfs<StreamsFromBlocks<BlocksInFile<FileOnDisk>>>`):
+SFS operates as a true single-file filesystem (`SfsDefault = Sfs<StreamsFromBlocks<BlocksInFile<FileOnDisk, DEFAULT_CACHE_BUDGET_BYTES>>>`):
 - A `.sfs` file is a single binary file on disk
 - L1 (`FileOnDisk`) wraps OS file I/O with exclusive process-level locking via `fs2`
-- L2 (`BlocksInFile`) stores fixed-size blocks within the single file, with a free list for block reuse
+- L2 (`BlocksInFile`) stores fixed-size blocks within the single file, with a free list for block reuse and a write-through cache for redirector blocks
 - L3 (`StreamsFromBlocks`) links blocks into streams using pyramid block linking
 - L4 (`Sfs`) provides the filing abstraction with directories and named streams
-- Header chain: L4 → L3 → L2 → L1 → disk (90 bytes total), each layer with its own section
+- Header chain: L4 → L3 → L2 → L1 → disk, each layer with its own section
 - `block_index_width` and `block_size_shift` are runtime values stored in the header
 - Two-pass create: layers pass placeholder headers down, then rewrite with real values
 - Thread-safe: RWLock on Streams stream + Mutex for bookkeeping + per-stream locking
@@ -115,6 +117,8 @@ SFS operates as a true single-file filesystem (`SfsDefault = Sfs<StreamsFromBloc
 - Stream I/O (read, write, seek, tell, truncate)
 - Multi-block streams with pyramid block linking (depth 0, 1, 2+)
 - Block reuse via free list (singly-linked in block content)
+- Write-through cache for redirector blocks (configurable budget)
+- Stream space reservation to reduce fragmentation
 - Proper locking (one writer OR many readers per stream)
 - Process-level file locking (exclusive access via `fs2`)
 - Thread safety with interior mutability

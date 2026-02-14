@@ -61,7 +61,7 @@ mod tests {
             let sh = sfs.create_stream("hello.txt").unwrap();
             sfs.write(&sh, b"Hello, World!").unwrap();
             sfs.close_stream(sh).unwrap();
-            sfs.close();
+            sfs.close().unwrap();
         }
 
         // Reopen and verify
@@ -73,7 +73,7 @@ mod tests {
             assert_eq!(n, 13);
             assert_eq!(&buf, b"Hello, World!");
             sfs.close_stream(sh).unwrap();
-            sfs.close();
+            sfs.close().unwrap();
         }
     }
 
@@ -140,7 +140,7 @@ mod tests {
         assert_eq!(buf, data);
 
         sfs.close_stream(sh).unwrap();
-        sfs.close();
+        sfs.close().unwrap();
     }
 
     #[test]
@@ -166,7 +166,7 @@ mod tests {
             let issues = sfs.verify().unwrap();
             assert!(issues.is_empty(), "Issues found: {:?}", issues);
 
-            sfs.close();
+            sfs.close().unwrap();
         }
 
         // Reopen read-only and verify
@@ -174,7 +174,7 @@ mod tests {
             let sfs = SfsDefault::open(path_str, OpenMode::Read).unwrap();
             let issues = sfs.verify().unwrap();
             assert!(issues.is_empty(), "Issues found: {:?}", issues);
-            sfs.close();
+            sfs.close().unwrap();
         }
     }
 
@@ -208,7 +208,7 @@ mod tests {
 
             let issues = sfs.verify().unwrap();
             assert!(issues.is_empty(), "Issues: {:?}", issues);
-            sfs.close();
+            sfs.close().unwrap();
         }
 
         // Reopen and verify persistence
@@ -223,7 +223,7 @@ mod tests {
 
             let issues = sfs.verify().unwrap();
             assert!(issues.is_empty(), "Issues: {:?}", issues);
-            sfs.close();
+            sfs.close().unwrap();
         }
     }
 
@@ -263,7 +263,7 @@ mod tests {
             let issues = sfs.verify().unwrap();
             assert!(issues.is_empty(), "Issues: {:?}", issues);
 
-            sfs.close();
+            sfs.close().unwrap();
         }
 
         // Reopen and verify reserved persists
@@ -284,7 +284,7 @@ mod tests {
             let issues = sfs.verify().unwrap();
             assert!(issues.is_empty(), "Issues: {:?}", issues);
 
-            sfs.close();
+            sfs.close().unwrap();
         }
     }
 }

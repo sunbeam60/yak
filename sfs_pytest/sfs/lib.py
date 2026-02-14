@@ -53,7 +53,7 @@ def _load_library():
     lib.sfs_open.restype = ctypes.c_void_p
     lib.sfs_open.argtypes = [ctypes.c_char_p, ctypes.c_int]
 
-    lib.sfs_close.restype = None
+    lib.sfs_close.restype = ctypes.c_int
     lib.sfs_close.argtypes = [ctypes.c_void_p]
 
     # --- Directory operations ---

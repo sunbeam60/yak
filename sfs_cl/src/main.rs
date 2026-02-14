@@ -74,7 +74,10 @@ fn cmd_create(args: &[String]) -> Result<(), ()> {
 
     match Sfs::create(&args[0], 4, 12) {
         Ok(sfs) => {
-            sfs.close();
+            if let Err(e) = sfs.close() {
+                eprintln!("Error closing SFS file: {}", e);
+                return Err(());
+            }
             println!("Created SFS file: {}", args[0]);
             Ok(())
         }
@@ -114,7 +117,10 @@ fn cmd_ls(args: &[String]) -> Result<(), ()> {
         ls_flat(&sfs, dir)
     };
 
-    sfs.close();
+    if let Err(e) = sfs.close() {
+        eprintln!("Error closing SFS file: {}", e);
+        return Err(());
+    }
     result
 }
 
@@ -192,7 +198,10 @@ fn cmd_mkdir(args: &[String]) -> Result<(), ()> {
     match sfs.mkdir(&args[1]) {
         Ok(()) => {
             println!("Created directory: {}", args[1]);
-            sfs.close();
+            if let Err(e) = sfs.close() {
+                eprintln!("Error closing SFS file: {}", e);
+                return Err(());
+            }
             Ok(())
         }
         Err(e) => {
@@ -219,7 +228,10 @@ fn cmd_rmdir(args: &[String]) -> Result<(), ()> {
     match sfs.rmdir(&args[1]) {
         Ok(()) => {
             println!("Removed directory: {}", args[1]);
-            sfs.close();
+            if let Err(e) = sfs.close() {
+                eprintln!("Error closing SFS file: {}", e);
+                return Err(());
+            }
             Ok(())
         }
         Err(e) => {
@@ -246,7 +258,10 @@ fn cmd_mv_dir(args: &[String]) -> Result<(), ()> {
     match sfs.rename_dir(&args[1], &args[2]) {
         Ok(()) => {
             println!("Renamed directory: {} -> {}", args[1], args[2]);
-            sfs.close();
+            if let Err(e) = sfs.close() {
+                eprintln!("Error closing SFS file: {}", e);
+                return Err(());
+            }
             Ok(())
         }
         Err(e) => {
@@ -309,7 +324,10 @@ fn cmd_put(args: &[String]) -> Result<(), ()> {
 
     match sfs.close_stream(handle) {
         Ok(()) => {
-            sfs.close();
+            if let Err(e) = sfs.close() {
+                eprintln!("Error closing SFS file: {}", e);
+                return Err(());
+            }
             Ok(())
         }
         Err(e) => {
@@ -371,7 +389,10 @@ fn cmd_get(args: &[String]) -> Result<(), ()> {
     if let Err(e) = sfs.close_stream(handle) {
         eprintln!("Error closing stream: {}", e);
     }
-    sfs.close();
+    if let Err(e) = sfs.close() {
+        eprintln!("Error closing SFS file: {}", e);
+        return Err(());
+    }
 
     match fs::write(local_file, &buffer) {
         Ok(()) => {
@@ -436,7 +457,10 @@ fn cmd_cat(args: &[String]) -> Result<(), ()> {
     if let Err(e) = sfs.close_stream(handle) {
         eprintln!("Error closing stream: {}", e);
     }
-    sfs.close();
+    if let Err(e) = sfs.close() {
+        eprintln!("Error closing SFS file: {}", e);
+        return Err(());
+    }
 
     if let Err(e) = io::stdout().write_all(&buffer) {
         eprintln!("Error writing to stdout: {}", e);
@@ -463,7 +487,10 @@ fn cmd_rm(args: &[String]) -> Result<(), ()> {
     match sfs.delete_stream(&args[1]) {
         Ok(()) => {
             println!("Deleted stream: {}", args[1]);
-            sfs.close();
+            if let Err(e) = sfs.close() {
+                eprintln!("Error closing SFS file: {}", e);
+                return Err(());
+            }
             Ok(())
         }
         Err(e) => {
@@ -490,7 +517,10 @@ fn cmd_mv(args: &[String]) -> Result<(), ()> {
     match sfs.rename_stream(&args[1], &args[2]) {
         Ok(()) => {
             println!("Renamed stream: {} -> {}", args[1], args[2]);
-            sfs.close();
+            if let Err(e) = sfs.close() {
+                eprintln!("Error closing SFS file: {}", e);
+                return Err(());
+            }
             Ok(())
         }
         Err(e) => {
@@ -524,7 +554,10 @@ fn cmd_verify(args: &[String]) -> Result<(), ()> {
                     println!("  - {}", issue);
                 }
             }
-            sfs.close();
+            if let Err(e) = sfs.close() {
+                eprintln!("Error closing SFS file: {}", e);
+                return Err(());
+            }
             if issues.is_empty() {
                 Ok(())
             } else {
@@ -581,6 +614,9 @@ fn cmd_info(args: &[String]) -> Result<(), ()> {
     println!("Length:   {} bytes", length);
     println!("Reserved: {} bytes", reserved);
     let _ = sfs.close_stream(handle);
-    sfs.close();
+    if let Err(e) = sfs.close() {
+        eprintln!("Error closing SFS file: {}", e);
+        return Err(());
+    }
     Ok(())
 }

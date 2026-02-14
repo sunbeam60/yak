@@ -117,14 +117,25 @@ pub extern "C" fn sfs_open(path: *const c_char, mode: c_int) -> *mut c_void {
     }
 }
 
+/// Close the SFS file, flushing any open stream handles.
+/// Returns 0 on success, -1 on error. The handle is always consumed
+/// regardless of the return value — callers must not reuse it.
+///
 /// # Safety
 /// `handle` must be a valid pointer returned by `sfs_create` or `sfs_open`,
 /// and must not have been closed already.
 #[no_mangle]
-pub extern "C" fn sfs_close(handle: *mut c_void) {
-    if !handle.is_null() {
-        let sfs = unsafe { Box::from_raw(handle as *mut Sfs) };
-        sfs.close();
+pub extern "C" fn sfs_close(handle: *mut c_void) -> c_int {
+    if handle.is_null() {
+        return 0;
+    }
+    let sfs = unsafe { Box::from_raw(handle as *mut Sfs) };
+    match sfs.close() {
+        Ok(()) => 0,
+        Err(e) => {
+            set_last_error(&e.to_string());
+            -1
+        }
     }
 }
 

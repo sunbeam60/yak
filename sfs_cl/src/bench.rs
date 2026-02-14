@@ -164,7 +164,7 @@ fn run_large_write(bss: u8, biw: u8) -> Result<(), ()> {
     }
     eprintln!("  elapsed: {:.0} ms", t0.elapsed().as_secs_f64() * 1000.0);
 
-    sfs.close();
+    sfs.close().map_err(|e| eprintln!("Error closing: {}", e))?;
     Ok(())
 }
 
@@ -187,7 +187,7 @@ fn run_small_write(bss: u8, biw: u8) -> Result<(), ()> {
     }
     eprintln!("  elapsed: {:.0} ms", t0.elapsed().as_secs_f64() * 1000.0);
 
-    sfs.close();
+    sfs.close().map_err(|e| eprintln!("Error closing: {}", e))?;
     Ok(())
 }
 
@@ -231,7 +231,11 @@ fn run_threaded_write(bss: u8, biw: u8, threads: usize) -> Result<(), ()> {
 
     // All threads joined — we are the sole Arc owner
     match Arc::try_unwrap(sfs) {
-        Ok(s) => s.close(),
+        Ok(s) => {
+            if let Err(e) = s.close() {
+                eprintln!("Error closing SFS: {}", e);
+            }
+        }
         Err(_) => eprintln!("Warning: could not unwrap Arc for close"),
     }
 
@@ -263,7 +267,7 @@ fn run_threaded_read(bss: u8, biw: u8, threads: usize) -> Result<(), ()> {
             sfs.close_stream(handle)
                 .map_err(|e| eprintln!("Error: {}", e))?;
         }
-        sfs.close();
+        sfs.close().map_err(|e| eprintln!("Error closing: {}", e))?;
     }
 
     // Phase 2: concurrent reads
@@ -300,7 +304,11 @@ fn run_threaded_read(bss: u8, biw: u8, threads: usize) -> Result<(), ()> {
     eprintln!("  elapsed: {:.0} ms", t0.elapsed().as_secs_f64() * 1000.0);
 
     match Arc::try_unwrap(sfs) {
-        Ok(s) => s.close(),
+        Ok(s) => {
+            if let Err(e) = s.close() {
+                eprintln!("Error closing SFS: {}", e);
+            }
+        }
         Err(_) => eprintln!("Warning: could not unwrap Arc for close"),
     }
 
@@ -347,7 +355,7 @@ fn run_large_read(bss: u8, biw: u8) -> Result<(), ()> {
                 .map_err(|e| eprintln!("Error: {}", e))?;
         }
 
-        sfs.close();
+        sfs.close().map_err(|e| eprintln!("Error closing: {}", e))?;
     }
 
     // Phase 2: read back
@@ -385,7 +393,7 @@ fn run_large_read(bss: u8, biw: u8) -> Result<(), ()> {
     }
     eprintln!("  elapsed: {:.0} ms", t0.elapsed().as_secs_f64() * 1000.0);
 
-    sfs.close();
+    sfs.close().map_err(|e| eprintln!("Error closing: {}", e))?;
     Ok(())
 }
 
@@ -410,7 +418,7 @@ fn run_small_read(bss: u8, biw: u8) -> Result<(), ()> {
             sfs.close_stream(handle)
                 .map_err(|e| eprintln!("Error: {}", e))?;
         }
-        sfs.close();
+        sfs.close().map_err(|e| eprintln!("Error closing: {}", e))?;
     }
 
     // Phase 2: read back
@@ -433,7 +441,7 @@ fn run_small_read(bss: u8, biw: u8) -> Result<(), ()> {
     }
     eprintln!("  elapsed: {:.0} ms", t0.elapsed().as_secs_f64() * 1000.0);
 
-    sfs.close();
+    sfs.close().map_err(|e| eprintln!("Error closing: {}", e))?;
     Ok(())
 }
 
@@ -467,7 +475,7 @@ fn run_churn(bss: u8, biw: u8) -> Result<(), ()> {
     }
     eprintln!("  elapsed: {:.0} ms", t0.elapsed().as_secs_f64() * 1000.0);
 
-    sfs.close();
+    sfs.close().map_err(|e| eprintln!("Error closing: {}", e))?;
     Ok(())
 }
 
@@ -493,7 +501,7 @@ fn run_threaded_mixed(bss: u8, biw: u8, threads: usize) -> Result<(), ()> {
             sfs.close_stream(handle)
                 .map_err(|e| eprintln!("Error: {}", e))?;
         }
-        sfs.close();
+        sfs.close().map_err(|e| eprintln!("Error closing: {}", e))?;
     }
 
     // Phase 2: mixed concurrent access
@@ -554,7 +562,11 @@ fn run_threaded_mixed(bss: u8, biw: u8, threads: usize) -> Result<(), ()> {
     eprintln!("  elapsed: {:.0} ms", t0.elapsed().as_secs_f64() * 1000.0);
 
     match Arc::try_unwrap(sfs) {
-        Ok(s) => s.close(),
+        Ok(s) => {
+            if let Err(e) = s.close() {
+                eprintln!("Error closing SFS: {}", e);
+            }
+        }
         Err(_) => eprintln!("Warning: could not unwrap Arc for close"),
     }
 

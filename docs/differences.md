@@ -4,13 +4,6 @@ Last reviewed: 2026-02-14
 
 # Major Differences
 
-## Sfs::close() doesn't flush open stream handles
-Architecture says (architecture.md line 21, "Data streams" section): "Data streams should be closed when reading and writing is no longer needed, which ensures that any last writes are written to the data stream."
-
-Code: `pub fn close(self) { }` just drops self. Since L3 handles are Copy (plain integers), dropping them triggers no cleanup. If a writer handle is still open at close() time, StreamsFromBlocks will never flush its cached descriptor to disk — data loss. There's no Drop impl on Sfs either.
-
-This is the most immediate risk (silent data loss). A Drop impl or explicit flush-all-open-handles logic in close() would resolve this.
-
 ## L2 doesn't flush before exiting critical section
 Architecture says (architecture.md line 400, "Thread safety in L2" section): "before code exits the critical section that modifies the free block list, changes to the file are flushed to disk."
 
@@ -48,6 +41,9 @@ Code: `BlocksFromFiles` (mock) deletes the file on deallocate and always allocat
 
 These were previously listed as differences but have since been addressed.
 
+## Sfs::close() doesn't flush open stream handles — RESOLVED
+Previously listed as major. `Sfs::close(self)` now returns `Result<(), SfsError>` and drains all open stream handles via `flush_open_streams()`, calling `L3::close_stream()` for each. A `Drop` impl on `Sfs` acts as a safety net for cases where `close()` is not called. Tested via `TestCloseFlushesHandles` in `test_single_file.py`.
+
 ## reserve() API in L4 — RESOLVED
 Previously listed as major. `reserve(handle, n_bytes)` now exists at L4 (`sfs.rs`), L3 (`stream_layer.rs`, `streams_from_blocks.rs`), and is exercised by tests. Pre-allocation of blocks works correctly via `pyramid_reserve()` in L3.
 
@@ -60,7 +56,7 @@ Code: Instead of `#[cfg(debug_assertions)]` runtime tracking, a `verify()` chain
 
 |     | Area              | Architecture                  | Code                              | Severity |
 | --- | ----------------- | ----------------------------- | --------------------------------- | -------- |
-| 1   | Sfs::close        | Flush open handles            | Drops without flushing            | Major    |
+| 1   | Sfs::close        | Flush open handles            | close() + Drop impl              | Resolved |
 | 2   | L2 flush          | Before mutex release          | After mutex release, no flush()   | Major    |
 | 3   | L1 head position  | Explicit head API             | Offset-based (stateless)          | Minor    |
 | 4   | L2 block size     | Bytes in header               | Shift exponent                    | Minor    |
@@ -70,7 +66,7 @@ Code: Instead of `#[cfg(debug_assertions)]` runtime tracking, a `verify()` chain
 | 8   | L4 reserve        | Required                      | Implemented                       | Resolved |
 | 9   | L2 debug tracking | Required in debug builds      | verify() chain instead            | Resolved |
 
-Items 3 and 6 were conscious implementation trade-offs that are arguably better than the architecture describes. Item 9 is resolved via `verify()`. Item 8 is resolved (reserve() now implemented). Items 1 and 2 are genuine gaps. Item 1 is the most immediate risk (silent data loss). Item 2 could cause free-list corruption on crash during concurrent use.
+Items 3 and 6 were conscious implementation trade-offs that are arguably better than the architecture describes. Items 1, 8, and 9 are resolved. Item 2 is the remaining genuine gap — it could cause free-list corruption on crash during concurrent use.
 
 # Conformance notes
 

@@ -275,9 +275,38 @@ impl<L3: StreamLayer> Sfs<L3> {
         Ok(())
     }
 
+    /// Drain all open stream handles and close them via L3.
+    /// Attempts to close ALL handles even if individual closes fail.
+    /// Returns the first error encountered, if any.
+    fn flush_open_streams(&self) -> Result<(), SfsError> {
+        let handles: Vec<(u64, OpenStreamInfo<L3::Handle>)> = {
+            let mut state = self.state.lock().unwrap();
+            state.open_streams.drain().collect()
+        };
+
+        let mut first_error: Option<SfsError> = None;
+        for (_handle_id, info) in handles {
+            if let Err(e) = self.layer3.close_stream(info.l3_handle) {
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+            }
+        }
+
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
     /// Close the SFS file. Consumes self.
-    pub fn close(self) {
-        // Dropping self closes all handles via HashMap drop.
+    ///
+    /// Flushes all open stream handles before dropping. If any stream
+    /// handle fails to close, all remaining handles are still closed
+    /// and the first error is returned.
+    pub fn close(self) -> Result<(), SfsError> {
+        self.flush_open_streams()
+        // Drop runs immediately after, but the HashMap is now empty.
     }
 
     /// Run integrity verification across all layers.
@@ -1162,6 +1191,16 @@ impl<L3: StreamLayer> Sfs<L3> {
         let mut buf = vec![0u8; len as usize];
         self.layer3.read(handle, 0, &mut buf)?;
         parse_entries(&buf, self.layer3.block_index_width())
+    }
+}
+
+impl<L3: StreamLayer> Drop for Sfs<L3> {
+    fn drop(&mut self) {
+        // Safety net: flush any stream handles that were not explicitly closed.
+        // If close() was already called, the HashMap is empty and this is a no-op.
+        if let Err(e) = self.flush_open_streams() {
+            eprintln!("SFS Drop: error flushing open streams: {}", e);
+        }
     }
 }
 

@@ -127,6 +127,82 @@ class TestSingleFilePersistence:
         f.close()
 
 
+class TestCloseFlushesHandles:
+    """Verify that Sfs.close() flushes any open stream handles."""
+
+    def test_close_flushes_open_write_handle(self, tmp_path):
+        """Data persists when stream handle is not closed before SFS close."""
+        sfs_path = str(tmp_path / "test.sfs")
+        data = b"flush test data " * 100  # 1600 bytes
+
+        f = sfs.Sfs.create(sfs_path)
+        handle = f.create_stream("unclosed")
+        f.write(handle, data)
+        # Deliberately NOT calling f.close_stream(handle)
+        f.close()
+
+        f = sfs.Sfs.open(sfs_path, sfs.OpenMode.READ)
+        handle = f.open_stream("unclosed", sfs.OpenMode.READ)
+        readback = f.read(handle, len(data))
+        assert readback == data, "Data must persist when SFS is closed with open write handles"
+        f.close_stream(handle)
+        f.close()
+
+    def test_close_flushes_multiple_open_handles(self, tmp_path):
+        """Multiple open write handles are all flushed when SFS is closed."""
+        sfs_path = str(tmp_path / "test.sfs")
+
+        f = sfs.Sfs.create(sfs_path)
+        f.mkdir("data")
+        h1 = f.create_stream("data/stream_a")
+        h2 = f.create_stream("data/stream_b")
+        f.write(h1, b"alpha")
+        f.write(h2, b"bravo")
+        # Neither stream handle closed explicitly
+        f.close()
+
+        f = sfs.Sfs.open(sfs_path, sfs.OpenMode.READ)
+        h = f.open_stream("data/stream_a", sfs.OpenMode.READ)
+        assert f.read(h, 10) == b"alpha"
+        f.close_stream(h)
+        h = f.open_stream("data/stream_b", sfs.OpenMode.READ)
+        assert f.read(h, 10) == b"bravo"
+        f.close_stream(h)
+        f.close()
+
+    def test_close_with_open_read_handles(self, tmp_path):
+        """Closing SFS with open reader handles succeeds without error."""
+        sfs_path = str(tmp_path / "test.sfs")
+
+        f = sfs.Sfs.create(sfs_path)
+        h = f.create_stream("readme")
+        f.write(h, b"hello")
+        f.close_stream(h)
+        f.close()
+
+        f = sfs.Sfs.open(sfs_path, sfs.OpenMode.READ)
+        h = f.open_stream("readme", sfs.OpenMode.READ)
+        f.read(h, 5)
+        # Leave reader handle open
+        f.close()  # Should not raise
+
+    def test_verify_clean_after_unflushed_close(self, tmp_path):
+        """Verify reports no issues after SFS is closed with open write handles."""
+        sfs_path = str(tmp_path / "test.sfs")
+        data = bytes(range(256)) * 50  # 12800 bytes, spans multiple blocks
+
+        f = sfs.Sfs.create(sfs_path)
+        h = f.create_stream("verified")
+        f.write(h, data)
+        # Stream handle left open
+        f.close()
+
+        f = sfs.Sfs.open(sfs_path, sfs.OpenMode.READ)
+        issues = f.verify()
+        assert issues == [], f"Verify found issues: {issues}"
+        f.close()
+
+
 class TestBlockParameters:
     """Verify that different block_index_width and block_size_shift work."""
 

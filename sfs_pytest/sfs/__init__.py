@@ -69,10 +69,16 @@ class Sfs:
         return Sfs(handle)
 
     def close(self) -> None:
-        """Close the SFS file."""
+        """Close the SFS file, flushing any open stream handles.
+
+        Raises SfsError if any stream handle fails to flush.
+        The file is always closed regardless of errors.
+        """
         if self._handle is not None:
-            _lib.sfs_close(self._handle)
+            result = _lib.sfs_close(self._handle)
             self._handle = None
+            if result != 0:
+                _check_error()
 
     def mkdir(self, path: str) -> None:
         """Create a directory inside the SFS file."""

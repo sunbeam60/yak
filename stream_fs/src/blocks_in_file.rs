@@ -266,6 +266,13 @@ impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlockLayer
         }
         let free_list_count = result.len();
 
+        // Sort free-list blocks by index so that originally-contiguous blocks
+        // are returned in ascending order, maximising contiguous runs for the
+        // run detector to batch into single I/O operations.
+        if free_list_count > 1 {
+            result[..free_list_count].sort_unstable();
+        }
+
         // Phase 2: grow file once for all remaining blocks
         let remaining = count as usize - result.len();
         if remaining > 0 {
@@ -342,6 +349,50 @@ impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlockLayer
         // Block content is now a free-list pointer, not useful data.
         if CACHE_BUDGET_BYTES > 0 {
             self.thread_cache().borrow_mut().pop(&index);
+        }
+
+        Ok(())
+    }
+
+    fn deallocate_blocks(&self, indices: &mut Vec<u64>) -> Result<(), SfsError> {
+        if indices.is_empty() {
+            return Ok(());
+        }
+
+        // Sort ascending so the free-list chain is written in block order.
+        // When these blocks are later re-allocated, they come off the free list
+        // in ascending order, maximising contiguous runs for batched I/O.
+        indices.sort_unstable();
+
+        let mut state = self.state.lock().unwrap();
+        let biw = self.block_index_width as usize;
+
+        // Chain: indices[0] → indices[1] → … → indices[n-1] → old free_list_head
+        for i in 0..indices.len() - 1 {
+            let next = indices[i + 1].to_le_bytes();
+            self.layer1
+                .write(self.block_offset(indices[i]), &next[..biw])?;
+        }
+        // Last freed block points to the previous head
+        let head_bytes = state.free_list_head.to_le_bytes();
+        self.layer1.write(
+            self.block_offset(*indices.last().unwrap()),
+            &head_bytes[..biw],
+        )?;
+
+        // New head is the lowest-numbered freed block
+        state.free_list_head = indices[0];
+
+        // Single header persist (saves n-1 header writes vs individual calls)
+        self.persist_l2_header(state.total_blocks, state.free_list_head)?;
+        drop(state);
+
+        // Evict freed blocks from thread-local cache
+        if CACHE_BUDGET_BYTES > 0 {
+            let mut cache = self.thread_cache().borrow_mut();
+            for &id in indices.iter() {
+                cache.pop(&id);
+            }
         }
 
         Ok(())

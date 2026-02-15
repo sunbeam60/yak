@@ -69,6 +69,17 @@ pub trait BlockLayer: Send + Sync {
     /// Deallocate a block, returning it for future reuse.
     fn deallocate_block(&self, index: u64) -> Result<(), SfsError>;
 
+    /// Deallocate multiple blocks at once, returning them for future reuse.
+    /// The default implementation calls `deallocate_block` in a loop.
+    /// `BlocksInFile` overrides this to sort indices and write the free-list
+    /// chain in block order with a single header persist.
+    fn deallocate_blocks(&self, indices: &mut Vec<u64>) -> Result<(), SfsError> {
+        for &index in indices.iter() {
+            self.deallocate_block(index)?;
+        }
+        Ok(())
+    }
+
     /// Read from a block at the given offset within the block.
     /// `offset + buf.len()` must not exceed `block_size`.
     /// When `cache` is true, the block may be served from and stored in the

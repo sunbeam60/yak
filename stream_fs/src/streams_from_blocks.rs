@@ -438,6 +438,9 @@ fn ensure_capacity<L2: BlockLayer>(
 }
 
 /// Read bytes from a stream described by `descriptor`, starting at `pos`.
+/// pyramid_read attempts to minimise the number of L2 read operations
+/// by scanning for runs of contiguous blocks and treating them like a regular
+/// buffer read when possible, while still correctly handling non-contiguous blocks.
 fn pyramid_read<L2: BlockLayer>(
     layer2: &L2,
     descriptor: &StreamDescriptor,
@@ -451,6 +454,7 @@ fn pyramid_read<L2: BlockLayer>(
         return Ok(0);
     }
 
+    // cap the read to the lowest of the stream size and descriptor size
     let available = (descriptor.size - pos) as usize;
     let to_read = buf.len().min(available);
     if to_read == 0 {
@@ -499,6 +503,9 @@ fn pyramid_read<L2: BlockLayer>(
         }
 
         // Scan for contiguous run within the cached leaf buffer
+        // This enables us to read as much possibe within the run
+        // This allows us to treat block based storage as byte based for
+        // better performance when there are contiguous blocks
         let slot_in_leaf = data_block_idx - leaf_start;
         let max_slots = (num_data_blocks - data_block_idx).min(fan_out - slot_in_leaf);
         let (first_phys_block, run_length) =
@@ -507,6 +514,7 @@ fn pyramid_read<L2: BlockLayer>(
         let bytes_in_run = run_length as usize * block_size - offset_in_block;
         let chunk = (to_read - bytes_read).min(bytes_in_run);
 
+        // now that we know how much we can read, read the whole run in one go
         let n = layer2.read_contiguous_blocks(
             first_phys_block,
             offset_in_block,
@@ -721,7 +729,41 @@ fn pyramid_reserve<L2: BlockLayer>(
     Ok(())
 }
 
-/// Recursively deallocate all blocks in a tree rooted at `block` with given `depth`.
+/// Recursively collect all block IDs (data + redirector) in a pyramid tree.
+/// Used by `deallocate_tree` to batch-free all blocks in one call.
+fn collect_tree_blocks_for_dealloc<L2: BlockLayer>(
+    layer2: &L2,
+    block: u64,
+    depth: u32,
+    fan_out: u64,
+    block_index_width: u8,
+    blocks: &mut Vec<u64>,
+) -> Result<(), SfsError> {
+    blocks.push(block);
+    if depth == 0 {
+        return Ok(());
+    }
+    let sentinel = block_sentinel(block_index_width);
+    for slot in 0..fan_out {
+        let child = read_block_index(layer2, block, slot, block_index_width)?;
+        if child != sentinel {
+            collect_tree_blocks_for_dealloc(
+                layer2,
+                child,
+                depth - 1,
+                fan_out,
+                block_index_width,
+                blocks,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Deallocate all blocks in a tree rooted at `block` with given `depth`.
+/// Collects all block IDs first, then batch-deallocates them so the free list
+/// is written in sorted block order (maximising contiguous runs on re-allocation)
+/// with a single header persist.
 fn deallocate_tree<L2: BlockLayer>(
     layer2: &L2,
     block: u64,
@@ -729,20 +771,16 @@ fn deallocate_tree<L2: BlockLayer>(
     fan_out: u64,
     block_index_width: u8,
 ) -> Result<(), SfsError> {
-    if depth == 0 {
-        // Data block
-        layer2.deallocate_block(block)?;
-        return Ok(());
-    }
-
-    // Redirector block: recurse into children, then deallocate self
-    for slot in 0..fan_out {
-        let child = read_block_index(layer2, block, slot, block_index_width)?;
-        if child != block_sentinel(block_index_width) {
-            deallocate_tree(layer2, child, depth - 1, fan_out, block_index_width)?;
-        }
-    }
-    layer2.deallocate_block(block)?;
+    let mut blocks = Vec::new();
+    collect_tree_blocks_for_dealloc(
+        layer2,
+        block,
+        depth,
+        fan_out,
+        block_index_width,
+        &mut blocks,
+    )?;
+    layer2.deallocate_blocks(&mut blocks)?;
     Ok(())
 }
 

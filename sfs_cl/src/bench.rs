@@ -500,10 +500,8 @@ fn run_reuse(bss: u8, biw: u8) -> Result<(), ()> {
         let h = sfs
             .create_stream(&name)
             .map_err(|e| eprintln!("Error: {}", e))?;
-        sfs.write(&h, &buf)
-            .map_err(|e| eprintln!("Error: {}", e))?;
-        sfs.close_stream(h)
-            .map_err(|e| eprintln!("Error: {}", e))?;
+        sfs.write(&h, &buf).map_err(|e| eprintln!("Error: {}", e))?;
+        sfs.close_stream(h).map_err(|e| eprintln!("Error: {}", e))?;
     }
 
     // Phase 2: read baseline (fresh contiguous blocks)
@@ -516,8 +514,7 @@ fn run_reuse(bss: u8, biw: u8) -> Result<(), ()> {
         let mut rbuf = vec![0u8; stream_size];
         sfs.read(&h, &mut rbuf)
             .map_err(|e| eprintln!("Error: {}", e))?;
-        sfs.close_stream(h)
-            .map_err(|e| eprintln!("Error: {}", e))?;
+        sfs.close_stream(h).map_err(|e| eprintln!("Error: {}", e))?;
     }
     let fresh_ms = t_fresh.elapsed().as_secs_f64() * 1000.0;
 
@@ -534,10 +531,8 @@ fn run_reuse(bss: u8, biw: u8) -> Result<(), ()> {
         let h = sfs
             .create_stream(&name)
             .map_err(|e| eprintln!("Error: {}", e))?;
-        sfs.write(&h, &buf)
-            .map_err(|e| eprintln!("Error: {}", e))?;
-        sfs.close_stream(h)
-            .map_err(|e| eprintln!("Error: {}", e))?;
+        sfs.write(&h, &buf).map_err(|e| eprintln!("Error: {}", e))?;
+        sfs.close_stream(h).map_err(|e| eprintln!("Error: {}", e))?;
     }
 
     // Phase 5: read after reuse
@@ -550,8 +545,7 @@ fn run_reuse(bss: u8, biw: u8) -> Result<(), ()> {
         let mut rbuf = vec![0u8; stream_size];
         sfs.read(&h, &mut rbuf)
             .map_err(|e| eprintln!("Error: {}", e))?;
-        sfs.close_stream(h)
-            .map_err(|e| eprintln!("Error: {}", e))?;
+        sfs.close_stream(h).map_err(|e| eprintln!("Error: {}", e))?;
     }
     let reuse_ms = t_reuse.elapsed().as_secs_f64() * 1000.0;
 

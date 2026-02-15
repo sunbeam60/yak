@@ -339,9 +339,13 @@ The "pyramid" block linking layout has a number of advantages:
 * Even with relatively small block sizes a *large* data stream can be tracked with low depth of tracking blocks. For example, if blocks are 4 kb and uint32 indices, an SFS stream can can grow to 4+ GB before needing a third redirector level.
 
 #### Reserved length
-For clarity of explanation, the explanation above does not deal with reserved capacity of a stream. A stream can be extended into being longer than needed to store the data in the stream. This enables long writes to pre-allocate the necessary blocks instead of the stream going through a slower, more iterative enlargement, and it often promotes data blocks being allocated next to each other.
+For clarity of explanation, the explanation above does not deal with reserved capacity of a stream. A stream can be extended into being longer than needed to store the data in the stream. So while the explanation above is correct, it leaves out the fact that a stream descriptor actually has 3 fields: Top block, size and reserved, and that the resulting pyramid can therefore be larger than it needs to be to strictly hold the user-written data.
 
-So while the explanation above is correct, it leaves out the fact that a stream descriptor actually has 3 fields: Top block, size and reserved, and that the resulting pyramid can therefore be larger than it needs to be to strictly hold the user-written data.
+L3 separates between size (how much data the caller has written to the stream) and reserved (how much data the stream has space for). This is to create the capability to reserve space in the stream, which creates a couple of significant performance opportunities in the SFS library: 
+
+* Callers can achieve significantly faster stream enlargement when it happens at once.
+* Long runs of stream data can be allocated as contiguous runs of blocks on the underlying storage. Contiguity may seem a strange property to seek in a block-based storage format, but both stream read and stream write operations can achieve significant speed-ups when they detect contiguous runs of blocks, as they can read and write multiple blocks with one call of IO.
+* Callers can achieve significantly faster trucations of streams when blocks contiguity is high.
 
 When a stream is truncated, all blocks - including those in any extended reserve - are returned as free blocks, in effect making the stream's size and reserved size very near to each other (reserved will include the unwritten space in the last data block).
 
@@ -388,9 +392,11 @@ L2 has a "first free" block index in its L2 header, which points to the first fr
 
 In that way, when L2 initialises on a new file, it writes 0xFFFF... in the "first free" block index, because there are no free blocks in the SFS file.
 
-When a block is deallocated, Layer two writes the block index of the previously "first free" block into the deallocated block (even if that is 0xFFFF as that would then terminate the linked list of blocks) and writes the index of the deallocated block into the "first free".
+When a new block needs allocating, L2 attempts to deliver these from the free list before enlarging the file to create new blocks. It is beneficial, although not a requirement, for this free list of blocks to be in the order the blocks are laid out in the file. This way L2 can support L3 by delivering contiguous runs of blocks (to the extent it is possible), enabling multi-block read and write operations (i.e. IO operations that span across as many blocks as possible, thereby lowering the number of IO calls).
 
-Similarly, when a new block needs allocating, L2 looks up the "first free block" and, if it's not 0xFFFF..., reads the index of the next free block from this block, placing it in the "first free" variable before returning the index of the previous "first free" block. If the "first free" is 0xFFFF, however, L2 instead expands creates the missing blocks and returns these.
+When blocks are deallocated, L2 therefore first sorts the block indicies given to it in order to promote them being later re-allocated in run-order. It then writes the index of the previous "first free" block into the tail of this newly deallocated chain of blocks, before setting the "first free" index to point to the start of the newly deallocated blocks.
+
+While this approach doesn't guarantee that all free blocks sit in run order in the free list, it does promote many contiguous runs of blocks for a small runtime penalty, which helps to speed up stream operations from blocks that have been re-used.
 
 ### Block caching
 L2 will often be requested to write and (especially) read the same block over and over again. This is most often the case when data is being written or read to a larger stream (i.e. a stream that must use redirector blocks) and the redirector blocks need constant access to locate the data in the stream. L2 therefore manages a write-through cache of blocks and it provides to L3 a way to use this write-through cache for some blocks, while not for others. As L3 writes or reads redirector blocks, it asks L2 to place and read these blocks in the write through cache. Then, when L3 comes to read the redirector blocks, it is instead served from the in-memory cache and placed in the write-through cache before being written to disk. The actual data written/read to a stream circumvents the write-through cache, under the assumption that callers know what data they've placed in the SFS file (and therefore won't be asking the SFS file to read that data again) and, when reading, receive a copy of the data stream into their memory bufffer and therefore won't asking to read the same data again.

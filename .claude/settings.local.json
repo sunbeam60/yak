@@ -30,7 +30,15 @@
       "Bash(git stash:*)",
       "Bash(git cherry-pick:*)",
       "Bash(git -C /Users/BMADSEN/Code/stream_fs add stream_fs/src/sfs.rs .vscode/tasks.json .claude/CLAUDE.md .claude/settings.local.json)",
-      "Bash(git -C:*)"
+      "Bash(git -C:*)",
+      "Bash(for i in 1 2 3)",
+      "Bash(do echo \"Run $i:\")",
+      "Bash(~/.local/bin/sfs-master bench reuse:*)",
+      "Bash(done)",
+      "Bash(~/.local/bin/sfs-sorted-free-list bench:*)",
+      "Bash(~/.local/bin/sfs-master bench:*)",
+      "Bash(.venv/bin/python -m pytest:*)",
+      "Bash(brew list:*)"
     ]
   }
 }

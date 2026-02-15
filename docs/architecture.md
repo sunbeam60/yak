@@ -4,7 +4,7 @@ This documentation provides a high level overview of the Stream File System (SFS
 
 ## SFS Purpose
 
-The SFS crate is a Rust library that enable users to create, manage and use SFS storage files. An SFS storage file is a "file system in a file", wherein there is 0..n data streams, addressable by a string name. Each data stream can be read and written similar to how an real file can be read and written, meaning after a data stream has been opened, it returns a handle from which the user can obtain the length, a position (where reads and writes happen) and the contents of the data stream itself. After such a data stream has been opened, there are functions to read and write data from and to the data stream. 
+SFS is a Rust library that enable users to create, manage and use SFS storage files. An SFS storage file is a "file system in a file", wherein there is 0..n data streams, addressable by a string name. Each data stream can be read and written similar to how an real file can be read and written, meaning after a data stream has been opened, it returns a handle from which the user can obtain the length, a position (where reads and writes happen) and the contents of the data stream itself. After such a data stream has been opened, there are functions to read and write data from and to the data stream. 
 
 ## Data streams
 
@@ -30,13 +30,18 @@ If a data stream "position" is set beyond the length of the data stream, an erro
 
 ## Use
 
-An SFS file is useful as a generic storage container. Given that it supports extending and shortening data streams, it is particularly useful as a way to provide storage for other libraries that continually write data to a file system and indeed for any writing scenarios where the expected length is not known when the data stream write begins. Some imagined scenarios:
+An SFS file is useful as a generic storage container. Given that it supports extending and shortening data streams inside of a single file, it is particularly useful as a way to provide storage for other libraries that continually write data to a file system and indeed for any writing scenarios where the expected length is not known when the data stream write begins, or changes over the lifetime of the file. 
 
-* Storage for a database.
-* Log entries.
-* Crash recovery files (to capture unsaved work).
+That said, even when the final data length is well known, SFS can be useful as a rapid, relatively well optimized way of writing binary data without having to worry about the particulars.
 
-While these scenarios are obvious, it is also expected that SFS files will be used for convenience when needing to write a lot of different data (even if the total length of the data to write is known), as a sort of "upgraded" block based file layout, .e.g IFF (interchange file format) file, where data stream names are used instead of IFF block identifiers.
+Some imagined scenarios:
+
+* Log entry storage
+* Receiving storage for streaming data
+* Undo stack storage
+* Application file formats
+* Game save files
+* Backup storage
 
 Naturally, to be usable as a storage container for other libraries, which would normally write their data to a regular file system, the using library has to support abstractions on top of the file system so that a write to a file goes instead into an SFS data stream.
 
@@ -113,23 +118,26 @@ Throughout this section, layers are described by L1, L2, L3 and L4, denoting Lay
 
 ## Project structure
 
-There are 4 projects across the workspace:
+There are 5 projects across the workspace:
 
-
-| Module                    | Language      | Path         |
+| Module                    | Language      | Path         | 
 | ------------------------- | ------------- | ------------ |
-| SFS module                | Rust          | stream_fs/   |
-| C ABI SFS wrapper module  | Rust          | stream_fs_c/ |
+| SFS library               | Rust          | stream_fs/   |
+| C ABI SFS wrapper         | Rust          | stream_fs_c/ |
+| Python SFS wrapper        | Rust          | sfs_python/  |
 | Command line SFS tool     | Rust          | sfs_cl/      |
 | Testing harness and tests | Python/pytest | sfs_pytest/  |
 
-## Implementation language
-
-The library is implemented as a Rust library create that can be used directly, but it also supports a C-compatible ABI on all public functions (using extern "C" and #[no_mangle] etc.). This ensures that the library can be linked into and used by as many other programming languages as possible, including the included Python test suite.
+* The SFS library is published as a crate on crates.io
+* The C ABI wrapper produces a dynamic and a static library with non-mangled names for linking into a C/C++ project - and for use in any environment that supports C FFI libraries (e.g. LuaJIT). A SFS header file is generated using cbindgen, which defines the function names used in the libraries.
+* The Python SFS wrapper is published as a PyPI wheel. It provides a full SFS experiece in Python.
+* The command line SFS tool is not meant as a day to day production tool, but it provides a set of functions to manipulate SFS files during development and, crucially, it provides a set of benchmarks that are useful for profiling and performance optimization.
 
 ## Testing
 
-The library is tested using Python/pytest. This allows us to rapidly develop tests and to test the C FFI wrapper around the Rust library.
+The library is tested using Python/pytest. This allows us to rapidly develop tests and to test the Python SFS wrapper.
+
+Additional rust tests exist in the library itself, to test functionality that can't adequately be tested by pytest.
 
 ## SFS file thread, process, machine & crash safety
 
@@ -218,13 +226,13 @@ When an existing SFS file is opened, it reads the root directory stream index nu
 
 #### Stream entry management
 
-Since stream entries can have variable length names, when they are serialised to a directory stream, each entry has its length prepended (2 bytes, providing space for 64k of naming), so that the stream entries look as follows:
+Stream entries in the directory streams are serialized compactly. Since the length of their names vary, they are encoded as follows:
 
-```
-| length | identifier | name.............. | length | identifier | name.... | length | identifier | name......................| length | identifier | name... |
+```ASCII
+| length (2 bytes) | stream identifier (2-8 bytes) | name hash (4 bytes) | name (1-65,522 bytes) ........ | 
 ```
 
-The length field for each entry includes its own size, i.e. with the length field is a uint16, the stream identifier a uint32 (it can be between 2-8 bytes) and the name was 12 bytes, the length would be 2 + 4 + 12 = 18 bytes.
+The hash of the name allows for (relatively) quick skipping through the list of stream entries when searching for a specific name in the directory. Each entry's hash is compared against the hash of the name being searched for; only when the hashes match is a full string compare done (to prevent against the unlikely risk of a hash clash).
 
 When an entry is deleted from this stream, all the following entries are copied upwards in the stream and the stream is shortened, i.e.:
 

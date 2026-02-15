@@ -34,7 +34,9 @@
             "command": "cargo",
             "args": [
                 "build",
-                "--workspace"
+                "--workspace",
+                "--exclude",
+                "stream_fs_python"
             ],
             "options": {
                 "cwd": "${workspaceFolder}",
@@ -107,6 +109,8 @@
                 "clippy",
                 "--workspace",
                 "--all-targets",
+                "--exclude",
+                "stream_fs_python",
                 "--",
                 "-D",
                 "warnings"
@@ -161,18 +165,50 @@
             }
         },
         {
+            "label": "maturin-develop",
+            "type": "shell",
+            "command": "bash",
+            "args": [
+                "-c",
+                "cd '${workspaceFolder}/stream_fs_python' && VIRTUAL_ENV='${workspaceFolder}/sfs_pytest/.venv' ../sfs_pytest/.venv/bin/maturin develop --release"
+            ],
+            "windows": {
+                "command": "powershell",
+                "args": [
+                    "-Command",
+                    "$env:VIRTUAL_ENV='${workspaceFolder}/sfs_pytest/.venv'; cd '${workspaceFolder}/stream_fs_python'; ../sfs_pytest/.venv/Scripts/maturin develop --release"
+                ]
+            },
+            "problemMatcher": [
+                "$rustc"
+            ],
+            "group": "build",
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared"
+            }
+        },
+        {
             "label": "run-pytest-all",
             "type": "shell",
-            "command": "C:/Python311/python.exe",
+            "command": "bash",
             "args": [
-                "-m",
-                "pytest",
-                "tests/",
-                "-v"
+                "-c",
+                "'${workspaceFolder}/sfs_pytest/.venv/bin/python' -m pytest tests/ -v"
             ],
+            "windows": {
+                "command": "powershell",
+                "args": [
+                    "-Command",
+                    "& '${workspaceFolder}/sfs_pytest/.venv/Scripts/python.exe' -m pytest tests/ -v"
+                ]
+            },
             "options": {
                 "cwd": "${workspaceFolder}/sfs_pytest"
             },
+            "dependsOn": [
+                "maturin-develop"
+            ],
             "problemMatcher": [],
             "group": "test",
             "presentation": {
@@ -227,7 +263,9 @@
             "args": [
                 "build",
                 "--release",
-                "--workspace"
+                "--workspace",
+                "--exclude",
+                "stream_fs_python"
             ],
             "options": {
                 "cwd": "${workspaceFolder}",

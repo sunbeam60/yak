@@ -147,7 +147,12 @@ pub trait BlockLayer: Send + Sync {
         let mut off = offset;
         while bytes_written < buf.len() {
             let chunk = (buf.len() - bytes_written).min(bs - off);
-            let n = self.write_block(block, off, &buf[bytes_written..bytes_written + chunk], false)?;
+            let n = self.write_block(
+                block,
+                off,
+                &buf[bytes_written..bytes_written + chunk],
+                false,
+            )?;
             bytes_written += n;
             block += 1;
             off = 0;

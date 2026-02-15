@@ -7,6 +7,26 @@ use crate::stream_layer::StreamLayer;
 /// L4 payload size: "filing"(6) + version(1) + root_dir_stream_id(8) = 15 bytes.
 const L4_PAYLOAD_SIZE: u16 = 15;
 
+/// Size in bytes of the FNV-1a name hash stored in each directory entry.
+const ENTRY_HASH_SIZE: usize = 4;
+
+/// Current L4 format version. Bumped when the on-disk directory entry format changes.
+const L4_FORMAT_VERSION: u8 = 1;
+
+/// FNV-1a hash of a byte slice, producing a 32-bit hash.
+/// Used to accelerate directory entry lookups by comparing a cheap integer
+/// before falling back to a full name comparison.
+fn fnv1a_hash(bytes: &[u8]) -> u32 {
+    const FNV_OFFSET: u32 = 2166136261;
+    const FNV_PRIME: u32 = 16777619;
+    let mut hash = FNV_OFFSET;
+    for &byte in bytes {
+        hash ^= byte as u32;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
 #[derive(Debug)]
 pub enum SfsError {
     NotFound(String),
@@ -79,15 +99,16 @@ struct StreamEntry {
 }
 
 /// Serialize a single stream entry to bytes.
-/// Format: | length: u16 | identifier: [u8; block_index_width] | name: [u8] |
+/// Format: | length: u16 | identifier: [u8; biw] | name_hash: u32 | name: [u8] |
 fn serialize_entry(entry: &StreamEntry, block_index_width: u8) -> Vec<u8> {
     let biw = block_index_width as usize;
     let name_bytes = entry.name.as_bytes();
-    let length: u16 = (2 + biw + name_bytes.len()) as u16;
+    let length: u16 = (2 + biw + ENTRY_HASH_SIZE + name_bytes.len()) as u16;
     let mut buf = Vec::with_capacity(length as usize);
     buf.extend_from_slice(&length.to_le_bytes());
     let id_bytes = entry.id.to_le_bytes();
     buf.extend_from_slice(&id_bytes[..biw]);
+    buf.extend_from_slice(&fnv1a_hash(name_bytes).to_le_bytes());
     buf.extend_from_slice(name_bytes);
     buf
 }
@@ -102,9 +123,10 @@ fn serialize_entries(entries: &[StreamEntry], block_index_width: u8) -> Vec<u8> 
 }
 
 /// Parse stream entries from a byte buffer.
+/// Format: | length: u16 | identifier: [u8; biw] | name_hash: u32 | name: [u8] |
 fn parse_entries(data: &[u8], block_index_width: u8) -> Result<Vec<StreamEntry>, SfsError> {
     let biw = block_index_width as usize;
-    let min_entry_len = 2 + biw;
+    let min_entry_len = 2 + biw + ENTRY_HASH_SIZE;
     let mut entries = Vec::new();
     let mut pos = 0;
     while pos < data.len() {
@@ -128,13 +150,68 @@ fn parse_entries(data: &[u8], block_index_width: u8) -> Result<Vec<StreamEntry>,
         let mut id_bytes = [0u8; 8];
         id_bytes[..biw].copy_from_slice(&data[pos + 2..pos + 2 + biw]);
         let id = u64::from_le_bytes(id_bytes);
-        let name = std::str::from_utf8(&data[pos + 2 + biw..pos + length])
+        // Skip over the name hash (ENTRY_HASH_SIZE bytes) to reach the name
+        let name_start = pos + 2 + biw + ENTRY_HASH_SIZE;
+        let name = std::str::from_utf8(&data[name_start..pos + length])
             .map_err(|e| SfsError::IoError(format!("invalid UTF-8 in entry name: {}", e)))?
             .to_string();
         entries.push(StreamEntry { id, name });
         pos += length;
     }
     Ok(entries)
+}
+
+/// Scan a raw directory buffer for an entry matching `name`.
+/// Compares the pre-computed FNV-1a hash first; only does a byte-level
+/// name comparison when hashes match. Returns the stream ID if found.
+/// Zero heap allocations on the scan path.
+fn find_entry_by_name(
+    data: &[u8],
+    name: &str,
+    block_index_width: u8,
+) -> Result<Option<u64>, SfsError> {
+    let biw = block_index_width as usize;
+    let min_entry_len = 2 + biw + ENTRY_HASH_SIZE;
+    let name_bytes = name.as_bytes();
+    let target_hash = fnv1a_hash(name_bytes);
+    let mut pos = 0;
+    while pos < data.len() {
+        if pos + 2 > data.len() {
+            return Err(SfsError::IoError(
+                "truncated entry length in directory stream".to_string(),
+            ));
+        }
+        let length = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+        if length < min_entry_len {
+            return Err(SfsError::IoError(
+                "invalid entry length in directory stream".to_string(),
+            ));
+        }
+        if pos + length > data.len() {
+            return Err(SfsError::IoError(
+                "truncated entry in directory stream".to_string(),
+            ));
+        }
+        // Read stored hash
+        let hash_start = pos + 2 + biw;
+        let stored_hash = u32::from_le_bytes([
+            data[hash_start],
+            data[hash_start + 1],
+            data[hash_start + 2],
+            data[hash_start + 3],
+        ]);
+        // Fast path: only compare name bytes when hashes match
+        if stored_hash == target_hash {
+            let name_start = hash_start + ENTRY_HASH_SIZE;
+            if &data[name_start..pos + length] == name_bytes {
+                let mut id_bytes = [0u8; 8];
+                id_bytes[..biw].copy_from_slice(&data[pos + 2..pos + 2 + biw]);
+                return Ok(Some(u64::from_le_bytes(id_bytes)));
+            }
+        }
+        pos += length;
+    }
+    Ok(None)
 }
 
 // ---------------------------------------------------------------------------
@@ -163,10 +240,11 @@ fn validate_path(path: &str) -> Result<(), SfsError> {
 }
 
 /// Split "a/b/c" into ("a/b", "c"). Split "c" into ("", "c").
-fn split_parent_leaf(path: &str) -> (String, String) {
+/// Returns borrowed slices — no heap allocations.
+fn split_parent_leaf(path: &str) -> (&str, &str) {
     match path.rsplit_once('/') {
-        Some((parent, leaf)) => (parent.to_string(), leaf.to_string()),
-        None => (String::new(), path.to_string()),
+        Some((parent, leaf)) => (parent, leaf),
+        None => ("", path),
     }
 }
 
@@ -424,7 +502,7 @@ impl<L3: StreamLayer> Sfs<L3> {
 
         let biw = self.layer3.block_index_width();
         let (parent_path, leaf) = split_parent_leaf(path);
-        let parent_id = self.resolve_dir_stream_id(&parent_path)?;
+        let parent_id = self.resolve_dir_stream_id(parent_path)?;
         let dir_entry_name = format!("{}/", leaf);
 
         // Open parent dir stream for writing (blocking — waits for contention)
@@ -470,7 +548,7 @@ impl<L3: StreamLayer> Sfs<L3> {
 
         let biw = self.layer3.block_index_width();
         let (parent_path, leaf) = split_parent_leaf(path);
-        let parent_id = self.resolve_dir_stream_id(&parent_path)?;
+        let parent_id = self.resolve_dir_stream_id(parent_path)?;
         let dir_entry_name = format!("{}/", leaf);
 
         // Open parent for writing (blocking)
@@ -566,8 +644,8 @@ impl<L3: StreamLayer> Sfs<L3> {
         let old_dir_name = format!("{}/", old_leaf);
         let new_dir_name = format!("{}/", new_leaf);
 
-        let old_parent_id = self.resolve_dir_stream_id(&old_parent_path)?;
-        let new_parent_id = self.resolve_dir_stream_id(&new_parent_path)?;
+        let old_parent_id = self.resolve_dir_stream_id(old_parent_path)?;
+        let new_parent_id = self.resolve_dir_stream_id(new_parent_path)?;
 
         if old_parent_id == new_parent_id {
             // Same parent: rename entry in place (blocking)
@@ -676,7 +754,7 @@ impl<L3: StreamLayer> Sfs<L3> {
 
         let biw = self.layer3.block_index_width();
         let (parent_path, leaf) = split_parent_leaf(path);
-        let parent_id = self.resolve_dir_stream_id(&parent_path)?;
+        let parent_id = self.resolve_dir_stream_id(parent_path)?;
         let dir_entry_name = format!("{}/", leaf);
 
         // Open parent dir stream for writing (blocking)
@@ -741,20 +819,12 @@ impl<L3: StreamLayer> Sfs<L3> {
         validate_path(path)?;
 
         let (parent_path, leaf) = split_parent_leaf(path);
-        let parent_id = self.resolve_dir_stream_id(&parent_path)?;
+        let parent_id = self.resolve_dir_stream_id(parent_path)?;
 
-        // Read parent dir to find the stream ID (blocking)
-        let parent_handle = self
-            .layer3
-            .open_stream_blocking(parent_id, OpenMode::Read)?;
-        let entries = self.read_entries_from_handle(&parent_handle)?;
-        self.layer3.close_stream(parent_handle)?;
-
-        let entry = entries
-            .iter()
-            .find(|e| e.name == leaf)
+        // Look up stream ID by name in parent directory (hash-accelerated)
+        let stream_id = self
+            .find_entry_in_dir(parent_id, leaf)?
             .ok_or_else(|| SfsError::NotFound(path.to_string()))?;
-        let stream_id = entry.id;
 
         // Open via L3 (L3 handles locking)
         let l3_handle = self.layer3.open_stream(stream_id, mode)?;
@@ -803,7 +873,7 @@ impl<L3: StreamLayer> Sfs<L3> {
 
         let biw = self.layer3.block_index_width();
         let (parent_path, leaf) = split_parent_leaf(path);
-        let parent_id = self.resolve_dir_stream_id(&parent_path)?;
+        let parent_id = self.resolve_dir_stream_id(parent_path)?;
 
         // Open parent for writing (blocking)
         let parent_handle = self
@@ -863,8 +933,8 @@ impl<L3: StreamLayer> Sfs<L3> {
         let (old_parent_path, old_leaf) = split_parent_leaf(old_path);
         let (new_parent_path, new_leaf) = split_parent_leaf(new_path);
 
-        let old_parent_id = self.resolve_dir_stream_id(&old_parent_path)?;
-        let new_parent_id = self.resolve_dir_stream_id(&new_parent_path)?;
+        let old_parent_id = self.resolve_dir_stream_id(old_parent_path)?;
+        let new_parent_id = self.resolve_dir_stream_id(new_parent_path)?;
 
         if old_parent_id == new_parent_id {
             // Same parent (blocking)
@@ -1166,17 +1236,9 @@ impl<L3: StreamLayer> Sfs<L3> {
         let mut current_id = self.root_dir_stream_id;
         for component in path.split('/') {
             let dir_name = format!("{}/", component);
-            let handle = self
-                .layer3
-                .open_stream_blocking(current_id, OpenMode::Read)?;
-            let entries = self.read_entries_from_handle(&handle)?;
-            self.layer3.close_stream(handle)?;
-
-            let entry = entries
-                .iter()
-                .find(|e| e.name == dir_name)
+            current_id = self
+                .find_entry_in_dir(current_id, &dir_name)?
                 .ok_or_else(|| SfsError::NotFound("parent directory does not exist".to_string()))?;
-            current_id = entry.id;
         }
 
         Ok(current_id)
@@ -1191,6 +1253,24 @@ impl<L3: StreamLayer> Sfs<L3> {
         let mut buf = vec![0u8; len as usize];
         self.layer3.read(handle, 0, &mut buf)?;
         parse_entries(&buf, self.layer3.block_index_width())
+    }
+
+    /// Look up a single entry by name in a directory stream.
+    /// Uses hash-accelerated scan — zero heap allocations on the search path.
+    /// Opens and closes the directory stream handle internally.
+    fn find_entry_in_dir(&self, dir_stream_id: u64, name: &str) -> Result<Option<u64>, SfsError> {
+        let handle = self
+            .layer3
+            .open_stream_blocking(dir_stream_id, OpenMode::Read)?;
+        let len = self.layer3.stream_length(&handle)?;
+        if len == 0 {
+            self.layer3.close_stream(handle)?;
+            return Ok(None);
+        }
+        let mut buf = vec![0u8; len as usize];
+        self.layer3.read(&handle, 0, &mut buf)?;
+        self.layer3.close_stream(handle)?;
+        find_entry_by_name(&buf, name, self.layer3.block_index_width())
     }
 }
 
@@ -1213,7 +1293,7 @@ impl<L3: StreamLayer> Drop for Sfs<L3> {
 fn serialize_header(root_dir_stream_id: u64) -> Vec<u8> {
     let mut buf = Vec::with_capacity(L4_PAYLOAD_SIZE as usize);
     buf.extend_from_slice(b"filing");
-    buf.push(0); // version
+    buf.push(L4_FORMAT_VERSION);
     buf.extend_from_slice(&root_dir_stream_id.to_le_bytes());
     buf
 }
@@ -1233,6 +1313,14 @@ fn deserialize_header(data: &[u8]) -> Result<u64, SfsError> {
         return Err(SfsError::IoError(format!(
             "expected L4 identifier 'filing', got '{}'",
             String::from_utf8_lossy(&data[0..6])
+        )));
+    }
+    // Verify version
+    let version = data[6];
+    if version != L4_FORMAT_VERSION {
+        return Err(SfsError::IoError(format!(
+            "unsupported L4 format version: {} (expected {})",
+            version, L4_FORMAT_VERSION
         )));
     }
     // payload[6] = version, payload[7..15] = root_dir_stream_id

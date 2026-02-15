@@ -487,7 +487,12 @@ fn pyramid_read<L2: BlockLayer>(
         // Only navigate and read the leaf when we cross a leaf boundary
         if leaf_start != cached_leaf_start {
             let leaf_block = navigate_to_leaf(
-                layer2, descriptor, data_block_idx, depth, fan_out, block_index_width,
+                layer2,
+                descriptor,
+                data_block_idx,
+                depth,
+                fan_out,
+                block_index_width,
             )?;
             layer2.read_block(leaf_block, 0, &mut leaf_buf, true)?;
             cached_leaf_start = leaf_start;
@@ -555,11 +560,7 @@ fn pyramid_write<L2: BlockLayer>(
     // Depth 0: single data block, no redirectors
     if depth == 0 {
         let offset_in_block = (pos % block_size as u64) as usize;
-        let n = layer2.write_contiguous_blocks(
-            descriptor.top_block,
-            offset_in_block,
-            buf,
-        )?;
+        let n = layer2.write_contiguous_blocks(descriptor.top_block, offset_in_block, buf)?;
         let actual_end = pos + n as u64;
         descriptor.size = actual_end.max(old_size);
         return Ok(n);
@@ -581,7 +582,12 @@ fn pyramid_write<L2: BlockLayer>(
         // Only navigate and read the leaf when we cross a leaf boundary
         if leaf_start != cached_leaf_start {
             let leaf_block = navigate_to_leaf(
-                layer2, descriptor, data_block_idx, depth, fan_out, block_index_width,
+                layer2,
+                descriptor,
+                data_block_idx,
+                depth,
+                fan_out,
+                block_index_width,
             )?;
             layer2.read_block(leaf_block, 0, &mut leaf_buf, true)?;
             cached_leaf_start = leaf_start;

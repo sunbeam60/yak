@@ -625,8 +625,17 @@ fn run_single_stream(bss: u8, biw: u8) -> Result<(), ()> {
     sfs.close().map_err(|e| eprintln!("Error closing: {}", e))?;
 
     let mb = stream_size as f64 / (1024.0 * 1024.0);
-    eprintln!("  write: {:.0} ms  ({:.1} MB/s)", write_ms, mb / (write_ms / 1000.0));
-    eprintln!("  read:  {:.0} ms  ({:.1} MB/s)  [{} bytes]", read_ms, mb / (read_ms / 1000.0), n);
+    eprintln!(
+        "  write: {:.0} ms  ({:.1} MB/s)",
+        write_ms,
+        mb / (write_ms / 1000.0)
+    );
+    eprintln!(
+        "  read:  {:.0} ms  ({:.1} MB/s)  [{} bytes]",
+        read_ms,
+        mb / (read_ms / 1000.0),
+        n
+    );
 
     Ok(())
 }

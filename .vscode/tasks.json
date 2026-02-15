@@ -326,6 +326,14 @@
             "label": "samply-bench-all",
             "type": "shell",
             "command": "samply",
+            "osx": {
+                "args": [
+                    "record",
+                    "${workspaceFolder}/target/profiling/sfs",
+                    "bench",
+                    "all"
+                ]
+            },
             "args": [
                 "record",
                 "${workspaceFolder}/target/profiling/sfs.exe",
@@ -352,6 +360,14 @@
             "label": "samply-bench-large-write",
             "type": "shell",
             "command": "samply",
+            "osx": {
+                "args": [
+                    "record",
+                    "${workspaceFolder}/target/profiling/sfs",
+                    "bench",
+                    "large-write"
+                ]
+            },
             "args": [
                 "record",
                 "${workspaceFolder}/target/profiling/sfs.exe",
@@ -378,6 +394,14 @@
             "label": "samply-bench-small-write",
             "type": "shell",
             "command": "samply",
+            "osx": {
+                "args": [
+                    "record",
+                    "${workspaceFolder}/target/profiling/sfs",
+                    "bench",
+                    "small-write"
+                ]
+            },
             "args": [
                 "record",
                 "${workspaceFolder}/target/profiling/sfs.exe",
@@ -404,6 +428,14 @@
             "label": "samply-bench-threaded-write",
             "type": "shell",
             "command": "samply",
+            "osx": {
+                "args": [
+                    "record",
+                    "${workspaceFolder}/target/profiling/sfs",
+                    "bench",
+                    "threaded-write"
+                ]
+            },
             "args": [
                 "record",
                 "${workspaceFolder}/target/profiling/sfs.exe",
@@ -430,6 +462,14 @@
             "label": "samply-bench-threaded-read",
             "type": "shell",
             "command": "samply",
+            "osx": {
+                "args": [
+                    "record",
+                    "${workspaceFolder}/target/profiling/sfs",
+                    "bench",
+                    "threaded-read"
+                ]
+            },
             "args": [
                 "record",
                 "${workspaceFolder}/target/profiling/sfs.exe",
@@ -456,6 +496,14 @@
             "label": "samply-bench-large-read",
             "type": "shell",
             "command": "samply",
+            "osx": {
+                "args": [
+                    "record",
+                    "${workspaceFolder}/target/profiling/sfs",
+                    "bench",
+                    "large-read"
+                ]
+            },
             "args": [
                 "record",
                 "${workspaceFolder}/target/profiling/sfs.exe",
@@ -482,6 +530,14 @@
             "label": "samply-bench-small-read",
             "type": "shell",
             "command": "samply",
+            "osx": {
+                "args": [
+                    "record",
+                    "${workspaceFolder}/target/profiling/sfs",
+                    "bench",
+                    "small-read"
+                ]
+            },
             "args": [
                 "record",
                 "${workspaceFolder}/target/profiling/sfs.exe",
@@ -508,6 +564,14 @@
             "label": "samply-bench-threaded-mixed",
             "type": "shell",
             "command": "samply",
+            "osx": {
+                "args": [
+                    "record",
+                    "${workspaceFolder}/target/profiling/sfs",
+                    "bench",
+                    "threaded-mixed"
+                ]
+            },
             "args": [
                 "record",
                 "${workspaceFolder}/target/profiling/sfs.exe",
@@ -534,6 +598,14 @@
             "label": "samply-bench-churn",
             "type": "shell",
             "command": "samply",
+            "osx": {
+                "args": [
+                    "record",
+                    "${workspaceFolder}/target/profiling/sfs",
+                    "bench",
+                    "churn"
+                ]
+            },
             "args": [
                 "record",
                 "${workspaceFolder}/target/profiling/sfs.exe",

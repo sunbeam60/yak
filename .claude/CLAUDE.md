@@ -38,3 +38,6 @@ It is critical that the four layers in SFS are kept as decoupled as possible: L4
 If there's a cleaner/neater way to do something, please suggest it.
 Don't use #[allow()] to get around warnings. Warnings from clippy shouldn't be worked around, they should be fixed.
 There's a git hook to run fmt and clippy before we push to remote master. Please finish off big tasks by running both and fixing any warnings.
+
+## Still in development
+Version changes to the underlying storage formats is not a large problem. We are still developing this and no existing files are in the wild, needing to be considered.

@@ -26,7 +26,11 @@
       "Bash(C:/Python311/python.exe -m pytest:*)",
       "Bash(cargo check:*)",
       "Bash(cargo fmt:*)",
-      "Bash(cargo clippy:*)"
+      "Bash(cargo clippy:*)",
+      "Bash(git stash:*)",
+      "Bash(git cherry-pick:*)",
+      "Bash(git -C /Users/BMADSEN/Code/stream_fs add stream_fs/src/sfs.rs .vscode/tasks.json .claude/CLAUDE.md .claude/settings.local.json)",
+      "Bash(git -C:*)"
     ]
   }
 }

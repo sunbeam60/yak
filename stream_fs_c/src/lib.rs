@@ -1,7 +1,25 @@
 use std::cell::RefCell;
-use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::ffi::{c_char, c_int, CStr, CString};
 
 use stream_fs::{EntryType, OpenMode, SfsDefault as Sfs, StreamHandle};
+
+// ---------------------------------------------------------------------------
+// Opaque handle types
+// ---------------------------------------------------------------------------
+
+/// Opaque handle to an open SFS file.
+/// C consumers see `SfsFile*` — the internal layout is never exposed.
+pub struct SfsFile(Sfs);
+
+/// Opaque directory listing returned by `sfs_list`.
+pub struct SfsList {
+    entries: Vec<(CString, c_int)>,
+}
+
+/// Opaque verification result returned by `sfs_verify`.
+pub struct SfsVerifyResult {
+    issues: Vec<CString>,
+}
 
 // ---------------------------------------------------------------------------
 // Thread-local error handling
@@ -60,7 +78,7 @@ pub extern "C" fn sfs_hello() -> *mut c_char {
 }
 
 /// # Safety
-/// The pointer must have been returned by `sfs_hello` and not yet freed.
+/// `s` must have been returned by `sfs_hello` and not yet freed.
 #[no_mangle]
 pub unsafe extern "C" fn sfs_free_string(s: *mut c_char) {
     if !s.is_null() {
@@ -74,18 +92,20 @@ pub unsafe extern "C" fn sfs_free_string(s: *mut c_char) {
 // SFS file lifecycle
 // ---------------------------------------------------------------------------
 
+/// # Safety
+/// `path` must be a valid, null-terminated UTF-8 string.
 #[no_mangle]
-pub extern "C" fn sfs_create(
+pub unsafe extern "C" fn sfs_create(
     path: *const c_char,
     block_index_width: u8,
     block_size_shift: u8,
-) -> *mut c_void {
+) -> *mut SfsFile {
     let path = match cstr_to_str(path) {
         Some(s) => s,
         None => return std::ptr::null_mut(),
     };
     match Sfs::create(path, block_index_width, block_size_shift) {
-        Ok(sfs) => Box::into_raw(Box::new(sfs)) as *mut c_void,
+        Ok(sfs) => Box::into_raw(Box::new(SfsFile(sfs))),
         Err(e) => {
             set_last_error(&e.to_string());
             std::ptr::null_mut()
@@ -94,8 +114,11 @@ pub extern "C" fn sfs_create(
 }
 
 /// Open an existing SFS file. mode: 0=READ, 1=WRITE.
+///
+/// # Safety
+/// `path` must be a valid, null-terminated UTF-8 string.
 #[no_mangle]
-pub extern "C" fn sfs_open(path: *const c_char, mode: c_int) -> *mut c_void {
+pub unsafe extern "C" fn sfs_open(path: *const c_char, mode: c_int) -> *mut SfsFile {
     let path = match cstr_to_str(path) {
         Some(s) => s,
         None => return std::ptr::null_mut(),
@@ -109,7 +132,7 @@ pub extern "C" fn sfs_open(path: *const c_char, mode: c_int) -> *mut c_void {
         }
     };
     match Sfs::open(path, mode) {
-        Ok(sfs) => Box::into_raw(Box::new(sfs)) as *mut c_void,
+        Ok(sfs) => Box::into_raw(Box::new(SfsFile(sfs))),
         Err(e) => {
             set_last_error(&e.to_string());
             std::ptr::null_mut()
@@ -125,12 +148,12 @@ pub extern "C" fn sfs_open(path: *const c_char, mode: c_int) -> *mut c_void {
 /// `handle` must be a valid pointer returned by `sfs_create` or `sfs_open`,
 /// and must not have been closed already.
 #[no_mangle]
-pub extern "C" fn sfs_close(handle: *mut c_void) -> c_int {
+pub unsafe extern "C" fn sfs_close(handle: *mut SfsFile) -> c_int {
     if handle.is_null() {
         return 0;
     }
-    let sfs = unsafe { Box::from_raw(handle as *mut Sfs) };
-    match sfs.close() {
+    let sfs_file = unsafe { Box::from_raw(handle) };
+    match sfs_file.0.close() {
         Ok(()) => 0,
         Err(e) => {
             set_last_error(&e.to_string());
@@ -143,9 +166,11 @@ pub extern "C" fn sfs_close(handle: *mut c_void) -> c_int {
 // Directory operations
 // ---------------------------------------------------------------------------
 
+/// # Safety
+/// `handle` must be a live `SfsFile` pointer. `path` must be a valid C string.
 #[no_mangle]
-pub extern "C" fn sfs_mkdir(handle: *mut c_void, path: *const c_char) -> c_int {
-    let sfs = unsafe { &*(handle as *const Sfs) };
+pub unsafe extern "C" fn sfs_mkdir(handle: *mut SfsFile, path: *const c_char) -> c_int {
+    let sfs = unsafe { &(*handle).0 };
     let path = match cstr_to_str(path) {
         Some(s) => s,
         None => return -1,
@@ -159,9 +184,11 @@ pub extern "C" fn sfs_mkdir(handle: *mut c_void, path: *const c_char) -> c_int {
     }
 }
 
+/// # Safety
+/// `handle` must be a live `SfsFile` pointer. `path` must be a valid C string.
 #[no_mangle]
-pub extern "C" fn sfs_rmdir(handle: *mut c_void, path: *const c_char) -> c_int {
-    let sfs = unsafe { &*(handle as *const Sfs) };
+pub unsafe extern "C" fn sfs_rmdir(handle: *mut SfsFile, path: *const c_char) -> c_int {
+    let sfs = unsafe { &(*handle).0 };
     let path = match cstr_to_str(path) {
         Some(s) => s,
         None => return -1,
@@ -175,13 +202,15 @@ pub extern "C" fn sfs_rmdir(handle: *mut c_void, path: *const c_char) -> c_int {
     }
 }
 
+/// # Safety
+/// `handle` must be a live `SfsFile` pointer. Both path arguments must be valid C strings.
 #[no_mangle]
-pub extern "C" fn sfs_rename_dir(
-    handle: *mut c_void,
+pub unsafe extern "C" fn sfs_rename_dir(
+    handle: *mut SfsFile,
     old_path: *const c_char,
     new_path: *const c_char,
 ) -> c_int {
-    let sfs = unsafe { &*(handle as *const Sfs) };
+    let sfs = unsafe { &(*handle).0 };
     let old_path = match cstr_to_str(old_path) {
         Some(s) => s,
         None => return -1,
@@ -203,13 +232,11 @@ pub extern "C" fn sfs_rename_dir(
 // Listing
 // ---------------------------------------------------------------------------
 
-struct SfsList {
-    entries: Vec<(CString, c_int)>,
-}
-
+/// # Safety
+/// `handle` must be a live `SfsFile` pointer. `path` must be a valid C string.
 #[no_mangle]
-pub extern "C" fn sfs_list(handle: *mut c_void, path: *const c_char) -> *mut c_void {
-    let sfs = unsafe { &*(handle as *const Sfs) };
+pub unsafe extern "C" fn sfs_list(handle: *mut SfsFile, path: *const c_char) -> *mut SfsList {
+    let sfs = unsafe { &(*handle).0 };
     let path = match cstr_to_str(path) {
         Some(s) => s,
         None => return std::ptr::null_mut(),
@@ -231,7 +258,7 @@ pub extern "C" fn sfs_list(handle: *mut c_void, path: *const c_char) -> *mut c_v
                 .collect();
             Box::into_raw(Box::new(SfsList {
                 entries: list_entries,
-            })) as *mut c_void
+            }))
         }
         Err(e) => {
             set_last_error(&e.to_string());
@@ -240,24 +267,30 @@ pub extern "C" fn sfs_list(handle: *mut c_void, path: *const c_char) -> *mut c_v
     }
 }
 
+/// # Safety
+/// `list` must be a valid pointer returned by `sfs_list` and not yet freed.
 #[no_mangle]
-pub extern "C" fn sfs_list_count(list: *mut c_void) -> c_int {
-    let list = unsafe { &*(list as *mut SfsList) };
+pub unsafe extern "C" fn sfs_list_count(list: *mut SfsList) -> c_int {
+    let list = unsafe { &*list };
     list.entries.len() as c_int
 }
 
+/// # Safety
+/// `list` must be a valid pointer returned by `sfs_list` and not yet freed.
 #[no_mangle]
-pub extern "C" fn sfs_list_entry_name(list: *mut c_void, index: c_int) -> *const c_char {
-    let list = unsafe { &*(list as *mut SfsList) };
+pub unsafe extern "C" fn sfs_list_entry_name(list: *mut SfsList, index: c_int) -> *const c_char {
+    let list = unsafe { &*list };
     if index < 0 || (index as usize) >= list.entries.len() {
         return std::ptr::null();
     }
     list.entries[index as usize].0.as_ptr()
 }
 
+/// # Safety
+/// `list` must be a valid pointer returned by `sfs_list` and not yet freed.
 #[no_mangle]
-pub extern "C" fn sfs_list_entry_type(list: *mut c_void, index: c_int) -> c_int {
-    let list = unsafe { &*(list as *mut SfsList) };
+pub unsafe extern "C" fn sfs_list_entry_type(list: *mut SfsList, index: c_int) -> c_int {
+    let list = unsafe { &*list };
     if index < 0 || (index as usize) >= list.entries.len() {
         return -1;
     }
@@ -267,10 +300,10 @@ pub extern "C" fn sfs_list_entry_type(list: *mut c_void, index: c_int) -> c_int 
 /// # Safety
 /// `list` must be a valid pointer returned by `sfs_list` and not yet freed.
 #[no_mangle]
-pub extern "C" fn sfs_list_free(list: *mut c_void) {
+pub unsafe extern "C" fn sfs_list_free(list: *mut SfsList) {
     if !list.is_null() {
         unsafe {
-            drop(Box::from_raw(list as *mut SfsList));
+            drop(Box::from_raw(list));
         }
     }
 }
@@ -279,22 +312,21 @@ pub extern "C" fn sfs_list_free(list: *mut c_void) {
 // Verify
 // ---------------------------------------------------------------------------
 
-struct SfsVerifyResult {
-    issues: Vec<CString>,
-}
-
 /// Run integrity verification across all layers. Returns a result handle (NULL on error).
 /// Use sfs_verify_count/sfs_verify_issue to read issues, then sfs_verify_free to release.
+///
+/// # Safety
+/// `handle` must be a live `SfsFile` pointer.
 #[no_mangle]
-pub extern "C" fn sfs_verify(handle: *mut c_void) -> *mut c_void {
-    let sfs = unsafe { &*(handle as *const Sfs) };
+pub unsafe extern "C" fn sfs_verify(handle: *mut SfsFile) -> *mut SfsVerifyResult {
+    let sfs = unsafe { &(*handle).0 };
     match sfs.verify() {
         Ok(issues) => {
             let c_issues: Vec<CString> = issues
                 .into_iter()
                 .map(|s| CString::new(s).unwrap_or_else(|_| CString::new("?").unwrap()))
                 .collect();
-            Box::into_raw(Box::new(SfsVerifyResult { issues: c_issues })) as *mut c_void
+            Box::into_raw(Box::new(SfsVerifyResult { issues: c_issues }))
         }
         Err(e) => {
             set_last_error(&e.to_string());
@@ -303,15 +335,22 @@ pub extern "C" fn sfs_verify(handle: *mut c_void) -> *mut c_void {
     }
 }
 
+/// # Safety
+/// `result` must be a valid pointer returned by `sfs_verify` and not yet freed.
 #[no_mangle]
-pub extern "C" fn sfs_verify_count(result: *mut c_void) -> c_int {
-    let result = unsafe { &*(result as *mut SfsVerifyResult) };
+pub unsafe extern "C" fn sfs_verify_count(result: *mut SfsVerifyResult) -> c_int {
+    let result = unsafe { &*result };
     result.issues.len() as c_int
 }
 
+/// # Safety
+/// `result` must be a valid pointer returned by `sfs_verify` and not yet freed.
 #[no_mangle]
-pub extern "C" fn sfs_verify_issue(result: *mut c_void, index: c_int) -> *const c_char {
-    let result = unsafe { &*(result as *mut SfsVerifyResult) };
+pub unsafe extern "C" fn sfs_verify_issue(
+    result: *mut SfsVerifyResult,
+    index: c_int,
+) -> *const c_char {
+    let result = unsafe { &*result };
     if index < 0 || (index as usize) >= result.issues.len() {
         return std::ptr::null();
     }
@@ -321,10 +360,10 @@ pub extern "C" fn sfs_verify_issue(result: *mut c_void, index: c_int) -> *const 
 /// # Safety
 /// `result` must be a valid pointer returned by `sfs_verify` and not yet freed.
 #[no_mangle]
-pub extern "C" fn sfs_verify_free(result: *mut c_void) {
+pub unsafe extern "C" fn sfs_verify_free(result: *mut SfsVerifyResult) {
     if !result.is_null() {
         unsafe {
-            drop(Box::from_raw(result as *mut SfsVerifyResult));
+            drop(Box::from_raw(result));
         }
     }
 }
@@ -334,9 +373,12 @@ pub extern "C" fn sfs_verify_free(result: *mut c_void) {
 // ---------------------------------------------------------------------------
 
 /// Create a new stream and open it for writing. Returns handle ID or -1.
+///
+/// # Safety
+/// `handle` must be a live `SfsFile` pointer. `path` must be a valid C string.
 #[no_mangle]
-pub extern "C" fn sfs_create_stream(handle: *mut c_void, path: *const c_char) -> i64 {
-    let sfs = unsafe { &*(handle as *const Sfs) };
+pub unsafe extern "C" fn sfs_create_stream(handle: *mut SfsFile, path: *const c_char) -> i64 {
+    let sfs = unsafe { &(*handle).0 };
     let path = match cstr_to_str(path) {
         Some(s) => s,
         None => return -1,
@@ -351,9 +393,16 @@ pub extern "C" fn sfs_create_stream(handle: *mut c_void, path: *const c_char) ->
 }
 
 /// Open an existing stream. mode: 0=READ, 1=WRITE. Returns handle ID or -1.
+///
+/// # Safety
+/// `handle` must be a live `SfsFile` pointer. `path` must be a valid C string.
 #[no_mangle]
-pub extern "C" fn sfs_open_stream(handle: *mut c_void, path: *const c_char, mode: c_int) -> i64 {
-    let sfs = unsafe { &*(handle as *const Sfs) };
+pub unsafe extern "C" fn sfs_open_stream(
+    handle: *mut SfsFile,
+    path: *const c_char,
+    mode: c_int,
+) -> i64 {
+    let sfs = unsafe { &(*handle).0 };
     let path = match cstr_to_str(path) {
         Some(s) => s,
         None => return -1,
@@ -376,9 +425,12 @@ pub extern "C" fn sfs_open_stream(handle: *mut c_void, path: *const c_char, mode
 }
 
 /// Close a stream handle.
+///
+/// # Safety
+/// `handle` must be a live `SfsFile` pointer. `stream` must be an open stream handle ID.
 #[no_mangle]
-pub extern "C" fn sfs_close_stream(handle: *mut c_void, stream: i64) -> c_int {
-    let sfs = unsafe { &*(handle as *const Sfs) };
+pub unsafe extern "C" fn sfs_close_stream(handle: *mut SfsFile, stream: i64) -> c_int {
+    let sfs = unsafe { &(*handle).0 };
     match sfs.close_stream(StreamHandle::from_id(stream as u64)) {
         Ok(()) => 0,
         Err(e) => {
@@ -389,9 +441,12 @@ pub extern "C" fn sfs_close_stream(handle: *mut c_void, stream: i64) -> c_int {
 }
 
 /// Delete a stream by path. Must not be currently open.
+///
+/// # Safety
+/// `handle` must be a live `SfsFile` pointer. `path` must be a valid C string.
 #[no_mangle]
-pub extern "C" fn sfs_delete_stream(handle: *mut c_void, path: *const c_char) -> c_int {
-    let sfs = unsafe { &*(handle as *const Sfs) };
+pub unsafe extern "C" fn sfs_delete_stream(handle: *mut SfsFile, path: *const c_char) -> c_int {
+    let sfs = unsafe { &(*handle).0 };
     let path = match cstr_to_str(path) {
         Some(s) => s,
         None => return -1,
@@ -406,13 +461,16 @@ pub extern "C" fn sfs_delete_stream(handle: *mut c_void, path: *const c_char) ->
 }
 
 /// Rename/move a stream by path. Must not be currently open.
+///
+/// # Safety
+/// `handle` must be a live `SfsFile` pointer. Both path arguments must be valid C strings.
 #[no_mangle]
-pub extern "C" fn sfs_rename_stream(
-    handle: *mut c_void,
+pub unsafe extern "C" fn sfs_rename_stream(
+    handle: *mut SfsFile,
     old_path: *const c_char,
     new_path: *const c_char,
 ) -> c_int {
-    let sfs = unsafe { &*(handle as *const Sfs) };
+    let sfs = unsafe { &(*handle).0 };
     let old_path = match cstr_to_str(old_path) {
         Some(s) => s,
         None => return -1,
@@ -435,11 +493,20 @@ pub extern "C" fn sfs_rename_stream(
 // ---------------------------------------------------------------------------
 
 /// Read up to `len` bytes. Returns bytes read or -1 on error.
+///
+/// # Safety
+/// `handle` must be a live `SfsFile` pointer. `stream` must be an open stream handle ID.
+/// `buf` must point to at least `len` writable bytes.
 #[no_mangle]
-pub extern "C" fn sfs_read(handle: *mut c_void, stream: i64, buf: *mut c_void, len: u64) -> i64 {
-    let sfs = unsafe { &*(handle as *const Sfs) };
+pub unsafe extern "C" fn sfs_stream_read(
+    handle: *mut SfsFile,
+    stream: i64,
+    buf: *mut u8,
+    len: u64,
+) -> i64 {
+    let sfs = unsafe { &(*handle).0 };
     let sh = StreamHandle::from_id(stream as u64);
-    let buf = unsafe { std::slice::from_raw_parts_mut(buf as *mut u8, len as usize) };
+    let buf = unsafe { std::slice::from_raw_parts_mut(buf, len as usize) };
     match sfs.read(&sh, buf) {
         Ok(n) => n as i64,
         Err(e) => {
@@ -450,11 +517,20 @@ pub extern "C" fn sfs_read(handle: *mut c_void, stream: i64, buf: *mut c_void, l
 }
 
 /// Write `len` bytes. Returns bytes written or -1 on error.
+///
+/// # Safety
+/// `handle` must be a live `SfsFile` pointer. `stream` must be an open stream handle ID.
+/// `buf` must point to at least `len` readable bytes.
 #[no_mangle]
-pub extern "C" fn sfs_write(handle: *mut c_void, stream: i64, buf: *const c_void, len: u64) -> i64 {
-    let sfs = unsafe { &*(handle as *const Sfs) };
+pub unsafe extern "C" fn sfs_stream_write(
+    handle: *mut SfsFile,
+    stream: i64,
+    buf: *const u8,
+    len: u64,
+) -> i64 {
+    let sfs = unsafe { &(*handle).0 };
     let sh = StreamHandle::from_id(stream as u64);
-    let buf = unsafe { std::slice::from_raw_parts(buf as *const u8, len as usize) };
+    let buf = unsafe { std::slice::from_raw_parts(buf, len as usize) };
     match sfs.write(&sh, buf) {
         Ok(n) => n as i64,
         Err(e) => {
@@ -465,9 +541,12 @@ pub extern "C" fn sfs_write(handle: *mut c_void, stream: i64, buf: *const c_void
 }
 
 /// Set the head position. Returns 0 or -1.
+///
+/// # Safety
+/// `handle` must be a live `SfsFile` pointer. `stream` must be an open stream handle ID.
 #[no_mangle]
-pub extern "C" fn sfs_seek(handle: *mut c_void, stream: i64, pos: u64) -> c_int {
-    let sfs = unsafe { &*(handle as *const Sfs) };
+pub unsafe extern "C" fn sfs_stream_seek(handle: *mut SfsFile, stream: i64, pos: u64) -> c_int {
+    let sfs = unsafe { &(*handle).0 };
     let sh = StreamHandle::from_id(stream as u64);
     match sfs.seek(&sh, pos) {
         Ok(()) => 0,
@@ -479,9 +558,12 @@ pub extern "C" fn sfs_seek(handle: *mut c_void, stream: i64, pos: u64) -> c_int 
 }
 
 /// Get the current head position. Returns position or -1 on error.
+///
+/// # Safety
+/// `handle` must be a live `SfsFile` pointer. `stream` must be an open stream handle ID.
 #[no_mangle]
-pub extern "C" fn sfs_tell(handle: *mut c_void, stream: i64) -> i64 {
-    let sfs = unsafe { &*(handle as *const Sfs) };
+pub unsafe extern "C" fn sfs_stream_tell(handle: *mut SfsFile, stream: i64) -> i64 {
+    let sfs = unsafe { &(*handle).0 };
     let sh = StreamHandle::from_id(stream as u64);
     match sfs.tell(&sh) {
         Ok(pos) => pos as i64,
@@ -493,9 +575,12 @@ pub extern "C" fn sfs_tell(handle: *mut c_void, stream: i64) -> i64 {
 }
 
 /// Get the stream length. Returns length or -1 on error.
+///
+/// # Safety
+/// `handle` must be a live `SfsFile` pointer. `stream` must be an open stream handle ID.
 #[no_mangle]
-pub extern "C" fn sfs_stream_length(handle: *mut c_void, stream: i64) -> i64 {
-    let sfs = unsafe { &*(handle as *const Sfs) };
+pub unsafe extern "C" fn sfs_stream_length(handle: *mut SfsFile, stream: i64) -> i64 {
+    let sfs = unsafe { &(*handle).0 };
     let sh = StreamHandle::from_id(stream as u64);
     match sfs.stream_length(&sh) {
         Ok(len) => len as i64,
@@ -507,9 +592,16 @@ pub extern "C" fn sfs_stream_length(handle: *mut c_void, stream: i64) -> i64 {
 }
 
 /// Truncate a stream. Returns 0 or -1.
+///
+/// # Safety
+/// `handle` must be a live `SfsFile` pointer. `stream` must be an open stream handle ID.
 #[no_mangle]
-pub extern "C" fn sfs_truncate(handle: *mut c_void, stream: i64, new_len: u64) -> c_int {
-    let sfs = unsafe { &*(handle as *const Sfs) };
+pub unsafe extern "C" fn sfs_stream_truncate(
+    handle: *mut SfsFile,
+    stream: i64,
+    new_len: u64,
+) -> c_int {
+    let sfs = unsafe { &(*handle).0 };
     let sh = StreamHandle::from_id(stream as u64);
     match sfs.truncate(&sh, new_len) {
         Ok(()) => 0,
@@ -521,9 +613,16 @@ pub extern "C" fn sfs_truncate(handle: *mut c_void, stream: i64, new_len: u64) -
 }
 
 /// Pre-allocate storage for a stream. Returns 0 or -1.
+///
+/// # Safety
+/// `handle` must be a live `SfsFile` pointer. `stream` must be an open stream handle ID.
 #[no_mangle]
-pub extern "C" fn sfs_reserve(handle: *mut c_void, stream: i64, n_bytes: u64) -> c_int {
-    let sfs = unsafe { &*(handle as *const Sfs) };
+pub unsafe extern "C" fn sfs_stream_reserve(
+    handle: *mut SfsFile,
+    stream: i64,
+    n_bytes: u64,
+) -> c_int {
+    let sfs = unsafe { &(*handle).0 };
     let sh = StreamHandle::from_id(stream as u64);
     match sfs.reserve(&sh, n_bytes) {
         Ok(()) => 0,
@@ -535,9 +634,12 @@ pub extern "C" fn sfs_reserve(handle: *mut c_void, stream: i64, n_bytes: u64) ->
 }
 
 /// Get the reserved capacity of a stream. Returns capacity or -1 on error.
+///
+/// # Safety
+/// `handle` must be a live `SfsFile` pointer. `stream` must be an open stream handle ID.
 #[no_mangle]
-pub extern "C" fn sfs_stream_reserved(handle: *mut c_void, stream: i64) -> i64 {
-    let sfs = unsafe { &*(handle as *const Sfs) };
+pub unsafe extern "C" fn sfs_stream_reserved(handle: *mut SfsFile, stream: i64) -> i64 {
+    let sfs = unsafe { &(*handle).0 };
     let sh = StreamHandle::from_id(stream as u64);
     match sfs.stream_reserved(&sh) {
         Ok(r) => r as i64,

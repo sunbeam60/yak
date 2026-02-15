@@ -106,6 +106,7 @@ fn print_bench_usage() {
     eprintln!("  threaded-read    T threads reading streams concurrently");
     eprintln!("  threaded-mixed   T/2 readers + T/2 writers concurrently");
     eprintln!("  churn            Write then delete many streams (5 rounds)");
+    eprintln!("  reuse            Fresh vs recycled-block read throughput");
     eprintln!("  single-stream    Write + read one 64MB stream (contiguous I/O test)");
     eprintln!("  warm-read        Write then read 2750x10KB streams (same instance, warm cache)");
     eprintln!("  all              Run all scenarios in sequence");
@@ -134,6 +135,7 @@ pub fn cmd_bench(args: &[String]) -> Result<(), ()> {
         "threaded-read" => run_threaded_read(bench_args.bss, bench_args.biw, bench_args.threads),
         "threaded-mixed" => run_threaded_mixed(bench_args.bss, bench_args.biw, bench_args.threads),
         "churn" => run_churn(bench_args.bss, bench_args.biw),
+        "reuse" => run_reuse(bench_args.bss, bench_args.biw),
         "single-stream" => run_single_stream(bench_args.bss, bench_args.biw),
         "warm-read" => run_warm_read(bench_args.bss, bench_args.biw),
         "all" => run_all(bench_args.bss, bench_args.biw, bench_args.threads),
@@ -483,6 +485,92 @@ fn run_churn(bss: u8, biw: u8) -> Result<(), ()> {
     Ok(())
 }
 
+/// Write streams, read them (baseline), delete all, re-write into recycled
+/// blocks, then read again. Compares "fresh" vs "reused-block" read throughput.
+fn run_reuse(bss: u8, biw: u8) -> Result<(), ()> {
+    let _guard = CleanupGuard { path: BENCH_FILE };
+    let sfs = Sfs::create(BENCH_FILE, biw, bss).map_err(|e| eprintln!("Error: {}", e))?;
+    let stream_size = 512 * 1024usize;
+    let n = 50usize;
+    let buf = make_buffer(stream_size);
+
+    // Phase 1: populate (fresh contiguous allocation)
+    for i in 0..n {
+        let name = format!("reuse_{:04}.bin", i);
+        let h = sfs
+            .create_stream(&name)
+            .map_err(|e| eprintln!("Error: {}", e))?;
+        sfs.write(&h, &buf)
+            .map_err(|e| eprintln!("Error: {}", e))?;
+        sfs.close_stream(h)
+            .map_err(|e| eprintln!("Error: {}", e))?;
+    }
+
+    // Phase 2: read baseline (fresh contiguous blocks)
+    let t_fresh = Instant::now();
+    for i in 0..n {
+        let name = format!("reuse_{:04}.bin", i);
+        let h = sfs
+            .open_stream(&name, OpenMode::Read)
+            .map_err(|e| eprintln!("Error: {}", e))?;
+        let mut rbuf = vec![0u8; stream_size];
+        sfs.read(&h, &mut rbuf)
+            .map_err(|e| eprintln!("Error: {}", e))?;
+        sfs.close_stream(h)
+            .map_err(|e| eprintln!("Error: {}", e))?;
+    }
+    let fresh_ms = t_fresh.elapsed().as_secs_f64() * 1000.0;
+
+    // Phase 3: delete all
+    for i in 0..n {
+        let name = format!("reuse_{:04}.bin", i);
+        sfs.delete_stream(&name)
+            .map_err(|e| eprintln!("Error: {}", e))?;
+    }
+
+    // Phase 4: repopulate (recycled blocks)
+    for i in 0..n {
+        let name = format!("reuse_{:04}.bin", i);
+        let h = sfs
+            .create_stream(&name)
+            .map_err(|e| eprintln!("Error: {}", e))?;
+        sfs.write(&h, &buf)
+            .map_err(|e| eprintln!("Error: {}", e))?;
+        sfs.close_stream(h)
+            .map_err(|e| eprintln!("Error: {}", e))?;
+    }
+
+    // Phase 5: read after reuse
+    let t_reuse = Instant::now();
+    for i in 0..n {
+        let name = format!("reuse_{:04}.bin", i);
+        let h = sfs
+            .open_stream(&name, OpenMode::Read)
+            .map_err(|e| eprintln!("Error: {}", e))?;
+        let mut rbuf = vec![0u8; stream_size];
+        sfs.read(&h, &mut rbuf)
+            .map_err(|e| eprintln!("Error: {}", e))?;
+        sfs.close_stream(h)
+            .map_err(|e| eprintln!("Error: {}", e))?;
+    }
+    let reuse_ms = t_reuse.elapsed().as_secs_f64() * 1000.0;
+
+    let mb = (n * stream_size) as f64 / (1024.0 * 1024.0);
+    eprintln!(
+        "  fresh read: {:.0} ms  ({:.1} MB/s)",
+        fresh_ms,
+        mb / (fresh_ms / 1000.0)
+    );
+    eprintln!(
+        "  reuse read: {:.0} ms  ({:.1} MB/s)",
+        reuse_ms,
+        mb / (reuse_ms / 1000.0)
+    );
+
+    sfs.close().map_err(|e| eprintln!("Error closing: {}", e))?;
+    Ok(())
+}
+
 /// Populate 100 streams, then T/2 threads read while T/2 threads write concurrently.
 fn run_threaded_mixed(bss: u8, biw: u8, threads: usize) -> Result<(), ()> {
     let _guard = CleanupGuard { path: BENCH_FILE };
@@ -710,6 +798,9 @@ fn run_all(bss: u8, biw: u8, threads: usize) -> Result<(), ()> {
 
     eprintln!("[churn]");
     run_churn(bss, biw)?;
+
+    eprintln!("[reuse]");
+    run_reuse(bss, biw)?;
 
     eprintln!("[single-stream]");
     run_single_stream(bss, biw)?;

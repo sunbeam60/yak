@@ -2,6 +2,7 @@
 members = [
     "stream_fs",
     "stream_fs_c",
+    "stream_fs_python",
     "sfs_cl",
 ]
 resolver = "2"

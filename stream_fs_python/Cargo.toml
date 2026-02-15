@@ -1,0 +1,16 @@
+[package]
+name = "stream_fs_python"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Python bindings for the Stream File System library"
+
+[lib]
+name = "sfs"
+crate-type = ["cdylib"]
+
+[dependencies]
+stream_fs.workspace = true
+pyo3 = { version = "0.28", features = ["extension-module"] }

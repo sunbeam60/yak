@@ -231,8 +231,9 @@ import os, sys
 sys.path.insert(0, sys.argv[1])
 import sfs
 
+mode = sfs.OpenMode.READ if sys.argv[3] == "0" else sfs.OpenMode.WRITE
 try:
-    f = sfs.Sfs.open(sys.argv[2], sfs.OpenMode(int(sys.argv[3])))
+    f = sfs.Sfs.open(sys.argv[2], mode)
     f.close()
 except sfs.SfsError:
     os._exit(1)
@@ -249,7 +250,7 @@ def _try_open_in_child(sfs_path, mode):
         os.path.join(os.path.dirname(__file__), "..")
     )
     result = subprocess.run(
-        [sys.executable, "-c", _CHILD_SCRIPT, sfs_pytest_dir, sfs_path, str(mode)],
+        [sys.executable, "-c", _CHILD_SCRIPT, sfs_pytest_dir, sfs_path, str(int(mode))],
         capture_output=True, timeout=10,
     )
     return result.returncode == 0

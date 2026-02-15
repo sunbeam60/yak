@@ -22,11 +22,12 @@ This is a low level library. Memory allocations should be minimized when possibl
 Samply is used for profiling release builds. Please see ./.vscode/tasks.json for how they are defined.
 
 ## Workspace harness
-Whenever you make changes, they must be in sync across the four key projects:
-./../stream_fs/     - the main project for the library
-./../sfs_cl/        - the command line utility that enables command line manipulation of .stream_fs files
-./../stream_fs_c    - the C FFI wrapper around the main stream_fs module
-./../sfs_pytest     - the python testing harness that enables rapid testing of SFS files the stream_fs library
+Whenever you make changes, they must be in sync across the five key projects:
+./../stream_fs/         - the main project for the library
+./../sfs_cl/            - the command line utility that enables command line manipulation of .stream_fs files
+./../stream_fs_c/       - the C FFI wrapper around the main stream_fs module
+./../stream_fs_python/  - the PyO3 Python bindings around the main stream_fs module (installed via `maturin develop`)
+./../sfs_pytest/        - the python testing harness that enables rapid testing of SFS files the stream_fs library
 
 ## Test Driven Development
 As far as possible, when planning features, help the author first plan out how this feature should be tested in the pytest library. Only after tests have been planned and written, and failed, should we move to implementation and satisfy the tests. This won't always be possible, but whenever it is, this is the preferred method for development. Whenever large changes have been achieved, the full test suite in sfs_pytest must pass too.

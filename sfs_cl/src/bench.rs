@@ -4,9 +4,10 @@ use std::time::Instant;
 
 use stream_fs::{OpenMode, SfsDefault as Sfs};
 
+use crate::error::{CliError, CliResult};
+use crate::helpers::{DEFAULT_BLOCK_INDEX_WIDTH, DEFAULT_BLOCK_SIZE_SHIFT};
+
 const BENCH_FILE: &str = "_bench.sfs";
-const DEFAULT_BSS: u8 = 12;
-const DEFAULT_BIW: u8 = 4;
 const DEFAULT_THREADS: usize = 4;
 
 // ---------------------------------------------------------------------------
@@ -42,15 +43,15 @@ struct BenchArgs {
     threads: usize,
 }
 
-fn parse_bench_args(args: &[String]) -> Result<BenchArgs, ()> {
+fn parse_bench_args(args: &[String]) -> Result<BenchArgs, CliError> {
     if args.is_empty() {
         print_bench_usage();
-        return Err(());
+        return Err(CliError::new("No scenario specified"));
     }
 
     let scenario = args[0].clone();
-    let mut bss = DEFAULT_BSS;
-    let mut biw = DEFAULT_BIW;
+    let mut bss = DEFAULT_BLOCK_SIZE_SHIFT;
+    let mut biw = DEFAULT_BLOCK_INDEX_WIDTH;
     let mut threads = DEFAULT_THREADS;
 
     let mut i = 1;
@@ -61,26 +62,25 @@ fn parse_bench_args(args: &[String]) -> Result<BenchArgs, ()> {
                 bss = args
                     .get(i)
                     .and_then(|s| s.parse().ok())
-                    .ok_or_else(|| eprintln!("--block-shift requires a numeric argument"))?;
+                    .ok_or_else(|| CliError::new("--block-shift requires a numeric argument"))?;
             }
             "--index-width" => {
                 i += 1;
                 biw = args
                     .get(i)
                     .and_then(|s| s.parse().ok())
-                    .ok_or_else(|| eprintln!("--index-width requires a numeric argument"))?;
+                    .ok_or_else(|| CliError::new("--index-width requires a numeric argument"))?;
             }
             "--threads" => {
                 i += 1;
                 threads = args
                     .get(i)
                     .and_then(|s| s.parse().ok())
-                    .ok_or_else(|| eprintln!("--threads requires a numeric argument"))?;
+                    .ok_or_else(|| CliError::new("--threads requires a numeric argument"))?;
             }
             other => {
-                eprintln!("Unknown option: {}", other);
                 print_bench_usage();
-                return Err(());
+                return Err(CliError::new(format!("Unknown option: {}", other)));
             }
         }
         i += 1;
@@ -123,7 +123,7 @@ fn print_bench_usage() {
 // Entry point
 // ---------------------------------------------------------------------------
 
-pub fn cmd_bench(args: &[String]) -> Result<(), ()> {
+pub fn cmd_bench(args: &[String]) -> CliResult {
     let bench_args = parse_bench_args(args)?;
 
     match bench_args.scenario.as_str() {
@@ -140,11 +140,18 @@ pub fn cmd_bench(args: &[String]) -> Result<(), ()> {
         "warm-read" => run_warm_read(bench_args.bss, bench_args.biw),
         "all" => run_all(bench_args.bss, bench_args.biw, bench_args.threads),
         other => {
-            eprintln!("Unknown bench scenario: {}", other);
             print_bench_usage();
-            Err(())
+            Err(CliError::new(format!("Unknown bench scenario: {}", other)))
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Helper — shorthand for the repeated .map_err pattern in benchmarks
+// ---------------------------------------------------------------------------
+
+fn err(e: impl std::fmt::Display) -> CliError {
+    CliError::new(format!("Benchmark error: {}", e))
 }
 
 // ---------------------------------------------------------------------------
@@ -152,55 +159,47 @@ pub fn cmd_bench(args: &[String]) -> Result<(), ()> {
 // ---------------------------------------------------------------------------
 
 /// Write 5 streams of 30MB each.
-fn run_large_write(bss: u8, biw: u8) -> Result<(), ()> {
+fn run_large_write(bss: u8, biw: u8) -> CliResult {
     let _guard = CleanupGuard { path: BENCH_FILE };
-    let sfs = Sfs::create(BENCH_FILE, biw, bss).map_err(|e| eprintln!("Error: {}", e))?;
+    let sfs = Sfs::create(BENCH_FILE, biw, bss).map_err(err)?;
     let buf = make_buffer(30 * 1024 * 1024);
 
     let t0 = Instant::now();
     for i in 0..5 {
         let name = format!("large_{}.bin", i);
-        let handle = sfs
-            .create_stream(&name)
-            .map_err(|e| eprintln!("Error: {}", e))?;
-        sfs.write(&handle, &buf)
-            .map_err(|e| eprintln!("Error: {}", e))?;
-        sfs.close_stream(handle)
-            .map_err(|e| eprintln!("Error: {}", e))?;
+        let handle = sfs.create_stream(&name).map_err(err)?;
+        sfs.write(&handle, &buf).map_err(err)?;
+        sfs.close_stream(handle).map_err(err)?;
     }
     eprintln!("  elapsed: {:.0} ms", t0.elapsed().as_secs_f64() * 1000.0);
 
-    sfs.close().map_err(|e| eprintln!("Error closing: {}", e))?;
+    sfs.close().map_err(err)?;
     Ok(())
 }
 
 /// Write 180 streams of 10KB each.
-fn run_small_write(bss: u8, biw: u8) -> Result<(), ()> {
+fn run_small_write(bss: u8, biw: u8) -> CliResult {
     let _guard = CleanupGuard { path: BENCH_FILE };
-    let sfs = Sfs::create(BENCH_FILE, biw, bss).map_err(|e| eprintln!("Error: {}", e))?;
+    let sfs = Sfs::create(BENCH_FILE, biw, bss).map_err(err)?;
     let buf = make_buffer(10 * 1024);
 
     let t0 = Instant::now();
     for i in 0..180 {
         let name = format!("stream_{:04}.bin", i);
-        let handle = sfs
-            .create_stream(&name)
-            .map_err(|e| eprintln!("Error: {}", e))?;
-        sfs.write(&handle, &buf)
-            .map_err(|e| eprintln!("Error: {}", e))?;
-        sfs.close_stream(handle)
-            .map_err(|e| eprintln!("Error: {}", e))?;
+        let handle = sfs.create_stream(&name).map_err(err)?;
+        sfs.write(&handle, &buf).map_err(err)?;
+        sfs.close_stream(handle).map_err(err)?;
     }
     eprintln!("  elapsed: {:.0} ms", t0.elapsed().as_secs_f64() * 1000.0);
 
-    sfs.close().map_err(|e| eprintln!("Error closing: {}", e))?;
+    sfs.close().map_err(err)?;
     Ok(())
 }
 
 /// T threads, each writing a partition of 125 streams (100KB each).
-fn run_threaded_write(bss: u8, biw: u8, threads: usize) -> Result<(), ()> {
+fn run_threaded_write(bss: u8, biw: u8, threads: usize) -> CliResult {
     let _guard = CleanupGuard { path: BENCH_FILE };
-    let sfs = Arc::new(Sfs::create(BENCH_FILE, biw, bss).map_err(|e| eprintln!("Error: {}", e))?);
+    let sfs = Arc::new(Sfs::create(BENCH_FILE, biw, bss).map_err(err)?);
     let buf = Arc::new(make_buffer(100 * 1024));
 
     let total_streams = 125usize;
@@ -246,14 +245,14 @@ fn run_threaded_write(bss: u8, biw: u8, threads: usize) -> Result<(), ()> {
     }
 
     if failed {
-        Err(())
+        Err(CliError::new("One or more threads failed"))
     } else {
         Ok(())
     }
 }
 
 /// Populate streams, then T threads each read all streams.
-fn run_threaded_read(bss: u8, biw: u8, threads: usize) -> Result<(), ()> {
+fn run_threaded_read(bss: u8, biw: u8, threads: usize) -> CliResult {
     let _guard = CleanupGuard { path: BENCH_FILE };
 
     let stream_count = 230usize;
@@ -261,24 +260,19 @@ fn run_threaded_read(bss: u8, biw: u8, threads: usize) -> Result<(), ()> {
 
     // Phase 1: populate (single-threaded)
     {
-        let sfs = Sfs::create(BENCH_FILE, biw, bss).map_err(|e| eprintln!("Error: {}", e))?;
+        let sfs = Sfs::create(BENCH_FILE, biw, bss).map_err(err)?;
         let buf = make_buffer(stream_size);
         for i in 0..stream_count {
             let name = format!("stream_{:04}.bin", i);
-            let handle = sfs
-                .create_stream(&name)
-                .map_err(|e| eprintln!("Error: {}", e))?;
-            sfs.write(&handle, &buf)
-                .map_err(|e| eprintln!("Error: {}", e))?;
-            sfs.close_stream(handle)
-                .map_err(|e| eprintln!("Error: {}", e))?;
+            let handle = sfs.create_stream(&name).map_err(err)?;
+            sfs.write(&handle, &buf).map_err(err)?;
+            sfs.close_stream(handle).map_err(err)?;
         }
-        sfs.close().map_err(|e| eprintln!("Error closing: {}", e))?;
+        sfs.close().map_err(err)?;
     }
 
     // Phase 2: concurrent reads
-    let sfs =
-        Arc::new(Sfs::open(BENCH_FILE, OpenMode::Read).map_err(|e| eprintln!("Error: {}", e))?);
+    let sfs = Arc::new(Sfs::open(BENCH_FILE, OpenMode::Read).map_err(err)?);
 
     let t0 = Instant::now();
     let handles: Vec<_> = (0..threads)
@@ -319,14 +313,14 @@ fn run_threaded_read(bss: u8, biw: u8, threads: usize) -> Result<(), ()> {
     }
 
     if failed {
-        Err(())
+        Err(CliError::new("One or more threads failed"))
     } else {
         Ok(())
     }
 }
 
 /// Populate 17×10MB + 17×20MB streams, then read them all back (510MB total).
-fn run_large_read(bss: u8, biw: u8) -> Result<(), ()> {
+fn run_large_read(bss: u8, biw: u8) -> CliResult {
     let _guard = CleanupGuard { path: BENCH_FILE };
 
     let size_10mb = 10 * 1024 * 1024usize;
@@ -335,76 +329,56 @@ fn run_large_read(bss: u8, biw: u8) -> Result<(), ()> {
 
     // Phase 1: populate
     {
-        let sfs = Sfs::create(BENCH_FILE, biw, bss).map_err(|e| eprintln!("Error: {}", e))?;
+        let sfs = Sfs::create(BENCH_FILE, biw, bss).map_err(err)?;
 
         let buf_10 = make_buffer(size_10mb);
         for i in 0..streams_per_tier {
             let name = format!("large_10m_{}.bin", i);
-            let handle = sfs
-                .create_stream(&name)
-                .map_err(|e| eprintln!("Error: {}", e))?;
-            sfs.write(&handle, &buf_10)
-                .map_err(|e| eprintln!("Error: {}", e))?;
-            sfs.close_stream(handle)
-                .map_err(|e| eprintln!("Error: {}", e))?;
+            let handle = sfs.create_stream(&name).map_err(err)?;
+            sfs.write(&handle, &buf_10).map_err(err)?;
+            sfs.close_stream(handle).map_err(err)?;
         }
 
         let buf_20 = make_buffer(size_20mb);
         for i in 0..streams_per_tier {
             let name = format!("large_20m_{}.bin", i);
-            let handle = sfs
-                .create_stream(&name)
-                .map_err(|e| eprintln!("Error: {}", e))?;
-            sfs.write(&handle, &buf_20)
-                .map_err(|e| eprintln!("Error: {}", e))?;
-            sfs.close_stream(handle)
-                .map_err(|e| eprintln!("Error: {}", e))?;
+            let handle = sfs.create_stream(&name).map_err(err)?;
+            sfs.write(&handle, &buf_20).map_err(err)?;
+            sfs.close_stream(handle).map_err(err)?;
         }
 
-        sfs.close().map_err(|e| eprintln!("Error closing: {}", e))?;
+        sfs.close().map_err(err)?;
     }
 
     // Phase 2: read back
-    let sfs = Sfs::open(BENCH_FILE, OpenMode::Read).map_err(|e| eprintln!("Error: {}", e))?;
+    let sfs = Sfs::open(BENCH_FILE, OpenMode::Read).map_err(err)?;
 
     let t0 = Instant::now();
     for i in 0..streams_per_tier {
         let name = format!("large_10m_{}.bin", i);
-        let handle = sfs
-            .open_stream(&name, OpenMode::Read)
-            .map_err(|e| eprintln!("Error: {}", e))?;
-        let len = sfs
-            .stream_length(&handle)
-            .map_err(|e| eprintln!("Error: {}", e))? as usize;
+        let handle = sfs.open_stream(&name, OpenMode::Read).map_err(err)?;
+        let len = sfs.stream_length(&handle).map_err(err)? as usize;
         let mut buf = vec![0u8; len];
-        sfs.read(&handle, &mut buf)
-            .map_err(|e| eprintln!("Error: {}", e))?;
-        sfs.close_stream(handle)
-            .map_err(|e| eprintln!("Error: {}", e))?;
+        sfs.read(&handle, &mut buf).map_err(err)?;
+        sfs.close_stream(handle).map_err(err)?;
     }
 
     for i in 0..streams_per_tier {
         let name = format!("large_20m_{}.bin", i);
-        let handle = sfs
-            .open_stream(&name, OpenMode::Read)
-            .map_err(|e| eprintln!("Error: {}", e))?;
-        let len = sfs
-            .stream_length(&handle)
-            .map_err(|e| eprintln!("Error: {}", e))? as usize;
+        let handle = sfs.open_stream(&name, OpenMode::Read).map_err(err)?;
+        let len = sfs.stream_length(&handle).map_err(err)? as usize;
         let mut buf = vec![0u8; len];
-        sfs.read(&handle, &mut buf)
-            .map_err(|e| eprintln!("Error: {}", e))?;
-        sfs.close_stream(handle)
-            .map_err(|e| eprintln!("Error: {}", e))?;
+        sfs.read(&handle, &mut buf).map_err(err)?;
+        sfs.close_stream(handle).map_err(err)?;
     }
     eprintln!("  elapsed: {:.0} ms", t0.elapsed().as_secs_f64() * 1000.0);
 
-    sfs.close().map_err(|e| eprintln!("Error closing: {}", e))?;
+    sfs.close().map_err(err)?;
     Ok(())
 }
 
 /// Populate 2750 streams of 10KB, then read them all back.
-fn run_small_read(bss: u8, biw: u8) -> Result<(), ()> {
+fn run_small_read(bss: u8, biw: u8) -> CliResult {
     let _guard = CleanupGuard { path: BENCH_FILE };
 
     let stream_count = 2750usize;
@@ -412,49 +386,39 @@ fn run_small_read(bss: u8, biw: u8) -> Result<(), ()> {
 
     // Phase 1: populate
     {
-        let sfs = Sfs::create(BENCH_FILE, biw, bss).map_err(|e| eprintln!("Error: {}", e))?;
+        let sfs = Sfs::create(BENCH_FILE, biw, bss).map_err(err)?;
         let buf = make_buffer(stream_size);
         for i in 0..stream_count {
             let name = format!("stream_{:04}.bin", i);
-            let handle = sfs
-                .create_stream(&name)
-                .map_err(|e| eprintln!("Error: {}", e))?;
-            sfs.write(&handle, &buf)
-                .map_err(|e| eprintln!("Error: {}", e))?;
-            sfs.close_stream(handle)
-                .map_err(|e| eprintln!("Error: {}", e))?;
+            let handle = sfs.create_stream(&name).map_err(err)?;
+            sfs.write(&handle, &buf).map_err(err)?;
+            sfs.close_stream(handle).map_err(err)?;
         }
-        sfs.close().map_err(|e| eprintln!("Error closing: {}", e))?;
+        sfs.close().map_err(err)?;
     }
 
     // Phase 2: read back
-    let sfs = Sfs::open(BENCH_FILE, OpenMode::Read).map_err(|e| eprintln!("Error: {}", e))?;
+    let sfs = Sfs::open(BENCH_FILE, OpenMode::Read).map_err(err)?;
 
     let t0 = Instant::now();
     for i in 0..stream_count {
         let name = format!("stream_{:04}.bin", i);
-        let handle = sfs
-            .open_stream(&name, OpenMode::Read)
-            .map_err(|e| eprintln!("Error: {}", e))?;
-        let len = sfs
-            .stream_length(&handle)
-            .map_err(|e| eprintln!("Error: {}", e))? as usize;
+        let handle = sfs.open_stream(&name, OpenMode::Read).map_err(err)?;
+        let len = sfs.stream_length(&handle).map_err(err)? as usize;
         let mut buf = vec![0u8; len];
-        sfs.read(&handle, &mut buf)
-            .map_err(|e| eprintln!("Error: {}", e))?;
-        sfs.close_stream(handle)
-            .map_err(|e| eprintln!("Error: {}", e))?;
+        sfs.read(&handle, &mut buf).map_err(err)?;
+        sfs.close_stream(handle).map_err(err)?;
     }
     eprintln!("  elapsed: {:.0} ms", t0.elapsed().as_secs_f64() * 1000.0);
 
-    sfs.close().map_err(|e| eprintln!("Error closing: {}", e))?;
+    sfs.close().map_err(err)?;
     Ok(())
 }
 
 /// Write 20 streams of 512KB then delete them all, repeated 5 times.
-fn run_churn(bss: u8, biw: u8) -> Result<(), ()> {
+fn run_churn(bss: u8, biw: u8) -> CliResult {
     let _guard = CleanupGuard { path: BENCH_FILE };
-    let sfs = Sfs::create(BENCH_FILE, biw, bss).map_err(|e| eprintln!("Error: {}", e))?;
+    let sfs = Sfs::create(BENCH_FILE, biw, bss).map_err(err)?;
     let buf = make_buffer(512 * 1024);
     let n = 20usize;
 
@@ -463,33 +427,28 @@ fn run_churn(bss: u8, biw: u8) -> Result<(), ()> {
         // Write phase
         for i in 0..n {
             let name = format!("churn_{:04}.bin", i);
-            let handle = sfs
-                .create_stream(&name)
-                .map_err(|e| eprintln!("Error: {}", e))?;
-            sfs.write(&handle, &buf)
-                .map_err(|e| eprintln!("Error: {}", e))?;
-            sfs.close_stream(handle)
-                .map_err(|e| eprintln!("Error: {}", e))?;
+            let handle = sfs.create_stream(&name).map_err(err)?;
+            sfs.write(&handle, &buf).map_err(err)?;
+            sfs.close_stream(handle).map_err(err)?;
         }
 
         // Delete phase
         for i in 0..n {
             let name = format!("churn_{:04}.bin", i);
-            sfs.delete_stream(&name)
-                .map_err(|e| eprintln!("Error: {}", e))?;
+            sfs.delete_stream(&name).map_err(err)?;
         }
     }
     eprintln!("  elapsed: {:.0} ms", t0.elapsed().as_secs_f64() * 1000.0);
 
-    sfs.close().map_err(|e| eprintln!("Error closing: {}", e))?;
+    sfs.close().map_err(err)?;
     Ok(())
 }
 
 /// Write streams, read them (baseline), delete all, re-write into recycled
 /// blocks, then read again. Compares "fresh" vs "reused-block" read throughput.
-fn run_reuse(bss: u8, biw: u8) -> Result<(), ()> {
+fn run_reuse(bss: u8, biw: u8) -> CliResult {
     let _guard = CleanupGuard { path: BENCH_FILE };
-    let sfs = Sfs::create(BENCH_FILE, biw, bss).map_err(|e| eprintln!("Error: {}", e))?;
+    let sfs = Sfs::create(BENCH_FILE, biw, bss).map_err(err)?;
     let stream_size = 512 * 1024usize;
     let n = 50usize;
     let buf = make_buffer(stream_size);
@@ -497,55 +456,44 @@ fn run_reuse(bss: u8, biw: u8) -> Result<(), ()> {
     // Phase 1: populate (fresh contiguous allocation)
     for i in 0..n {
         let name = format!("reuse_{:04}.bin", i);
-        let h = sfs
-            .create_stream(&name)
-            .map_err(|e| eprintln!("Error: {}", e))?;
-        sfs.write(&h, &buf).map_err(|e| eprintln!("Error: {}", e))?;
-        sfs.close_stream(h).map_err(|e| eprintln!("Error: {}", e))?;
+        let h = sfs.create_stream(&name).map_err(err)?;
+        sfs.write(&h, &buf).map_err(err)?;
+        sfs.close_stream(h).map_err(err)?;
     }
 
     // Phase 2: read baseline (fresh contiguous blocks)
     let t_fresh = Instant::now();
     for i in 0..n {
         let name = format!("reuse_{:04}.bin", i);
-        let h = sfs
-            .open_stream(&name, OpenMode::Read)
-            .map_err(|e| eprintln!("Error: {}", e))?;
+        let h = sfs.open_stream(&name, OpenMode::Read).map_err(err)?;
         let mut rbuf = vec![0u8; stream_size];
-        sfs.read(&h, &mut rbuf)
-            .map_err(|e| eprintln!("Error: {}", e))?;
-        sfs.close_stream(h).map_err(|e| eprintln!("Error: {}", e))?;
+        sfs.read(&h, &mut rbuf).map_err(err)?;
+        sfs.close_stream(h).map_err(err)?;
     }
     let fresh_ms = t_fresh.elapsed().as_secs_f64() * 1000.0;
 
     // Phase 3: delete all
     for i in 0..n {
         let name = format!("reuse_{:04}.bin", i);
-        sfs.delete_stream(&name)
-            .map_err(|e| eprintln!("Error: {}", e))?;
+        sfs.delete_stream(&name).map_err(err)?;
     }
 
     // Phase 4: repopulate (recycled blocks)
     for i in 0..n {
         let name = format!("reuse_{:04}.bin", i);
-        let h = sfs
-            .create_stream(&name)
-            .map_err(|e| eprintln!("Error: {}", e))?;
-        sfs.write(&h, &buf).map_err(|e| eprintln!("Error: {}", e))?;
-        sfs.close_stream(h).map_err(|e| eprintln!("Error: {}", e))?;
+        let h = sfs.create_stream(&name).map_err(err)?;
+        sfs.write(&h, &buf).map_err(err)?;
+        sfs.close_stream(h).map_err(err)?;
     }
 
     // Phase 5: read after reuse
     let t_reuse = Instant::now();
     for i in 0..n {
         let name = format!("reuse_{:04}.bin", i);
-        let h = sfs
-            .open_stream(&name, OpenMode::Read)
-            .map_err(|e| eprintln!("Error: {}", e))?;
+        let h = sfs.open_stream(&name, OpenMode::Read).map_err(err)?;
         let mut rbuf = vec![0u8; stream_size];
-        sfs.read(&h, &mut rbuf)
-            .map_err(|e| eprintln!("Error: {}", e))?;
-        sfs.close_stream(h).map_err(|e| eprintln!("Error: {}", e))?;
+        sfs.read(&h, &mut rbuf).map_err(err)?;
+        sfs.close_stream(h).map_err(err)?;
     }
     let reuse_ms = t_reuse.elapsed().as_secs_f64() * 1000.0;
 
@@ -561,12 +509,12 @@ fn run_reuse(bss: u8, biw: u8) -> Result<(), ()> {
         mb / (reuse_ms / 1000.0)
     );
 
-    sfs.close().map_err(|e| eprintln!("Error closing: {}", e))?;
+    sfs.close().map_err(err)?;
     Ok(())
 }
 
 /// Populate 100 streams, then T/2 threads read while T/2 threads write concurrently.
-fn run_threaded_mixed(bss: u8, biw: u8, threads: usize) -> Result<(), ()> {
+fn run_threaded_mixed(bss: u8, biw: u8, threads: usize) -> CliResult {
     let _guard = CleanupGuard { path: BENCH_FILE };
 
     let stream_count = 60usize;
@@ -575,24 +523,19 @@ fn run_threaded_mixed(bss: u8, biw: u8, threads: usize) -> Result<(), ()> {
 
     // Phase 1: populate streams for readers (single-threaded)
     {
-        let sfs = Sfs::create(BENCH_FILE, biw, bss).map_err(|e| eprintln!("Error: {}", e))?;
+        let sfs = Sfs::create(BENCH_FILE, biw, bss).map_err(err)?;
         let buf = make_buffer(stream_size);
         for i in 0..stream_count {
             let name = format!("read_{:04}.bin", i);
-            let handle = sfs
-                .create_stream(&name)
-                .map_err(|e| eprintln!("Error: {}", e))?;
-            sfs.write(&handle, &buf)
-                .map_err(|e| eprintln!("Error: {}", e))?;
-            sfs.close_stream(handle)
-                .map_err(|e| eprintln!("Error: {}", e))?;
+            let handle = sfs.create_stream(&name).map_err(err)?;
+            sfs.write(&handle, &buf).map_err(err)?;
+            sfs.close_stream(handle).map_err(err)?;
         }
-        sfs.close().map_err(|e| eprintln!("Error closing: {}", e))?;
+        sfs.close().map_err(err)?;
     }
 
     // Phase 2: mixed concurrent access
-    let sfs =
-        Arc::new(Sfs::open(BENCH_FILE, OpenMode::Write).map_err(|e| eprintln!("Error: {}", e))?);
+    let sfs = Arc::new(Sfs::open(BENCH_FILE, OpenMode::Write).map_err(err)?);
     let buf = Arc::new(make_buffer(stream_size));
 
     let readers = threads / 2;
@@ -657,7 +600,7 @@ fn run_threaded_mixed(bss: u8, biw: u8, threads: usize) -> Result<(), ()> {
     }
 
     if failed {
-        Err(())
+        Err(CliError::new("One or more threads failed"))
     } else {
         Ok(())
     }
@@ -665,46 +608,35 @@ fn run_threaded_mixed(bss: u8, biw: u8, threads: usize) -> Result<(), ()> {
 
 /// Write one large stream then read it back. Times write and read separately.
 /// Designed to measure contiguous block I/O performance.
-fn run_single_stream(bss: u8, biw: u8) -> Result<(), ()> {
+fn run_single_stream(bss: u8, biw: u8) -> CliResult {
     let _guard = CleanupGuard { path: BENCH_FILE };
 
     let stream_size = 64 * 1024 * 1024usize; // 64 MB
     let buf = make_buffer(stream_size);
 
     // Phase 1: write
-    let sfs = Sfs::create(BENCH_FILE, biw, bss).map_err(|e| eprintln!("Error: {}", e))?;
-    let handle = sfs
-        .create_stream("big.bin")
-        .map_err(|e| eprintln!("Error: {}", e))?;
+    let sfs = Sfs::create(BENCH_FILE, biw, bss).map_err(err)?;
+    let handle = sfs.create_stream("big.bin").map_err(err)?;
 
     let t_write = Instant::now();
-    sfs.write(&handle, &buf)
-        .map_err(|e| eprintln!("Error: {}", e))?;
+    sfs.write(&handle, &buf).map_err(err)?;
     let write_ms = t_write.elapsed().as_secs_f64() * 1000.0;
 
-    sfs.close_stream(handle)
-        .map_err(|e| eprintln!("Error: {}", e))?;
-    sfs.close().map_err(|e| eprintln!("Error closing: {}", e))?;
+    sfs.close_stream(handle).map_err(err)?;
+    sfs.close().map_err(err)?;
 
     // Phase 2: reopen and read back
-    let sfs = Sfs::open(BENCH_FILE, OpenMode::Read).map_err(|e| eprintln!("Error: {}", e))?;
-    let handle = sfs
-        .open_stream("big.bin", OpenMode::Read)
-        .map_err(|e| eprintln!("Error: {}", e))?;
-    let len = sfs
-        .stream_length(&handle)
-        .map_err(|e| eprintln!("Error: {}", e))? as usize;
+    let sfs = Sfs::open(BENCH_FILE, OpenMode::Read).map_err(err)?;
+    let handle = sfs.open_stream("big.bin", OpenMode::Read).map_err(err)?;
+    let len = sfs.stream_length(&handle).map_err(err)? as usize;
     let mut read_buf = vec![0u8; len];
 
     let t_read = Instant::now();
-    let n = sfs
-        .read(&handle, &mut read_buf)
-        .map_err(|e| eprintln!("Error: {}", e))?;
+    let n = sfs.read(&handle, &mut read_buf).map_err(err)?;
     let read_ms = t_read.elapsed().as_secs_f64() * 1000.0;
 
-    sfs.close_stream(handle)
-        .map_err(|e| eprintln!("Error: {}", e))?;
-    sfs.close().map_err(|e| eprintln!("Error closing: {}", e))?;
+    sfs.close_stream(handle).map_err(err)?;
+    sfs.close().map_err(err)?;
 
     let mb = stream_size as f64 / (1024.0 * 1024.0);
     eprintln!(
@@ -724,51 +656,41 @@ fn run_single_stream(bss: u8, biw: u8) -> Result<(), ()> {
 
 /// Write 2750 streams of 10KB, then read them all back using the same Sfs instance.
 /// This tests the benefit of warm block caches across many open/read/close cycles.
-fn run_warm_read(bss: u8, biw: u8) -> Result<(), ()> {
+fn run_warm_read(bss: u8, biw: u8) -> CliResult {
     let _guard = CleanupGuard { path: BENCH_FILE };
 
     let stream_count = 2750usize;
     let stream_size = 10 * 1024usize;
 
-    let sfs = Sfs::create(BENCH_FILE, biw, bss).map_err(|e| eprintln!("Error: {}", e))?;
+    let sfs = Sfs::create(BENCH_FILE, biw, bss).map_err(err)?;
     let buf = make_buffer(stream_size);
 
     // Phase 1: populate (not timed)
     for i in 0..stream_count {
         let name = format!("stream_{:04}.bin", i);
-        let handle = sfs
-            .create_stream(&name)
-            .map_err(|e| eprintln!("Error: {}", e))?;
-        sfs.write(&handle, &buf)
-            .map_err(|e| eprintln!("Error: {}", e))?;
-        sfs.close_stream(handle)
-            .map_err(|e| eprintln!("Error: {}", e))?;
+        let handle = sfs.create_stream(&name).map_err(err)?;
+        sfs.write(&handle, &buf).map_err(err)?;
+        sfs.close_stream(handle).map_err(err)?;
     }
 
     // Phase 2: read back with warm cache (timed)
     let t0 = Instant::now();
     for i in 0..stream_count {
         let name = format!("stream_{:04}.bin", i);
-        let handle = sfs
-            .open_stream(&name, OpenMode::Read)
-            .map_err(|e| eprintln!("Error: {}", e))?;
-        let len = sfs
-            .stream_length(&handle)
-            .map_err(|e| eprintln!("Error: {}", e))? as usize;
+        let handle = sfs.open_stream(&name, OpenMode::Read).map_err(err)?;
+        let len = sfs.stream_length(&handle).map_err(err)? as usize;
         let mut read_buf = vec![0u8; len];
-        sfs.read(&handle, &mut read_buf)
-            .map_err(|e| eprintln!("Error: {}", e))?;
-        sfs.close_stream(handle)
-            .map_err(|e| eprintln!("Error: {}", e))?;
+        sfs.read(&handle, &mut read_buf).map_err(err)?;
+        sfs.close_stream(handle).map_err(err)?;
     }
     eprintln!("  elapsed: {:.0} ms", t0.elapsed().as_secs_f64() * 1000.0);
 
-    sfs.close().map_err(|e| eprintln!("Error closing: {}", e))?;
+    sfs.close().map_err(err)?;
     Ok(())
 }
 
 /// Run all scenarios in sequence.
-fn run_all(bss: u8, biw: u8, threads: usize) -> Result<(), ()> {
+fn run_all(bss: u8, biw: u8, threads: usize) -> CliResult {
     eprintln!("[large-write]");
     run_large_write(bss, biw)?;
 

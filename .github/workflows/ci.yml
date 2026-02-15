@@ -35,7 +35,7 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets --exclude stream_fs_python -- -D warnings
 
   test:
     name: Test (${{ matrix.os }})
@@ -54,8 +54,8 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
-      - run: cargo build --workspace
-      - run: cargo test --workspace
+      - run: cargo build --workspace --exclude stream_fs_python
+      - run: cargo test --workspace --exclude stream_fs_python
 
   python-tests:
     name: Python integration tests
@@ -71,12 +71,12 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-python-${{ hashFiles('**/Cargo.lock') }}
-      - name: Build workspace (including C FFI shared lib)
-        run: cargo build --workspace
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-      - name: Install pytest
-        run: pip install pytest
+          python-version: "3.12"
+      - name: Install maturin and pytest
+        run: pip install maturin pytest
+      - name: Build and install Python bindings
+        run: cd stream_fs_python && maturin develop --release
       - name: Run Python tests
         run: pytest sfs_pytest/ -v --burn-seconds=3

@@ -120,13 +120,13 @@ Throughout this section, layers are described by L1, L2, L3 and L4, denoting Lay
 
 There are 5 projects across the workspace:
 
-| Module                    | Language      | Path         | 
-| ------------------------- | ------------- | ------------ |
-| SFS library               | Rust          | stream_fs/   |
-| C ABI SFS wrapper         | Rust          | stream_fs_c/ |
-| Python SFS wrapper        | Rust          | sfs_python/  |
-| Command line SFS tool     | Rust          | sfs_cl/      |
-| Testing harness and tests | Python/pytest | sfs_pytest/  |
+| Module                    | Language      | Path              |
+| ------------------------- | ------------- | ----------------- |
+| SFS library               | Rust          | stream_fs/        |
+| C ABI SFS wrapper         | Rust          | stream_fs_c/      |
+| Python SFS wrapper        | Rust          | stream_fs_python/ |
+| Command line SFS tool     | Rust          | sfs_cl/           |
+| Testing harness and tests | Python/pytest | sfs_pytest/       |
 
 * The SFS library is published as a crate on crates.io
 * The C ABI wrapper produces a dynamic and a static library with non-mangled names for linking into a C/C++ project - and for use in any environment that supports C FFI libraries (e.g. LuaJIT). A SFS header file is generated using cbindgen, which defines the function names used in the libraries.

@@ -108,7 +108,9 @@ fn parse_bench_args(args: &[String]) -> Result<BenchArgs, CliError> {
 }
 
 fn print_bench_usage() {
-    eprintln!("Usage: sfs bench <scenario> [--block-shift N] [--index-width N] [--vbss N] [--threads N]");
+    eprintln!(
+        "Usage: sfs bench <scenario> [--block-shift N] [--index-width N] [--vbss N] [--threads N]"
+    );
     eprintln!();
     eprintln!("Each scenario runs twice: first uncompressed, then compressed.");
     eprintln!();

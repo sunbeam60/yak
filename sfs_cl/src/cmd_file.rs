@@ -7,9 +7,7 @@ use crate::helpers::{
 
 pub fn cmd_create(args: &[String]) -> CliResult {
     if args.is_empty() {
-        return Err(CliError::new(
-            "Usage: sfs create <sfs-file> [--vbss N]",
-        ));
+        return Err(CliError::new("Usage: sfs create <sfs-file> [--vbss N]"));
     }
 
     let path = &args[0];
@@ -37,7 +35,9 @@ pub fn cmd_create(args: &[String]) -> CliResult {
     }
 
     let sfs = match vbss {
-        Some(v) => Sfs::create_with_vbss(path, DEFAULT_BLOCK_INDEX_WIDTH, DEFAULT_BLOCK_SIZE_SHIFT, v),
+        Some(v) => {
+            Sfs::create_with_vbss(path, DEFAULT_BLOCK_INDEX_WIDTH, DEFAULT_BLOCK_SIZE_SHIFT, v)
+        }
         None => Sfs::create(path, DEFAULT_BLOCK_INDEX_WIDTH, DEFAULT_BLOCK_SIZE_SHIFT),
     }
     .map_err(|e| CliError::new(format!("Error creating SFS file: {}", e)))?;

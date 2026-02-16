@@ -31,7 +31,10 @@ pub fn cmd_put(args: &[String]) -> CliResult {
             let mb = n as f64 / (1024.0 * 1024.0);
             println!(
                 "Imported {} bytes from {} to {} ({:.1} MB/s)",
-                n, local_file, stream_path, mb / elapsed
+                n,
+                local_file,
+                stream_path,
+                mb / elapsed
             );
         }
         Err(e) => {
@@ -69,7 +72,10 @@ pub fn cmd_putc(args: &[String]) -> CliResult {
             let mb = n as f64 / (1024.0 * 1024.0);
             println!(
                 "Imported {} bytes from {} to {} (compressed, {:.1} MB/s)",
-                n, local_file, stream_path, mb / elapsed
+                n,
+                local_file,
+                stream_path,
+                mb / elapsed
             );
         }
         Err(e) => {

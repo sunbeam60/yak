@@ -2102,7 +2102,11 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
                 }
             };
 
-            let flags = if compressed { STREAM_FLAG_COMPRESSED } else { 0 };
+            let flags = if compressed {
+                STREAM_FLAG_COMPRESSED
+            } else {
+                0
+            };
             let new_desc = StreamDescriptor {
                 size: 0,
                 top_block: 0,

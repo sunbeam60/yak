@@ -665,6 +665,40 @@
                 "reveal": "always",
                 "panel": "shared"
             }
+        },
+        {
+            "label": "samply-bench-single-stream",
+            "type": "shell",
+            "command": "samply",
+            "osx": {
+                "args": [
+                    "record",
+                    "${workspaceFolder}/target/profiling/sfs",
+                    "bench",
+                    "single-stream"
+                ]
+            },
+            "args": [
+                "record",
+                "${workspaceFolder}/target/profiling/sfs.exe",
+                "bench",
+                "single-stream"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "env": {
+                    "PATH": "${env:PATH};C:/Users/bjorn/.cargo/bin"
+                }
+            },
+            "dependsOn": [
+                "cargo-build-profiling"
+            ],
+            "problemMatcher": [],
+            "group": "test",
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared"
+            }
         }
     ]
 }

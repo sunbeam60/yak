@@ -14,3 +14,4 @@ categories = ["filesystem", "data-structures"]
 fs2 = "0.4.3"
 thread_local = "1.1"
 lru = "0.12"
+lz4_flex = "0.11"

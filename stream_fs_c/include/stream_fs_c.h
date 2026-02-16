@@ -100,10 +100,11 @@ const char *sfs_verify_issue(struct SfsVerifyResult *result, int index);
 void sfs_verify_free(struct SfsVerifyResult *result);
 
 // Create a new stream and open it for writing. Returns handle ID or -1.
+// `compressed`: non-zero to create a compressed stream (requires vbss > 0).
 //
 // # Safety
 // `handle` must be a live `SfsFile` pointer. `path` must be a valid C string.
-int64_t sfs_create_stream(struct SfsFile *handle, const char *path);
+int64_t sfs_create_stream(struct SfsFile *handle, const char *path, int32_t compressed);
 
 // Open an existing stream. mode: 0=READ, 1=WRITE. Returns handle ID or -1.
 //

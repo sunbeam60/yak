@@ -373,17 +373,22 @@ pub unsafe extern "C" fn sfs_verify_free(result: *mut SfsVerifyResult) {
 // ---------------------------------------------------------------------------
 
 /// Create a new stream and open it for writing. Returns handle ID or -1.
+/// `compressed`: non-zero to create a compressed stream (requires vbss > 0).
 ///
 /// # Safety
 /// `handle` must be a live `SfsFile` pointer. `path` must be a valid C string.
 #[no_mangle]
-pub unsafe extern "C" fn sfs_create_stream(handle: *mut SfsFile, path: *const c_char) -> i64 {
+pub unsafe extern "C" fn sfs_create_stream(
+    handle: *mut SfsFile,
+    path: *const c_char,
+    compressed: i32,
+) -> i64 {
     let sfs = unsafe { &(*handle).0 };
     let path = match cstr_to_str(path) {
         Some(s) => s,
         None => return -1,
     };
-    match sfs.create_stream(path) {
+    match sfs.create_stream(path, compressed != 0) {
         Ok(sh) => sh.id() as i64,
         Err(e) => {
             set_last_error(&e.to_string());

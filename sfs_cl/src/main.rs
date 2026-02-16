@@ -24,8 +24,8 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const COMMANDS: &[CommandEntry] = &[
     CommandEntry {
         name: "create",
-        usage: "sfs create <sfs-file>",
-        description: "Create a new SFS file",
+        usage: "sfs create <sfs-file> [--vbss N]",
+        description: "Create a new SFS file (--vbss overrides virtual block size)",
         run: cmd_file::cmd_create,
     },
     CommandEntry {
@@ -57,6 +57,12 @@ const COMMANDS: &[CommandEntry] = &[
         usage: "sfs put <sfs-file> <local-file> <stream>",
         description: "Import a file as a stream",
         run: cmd_stream::cmd_put,
+    },
+    CommandEntry {
+        name: "putc",
+        usage: "sfs putc <sfs-file> <local-file> <stream>",
+        description: "Import a file as a compressed stream",
+        run: cmd_stream::cmd_putc,
     },
     CommandEntry {
         name: "get",

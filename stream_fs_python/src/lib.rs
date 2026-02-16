@@ -104,17 +104,26 @@ impl Sfs {
 impl Sfs {
     // -- Lifecycle -----------------------------------------------------------
 
+    /// Create a new SFS file. Compression support is always enabled.
+    /// If `virtual_block_size_shift` is None, defaults to block_size_shift + 3
+    /// (8x the physical block size).
     #[staticmethod]
-    #[pyo3(signature = (path, block_index_width=4, block_size_shift=12))]
+    #[pyo3(signature = (path, block_index_width=4, block_size_shift=12, virtual_block_size_shift=None))]
     fn create(
         py: Python<'_>,
         path: &str,
         block_index_width: u8,
         block_size_shift: u8,
+        virtual_block_size_shift: Option<u8>,
     ) -> PyResult<Self> {
         let path = path.to_owned();
         let sfs = py
-            .detach(move || SfsDefault::create(&path, block_index_width, block_size_shift))
+            .detach(move || match virtual_block_size_shift {
+                Some(vbss) => {
+                    SfsDefault::create_with_vbss(&path, block_index_width, block_size_shift, vbss)
+                }
+                None => SfsDefault::create(&path, block_index_width, block_size_shift),
+            })
             .map_err(to_py_err)?;
         Ok(Sfs { inner: Some(sfs) })
     }
@@ -174,11 +183,12 @@ impl Sfs {
 
     // -- Stream lifecycle ----------------------------------------------------
 
-    fn create_stream(&self, py: Python<'_>, path: &str) -> PyResult<u64> {
+    #[pyo3(signature = (path, compressed=false))]
+    fn create_stream(&self, py: Python<'_>, path: &str, compressed: bool) -> PyResult<u64> {
         let sfs = self.get()?;
         let path = path.to_owned();
         let handle = py
-            .detach(move || sfs.create_stream(&path))
+            .detach(move || sfs.create_stream(&path, compressed))
             .map_err(to_py_err)?;
         Ok(handle.id())
     }
@@ -265,6 +275,13 @@ impl Sfs {
         let sfs = self.get()?;
         let sh = StreamHandle::from_id(handle);
         py.detach(|| sfs.stream_reserved(&sh)).map_err(to_py_err)
+    }
+
+    fn is_stream_compressed(&self, py: Python<'_>, handle: u64) -> PyResult<bool> {
+        let sfs = self.get()?;
+        let sh = StreamHandle::from_id(handle);
+        py.detach(|| sfs.is_stream_compressed(&sh))
+            .map_err(to_py_err)
     }
 
     // -- Verification --------------------------------------------------------

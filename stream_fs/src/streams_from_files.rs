@@ -206,6 +206,7 @@ impl StreamLayer for StreamsFromFiles {
         path: &str,
         block_index_width: u8,
         block_size_shift: u8,
+        _virtual_block_size_shift: u8,
         mut slot_sizes: VecDeque<u16>,
     ) -> Result<Self, SfsError> {
         let root = PathBuf::from(path);
@@ -336,7 +337,11 @@ impl StreamLayer for StreamsFromFiles {
         self.block_size_shift
     }
 
-    fn create_stream(&self) -> Result<u64, SfsError> {
+    fn virtual_block_size_shift(&self) -> u8 {
+        0 // File-backed mock does not support compression
+    }
+
+    fn create_stream(&self, _compressed: bool) -> Result<u64, SfsError> {
         let mut state = self.state.lock().unwrap();
         let id = state.next_stream_id;
         let stream_path = self.stream_path(id);

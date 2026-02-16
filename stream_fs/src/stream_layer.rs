@@ -26,6 +26,9 @@ pub trait StreamLayer: Send + Sync {
     /// disk (e.g. 2, 4, or 8).
     /// `block_size_shift` is the power-of-2 exponent for block size
     /// (e.g. 12 → 4096 bytes).
+    /// `virtual_block_size_shift` is the power-of-2 exponent for the virtual
+    /// block size used by compressed streams (0 = compression not configured).
+    /// Must be >= `block_size_shift` when non-zero.
     /// `slot_sizes` accumulates payload sizes (NOT including the
     /// 2-byte length prefix) as they flow down through the layer chain.
     /// L3 push_front's its own payload size and passes the deque down to L2.
@@ -33,6 +36,7 @@ pub trait StreamLayer: Send + Sync {
         path: &str,
         block_index_width: u8,
         block_size_shift: u8,
+        virtual_block_size_shift: u8,
         slot_sizes: VecDeque<u16>,
     ) -> Result<Self, SfsError>
     where
@@ -51,8 +55,13 @@ pub trait StreamLayer: Send + Sync {
     /// Block size as a power of 2 (e.g. 12 → 4096 bytes).
     fn block_size_shift(&self) -> u8;
 
+    /// Virtual block size shift (0 = compression not configured).
+    fn virtual_block_size_shift(&self) -> u8;
+
     /// Create a new stream. Returns the stream identifier.
-    fn create_stream(&self) -> Result<u64, SfsError>;
+    /// If `compressed` is true, the stream will use leaf-level compression.
+    /// Requires virtual_block_size_shift > 0 when `compressed` is true.
+    fn create_stream(&self, compressed: bool) -> Result<u64, SfsError>;
 
     /// Check whether a stream with the given identifier exists.
     fn stream_exists(&self, id: u64) -> bool;
@@ -108,6 +117,12 @@ pub trait StreamLayer: Send + Sync {
     /// Return the current reserved capacity (allocated block capacity in bytes).
     /// This is always >= stream_length and always a multiple of the block size (or 0).
     fn stream_reserved(&self, handle: &Self::Handle) -> Result<u64, SfsError>;
+
+    /// Check whether a stream is compressed.
+    fn is_stream_compressed(&self, handle: &Self::Handle) -> Result<bool, SfsError> {
+        let _ = handle;
+        Ok(false)
+    }
 
     /// Get the `HeaderSlotId` for the `index`-th upper layer section.
     ///

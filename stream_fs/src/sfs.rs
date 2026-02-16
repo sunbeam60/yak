@@ -283,25 +283,68 @@ impl<L3: StreamLayer> Sfs<L3> {
     // SFS file lifecycle
     // -------------------------------------------------------------------
 
-    /// Create a new SFS file. The path is used directly as the storage name.
+    /// Default offset from block_size_shift to virtual_block_size_shift.
+    /// vbss = bss + 3 gives virtual blocks that are 8x the physical block size
+    /// (e.g. bss=12 → 4KB blocks, vbss=15 → 32KB virtual blocks).
+    const DEFAULT_VBSS_OFFSET: u8 = 3;
+
+    /// Create a new SFS file. Compression support is always enabled.
     ///
     /// `block_index_width` is the number of bytes used for block indices
     /// on disk (e.g. 2, 4, or 8).
     /// `block_size_shift` is the power-of-2 exponent for block size
     /// (e.g. 12 → 4096 bytes).
+    /// The virtual block size defaults to 8x the physical block size
+    /// (bss + 3). Use `create_with_vbss` to override.
     pub fn create(
         path: &str,
         block_index_width: u8,
         block_size_shift: u8,
+    ) -> Result<Self, SfsError> {
+        let vbss = block_size_shift.saturating_add(Self::DEFAULT_VBSS_OFFSET);
+        Self::create_inner(path, block_index_width, block_size_shift, vbss)
+    }
+
+    /// Create a new SFS file with a specific virtual block size shift.
+    ///
+    /// `virtual_block_size_shift` is the power-of-2 exponent for the virtual
+    /// block size used by compressed streams (e.g. 15 → 32768 bytes).
+    /// Must be >= `block_size_shift`.
+    pub fn create_with_vbss(
+        path: &str,
+        block_index_width: u8,
+        block_size_shift: u8,
+        virtual_block_size_shift: u8,
+    ) -> Result<Self, SfsError> {
+        if virtual_block_size_shift < block_size_shift {
+            return Err(SfsError::IoError(format!(
+                "virtual_block_size_shift ({}) must be >= block_size_shift ({})",
+                virtual_block_size_shift, block_size_shift
+            )));
+        }
+        Self::create_inner(
+            path,
+            block_index_width,
+            block_size_shift,
+            virtual_block_size_shift,
+        )
+    }
+
+    fn create_inner(
+        path: &str,
+        block_index_width: u8,
+        block_size_shift: u8,
+        virtual_block_size_shift: u8,
     ) -> Result<Self, SfsError> {
         // Pass L4 payload size down through the layer chain so L1 can calculate data_offset
         let layer3 = L3::create(
             path,
             block_index_width,
             block_size_shift,
+            virtual_block_size_shift,
             VecDeque::from([L4_PAYLOAD_SIZE]),
         )?;
-        let root_id = layer3.create_stream()?;
+        let root_id = layer3.create_stream(false)?;
 
         // Write L4 header payload via slot
         let l4_slot = layer3.header_slot_for_upper(0);
@@ -486,6 +529,11 @@ impl<L3: StreamLayer> Sfs<L3> {
         self.layer3.block_size_shift()
     }
 
+    /// Virtual block size shift (0 = compression not configured).
+    pub fn virtual_block_size_shift(&self) -> u8 {
+        self.layer3.virtual_block_size_shift()
+    }
+
     // -------------------------------------------------------------------
     // Directory operations
     // -------------------------------------------------------------------
@@ -521,7 +569,7 @@ impl<L3: StreamLayer> Sfs<L3> {
         }
 
         // Create new empty directory stream
-        let new_dir_id = self.layer3.create_stream()?;
+        let new_dir_id = self.layer3.create_stream(false)?;
 
         // Append entry to parent
         let entry = StreamEntry {
@@ -743,7 +791,9 @@ impl<L3: StreamLayer> Sfs<L3> {
 
     /// Create a new stream and open it for writing.
     /// Returns a handle positioned at byte 0.
-    pub fn create_stream(&self, path: &str) -> Result<StreamHandle, SfsError> {
+    /// If `compressed` is true, the stream uses leaf-level compression
+    /// (requires the SFS file to have been created with compression support).
+    pub fn create_stream(&self, path: &str, compressed: bool) -> Result<StreamHandle, SfsError> {
         self.require_write()?;
         if path.is_empty() {
             return Err(SfsError::InvalidPath(
@@ -773,7 +823,7 @@ impl<L3: StreamLayer> Sfs<L3> {
         }
 
         // Create new data stream in L3
-        let new_stream_id = self.layer3.create_stream()?;
+        let new_stream_id = self.layer3.create_stream(compressed)?;
 
         // Add entry to parent directory stream
         let entry = StreamEntry {
@@ -1220,6 +1270,19 @@ impl<L3: StreamLayer> Sfs<L3> {
             info.l3_handle
         };
         self.layer3.stream_reserved(&l3_handle)
+    }
+
+    /// Check whether a stream is compressed.
+    pub fn is_stream_compressed(&self, handle: &StreamHandle) -> Result<bool, SfsError> {
+        let l3_handle = {
+            let state = self.state.lock().unwrap();
+            let info = state
+                .open_streams
+                .get(&handle.0)
+                .ok_or_else(|| SfsError::NotFound("invalid stream handle".to_string()))?;
+            info.l3_handle
+        };
+        self.layer3.is_stream_compressed(&l3_handle)
     }
 
     // -------------------------------------------------------------------

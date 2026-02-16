@@ -38,7 +38,9 @@
       "Bash(~/.local/bin/sfs-sorted-free-list bench:*)",
       "Bash(~/.local/bin/sfs-master bench:*)",
       "Bash(.venv/bin/python -m pytest:*)",
-      "Bash(brew list:*)"
+      "Bash(brew list:*)",
+      "Bash(maturin develop:*)",
+      "Bash(git status:*)"
     ]
   }
 }

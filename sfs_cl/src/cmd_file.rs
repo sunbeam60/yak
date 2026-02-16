@@ -6,16 +6,44 @@ use crate::helpers::{
 };
 
 pub fn cmd_create(args: &[String]) -> CliResult {
-    expect_args(args, 1, "sfs create <sfs-file>")?;
+    if args.is_empty() {
+        return Err(CliError::new(
+            "Usage: sfs create <sfs-file> [--vbss N]",
+        ));
+    }
 
-    let sfs = Sfs::create(
-        &args[0],
-        DEFAULT_BLOCK_INDEX_WIDTH,
-        DEFAULT_BLOCK_SIZE_SHIFT,
-    )
+    let path = &args[0];
+    let mut vbss: Option<u8> = None;
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--vbss" => {
+                i += 1;
+                vbss = Some(
+                    args.get(i)
+                        .and_then(|s| s.parse().ok())
+                        .ok_or_else(|| CliError::new("--vbss requires a numeric argument"))?,
+                );
+            }
+            other => {
+                return Err(CliError::new(format!(
+                    "Unknown option: {}. Usage: sfs create <sfs-file> [--vbss N]",
+                    other
+                )));
+            }
+        }
+        i += 1;
+    }
+
+    let sfs = match vbss {
+        Some(v) => Sfs::create_with_vbss(path, DEFAULT_BLOCK_INDEX_WIDTH, DEFAULT_BLOCK_SIZE_SHIFT, v),
+        None => Sfs::create(path, DEFAULT_BLOCK_INDEX_WIDTH, DEFAULT_BLOCK_SIZE_SHIFT),
+    }
     .map_err(|e| CliError::new(format!("Error creating SFS file: {}", e)))?;
+
     close_sfs(sfs)?;
-    println!("Created SFS file: {}", args[0]);
+    println!("Created SFS file: {}", path);
     Ok(())
 }
 
@@ -70,10 +98,21 @@ pub fn cmd_info(args: &[String]) -> CliResult {
             )));
         }
     };
+    let compressed = match sfs.is_stream_compressed(&handle) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = sfs.close_stream(handle);
+            return Err(CliError::new(format!(
+                "Error checking stream compression: {}",
+                e
+            )));
+        }
+    };
 
-    println!("Stream: {}", args[1]);
-    println!("Length:   {} bytes", length);
-    println!("Reserved: {} bytes", reserved);
+    println!("Stream:     {}", args[1]);
+    println!("Length:     {} bytes", length);
+    println!("Reserved:   {} bytes", reserved);
+    println!("Compressed: {}", if compressed { "yes" } else { "no" });
 
     let _ = sfs.close_stream(handle);
     close_sfs(sfs)

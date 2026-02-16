@@ -58,7 +58,7 @@ mod tests {
         // Create and write
         {
             let sfs = SfsDefault::create(path_str, 4, 12).unwrap();
-            let sh = sfs.create_stream("hello.txt").unwrap();
+            let sh = sfs.create_stream("hello.txt", false).unwrap();
             sfs.write(&sh, b"Hello, World!").unwrap();
             sfs.close_stream(sh).unwrap();
             sfs.close().unwrap();
@@ -85,16 +85,16 @@ mod tests {
 
         // Test L3 directly via StreamsFromBlocks
         type L3 = StreamsFromBlocks<BlocksInFile<FileOnDisk, DEFAULT_CACHE_BUDGET_BYTES>>;
-        let l3 = L3::create(path_str, 4, 12, std::collections::VecDeque::new()).unwrap();
+        let l3 = L3::create(path_str, 4, 12, 0, std::collections::VecDeque::new()).unwrap();
 
         // Initially no streams
         assert_eq!(l3.stream_count().unwrap(), 0);
         assert!(l3.stream_ids().unwrap().is_empty());
 
         // Create 3 streams
-        let id0 = l3.create_stream().unwrap();
-        let id1 = l3.create_stream().unwrap();
-        let id2 = l3.create_stream().unwrap();
+        let id0 = l3.create_stream(false).unwrap();
+        let id1 = l3.create_stream(false).unwrap();
+        let id2 = l3.create_stream(false).unwrap();
 
         assert_eq!(l3.stream_count().unwrap(), 3);
         let mut ids = l3.stream_ids().unwrap();
@@ -109,7 +109,7 @@ mod tests {
         assert_eq!(ids, vec![id0, id2]);
 
         // Create another — should reuse the freed slot
-        let id3 = l3.create_stream().unwrap();
+        let id3 = l3.create_stream(false).unwrap();
         assert_eq!(id3, id1); // reuses freed descriptor slot
         assert_eq!(l3.stream_count().unwrap(), 3);
         let mut ids = l3.stream_ids().unwrap();
@@ -125,7 +125,7 @@ mod tests {
 
         // block_size=64, block_index_width=4, fan_out=16
         let sfs = SfsDefault::create(path_str, 4, 6).unwrap();
-        let sh = sfs.create_stream("big.bin").unwrap();
+        let sh = sfs.create_stream("big.bin", false).unwrap();
 
         // 1025 bytes requires 17 data blocks -> depth 2
         let len = 100025usize;
@@ -154,11 +154,11 @@ mod tests {
             let sfs = SfsDefault::create(path_str, 4, 12).unwrap();
             sfs.mkdir("docs").unwrap();
 
-            let sh = sfs.create_stream("hello.txt").unwrap();
+            let sh = sfs.create_stream("hello.txt", false).unwrap();
             sfs.write(&sh, b"Hello, World!").unwrap();
             sfs.close_stream(sh).unwrap();
 
-            let sh = sfs.create_stream("docs/readme.txt").unwrap();
+            let sh = sfs.create_stream("docs/readme.txt", false).unwrap();
             sfs.write(&sh, b"A readme").unwrap();
             sfs.close_stream(sh).unwrap();
 
@@ -191,12 +191,12 @@ mod tests {
             let sfs = SfsNoCache::create(path_str, 4, 12).unwrap();
             sfs.mkdir("docs").unwrap();
 
-            let sh = sfs.create_stream("hello.txt").unwrap();
+            let sh = sfs.create_stream("hello.txt", false).unwrap();
             sfs.write(&sh, b"Hello, no cache!").unwrap();
             sfs.close_stream(sh).unwrap();
 
             // Multi-block write to exercise allocate_blocks path
-            let sh = sfs.create_stream("docs/big.bin").unwrap();
+            let sh = sfs.create_stream("docs/big.bin", false).unwrap();
             let data: Vec<u8> = (0..10000).map(|i| (i & 0xFF) as u8).collect();
             sfs.write(&sh, &data).unwrap();
             sfs.seek(&sh, 0).unwrap();
@@ -235,7 +235,7 @@ mod tests {
 
         {
             let sfs = SfsDefault::create(path_str, 4, 12).unwrap();
-            let sh = sfs.create_stream("data.bin").unwrap();
+            let sh = sfs.create_stream("data.bin", false).unwrap();
 
             // Empty stream: reserved = 0
             assert_eq!(sfs.stream_reserved(&sh).unwrap(), 0);

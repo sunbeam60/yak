@@ -12,14 +12,14 @@ use std::collections::VecDeque;
 use crate::{HeaderSlotId, OpenMode, SfsError};
 
 // L2 header payload layout (offsets within the payload, WITHOUT the 2-byte length prefix):
-// | "blocks": [u8;6] | version: u8 | bss: u8 | biw: u8 | total_blocks: u64 | free_list_head: u64 |
+// | "blocks": [u8;6] | version: u8 | bss: u8 | biw: u8 | free_list_head: u64 |
+// total_blocks is derived at runtime from file size: (file_len - data_offset) / block_size
 const P_ID_OFFSET: usize = 0;
 const P_VERSION_OFFSET: usize = P_ID_OFFSET + 6;
 const P_BSS_OFFSET: usize = P_VERSION_OFFSET + 1;
 const P_BIW_OFFSET: usize = P_BSS_OFFSET + 1;
-const P_TOTAL_BLOCKS_OFFSET: usize = P_BIW_OFFSET + 1;
-const P_FREE_LIST_OFFSET: usize = P_TOTAL_BLOCKS_OFFSET + 8;
-const L2_PAYLOAD_SIZE: u16 = (P_FREE_LIST_OFFSET + 8) as u16; // = 25
+const P_FREE_LIST_OFFSET: usize = P_BIW_OFFSET + 1;
+const L2_PAYLOAD_SIZE: u16 = (P_FREE_LIST_OFFSET + 8) as u16; // = 17
 
 /// L2 identifier in the header section.
 const L2_IDENTIFIER: &[u8; 6] = b"blocks";
@@ -85,7 +85,6 @@ impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlocksInFile<L1, CACHE_BUDG
     fn serialize_header(
         block_size_shift: u8,
         block_index_width: u8,
-        total_blocks: u64,
         free_list_head: u64,
     ) -> Vec<u8> {
         let mut buf = Vec::with_capacity(L2_PAYLOAD_SIZE as usize);
@@ -93,17 +92,15 @@ impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlocksInFile<L1, CACHE_BUDG
         buf.push(L2_VERSION);
         buf.push(block_size_shift);
         buf.push(block_index_width);
-        buf.extend_from_slice(&total_blocks.to_le_bytes());
         buf.extend_from_slice(&free_list_head.to_le_bytes());
         buf
     }
 
     /// Persist the full L2 header payload via its slot.
-    fn persist_l2_header(&self, total_blocks: u64, free_list_head: u64) -> Result<(), SfsError> {
+    fn persist_l2_header(&self, free_list_head: u64) -> Result<(), SfsError> {
         let payload = Self::serialize_header(
             self.block_size_shift,
             self.block_index_width,
-            total_blocks,
             free_list_head,
         );
         self.layer1.write_header_slot(self.my_slot, &payload)
@@ -159,7 +156,6 @@ impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlockLayer
         let l2_payload = Self::serialize_header(
             block_size_shift,
             block_index_width,
-            0,        // total_blocks
             sentinel, // free_list_head (empty list)
         );
         layer1.write_header_slot(my_slot, &l2_payload)?;
@@ -202,16 +198,15 @@ impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlockLayer
 
         let block_size_shift = header_buffer[P_BSS_OFFSET];
         let block_index_width = header_buffer[P_BIW_OFFSET];
-        let total_blocks = u64::from_le_bytes(
-            header_buffer[P_TOTAL_BLOCKS_OFFSET..P_FREE_LIST_OFFSET]
-                .try_into()
-                .unwrap(),
-        );
         let free_list_head = u64::from_le_bytes(
             header_buffer[P_FREE_LIST_OFFSET..L2_PAYLOAD_SIZE as usize]
                 .try_into()
                 .unwrap(),
         );
+
+        // Derive total_blocks from file size rather than storing it in the header
+        let block_size = 1u64 << block_size_shift;
+        let total_blocks = (layer1.len()? - layer1.data_offset()) / block_size;
 
         Ok(BlocksInFile {
             layer1,
@@ -279,7 +274,9 @@ impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlockLayer
             let first_new_id = state.total_blocks;
 
             // Index overflow protection
-            if first_new_id + remaining as u64 > sentinel {
+            // This is a non-overflowing way of ensuring we don't allocate more
+            // blocks than the block index width can represent
+            if remaining as u64 > sentinel - first_new_id {
                 return Err(SfsError::IoError(format!(
                     "block index overflow: need {} blocks but only {} available before sentinel {}",
                     remaining,
@@ -311,7 +308,7 @@ impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlockLayer
         // Phase 4: persist L2 header before releasing the mutex, so other
         // threads cannot observe the updated in-memory state until the header
         // is written.
-        self.persist_l2_header(state.total_blocks, state.free_list_head)?;
+        self.persist_l2_header(state.free_list_head)?;
         drop(state);
 
         // Phase 5: evict allocated blocks from thread-local cache.
@@ -342,7 +339,7 @@ impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlockLayer
         // Persist updated L2 header before releasing the mutex, so other
         // threads cannot observe the updated in-memory state until the header
         // is written.
-        self.persist_l2_header(state.total_blocks, state.free_list_head)?;
+        self.persist_l2_header(state.free_list_head)?;
         drop(state);
 
         // Evict deallocated block from thread-local cache.
@@ -384,7 +381,7 @@ impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlockLayer
         state.free_list_head = indices[0];
 
         // Single header persist (saves n-1 header writes vs individual calls)
-        self.persist_l2_header(state.total_blocks, state.free_list_head)?;
+        self.persist_l2_header(state.free_list_head)?;
         drop(state);
 
         // Evict freed blocks from thread-local cache

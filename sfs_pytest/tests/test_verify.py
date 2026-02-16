@@ -149,14 +149,13 @@ class TestVerifyCorruption:
         f.close()
 
         # The free list head is stored in the L2 header section.
-        # Header layout: magic(12) + L1(9) + L2(27)
+        # Header layout: magic(12) + L1(9) + L2(19)
         # L2 section: length(2) + "blocks"(6) + version(1) + bss(1) + biw(1)
-        #             + total_blocks(8) + free_list_head(8)
-        # free_list_head is at offset 12 + 9 + 2 + 6 + 1 + 1 + 1 + 8 = 40
-        # Actually: L2 starts at 12+9=21, free_list_head offset within L2 = 19
-        # So absolute offset = 21 + 19 = 40
+        #             + free_list_head(8)
+        # L2 starts at 12+9=21, free_list_head offset within L2 = 11
+        # So absolute offset = 21 + 11 = 32
         l2_start = 12 + 9  # = 21
-        free_list_offset = l2_start + 19  # = 40
+        free_list_offset = l2_start + 11  # = 32
 
         with open(sfs_path, "r+b") as raw:
             # Read the free_list_head

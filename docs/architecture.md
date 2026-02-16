@@ -166,7 +166,7 @@ When the four layers instantiate for creation, they request through L1 a "header
 ```
 Magic: File magic header | header layout version | total layer header length
 L1: length | L1 identifier | L1 version
-L2: length | L2 identifier | L2 version | block size shift | block index size shift
+L2: length | L2 identifier | L2 version | block size shift | block index size shift | free list head
 L3: length | L3 identifier | L3 version | Streams stream descriptor
 L4: length | L4 identifier | L4 version | root directory stream index
 ```
@@ -352,10 +352,10 @@ For clarity of explanation, the explanation above does not deal with reserved ca
 L3 separates between size (how much data the caller has written to the stream) and reserved (how much data the stream has space for). This is to create the capability to reserve space in the stream, which creates a couple of significant performance opportunities in the SFS library: 
 
 * Callers can achieve significantly faster stream enlargement when it happens at once.
-* Long runs of stream data can be allocated as contiguous runs of blocks on the underlying storage. Contiguity may seem a strange property to seek in a block-based storage format, but both stream read and stream write operations can achieve significant speed-ups when they detect contiguous runs of blocks, as they can read and write multiple blocks with one call of IO.
+* Long runs of stream data can be allocated as contiguous runs of blocks on the underlying storage. Contiguity may seem a strange property to seek in a block-based storage format, but both stream read and stream write operations can achieve significant speed-ups when they detect contiguous runs of stream leaf-node data blocks, as they can read and write multiple blocks with one call of IO.
 * Callers can achieve significantly faster trucations of streams when blocks contiguity is high.
 
-When a stream is truncated, all blocks - including those in any extended reserve - are returned as free blocks, in effect making the stream's size and reserved size very near to each other (reserved will include the unwritten space in the last data block).
+When a stream is truncated, all blocks - including those in any extended reserve - are returned as free blocks, in effect making the stream's size and reserved size very near to each other (reserved will include the unwritten space in the last data block, so tends to be every so slightly larger).
 
 ### Tracking streams in L3
 

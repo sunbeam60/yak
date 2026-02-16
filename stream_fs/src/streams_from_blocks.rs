@@ -970,13 +970,16 @@ struct CompRedir {
 }
 
 /// Read a compression redirector from the given block.
+/// Reads the entire redirector in a single `read_block` call, mirroring
+/// `write_comp_redir` which writes the whole redirector in one call.
 fn read_comp_redir<L2: BlockLayer>(
     layer2: &L2,
     redir_block: u64,
     block_size: usize,
     block_index_width: u8,
 ) -> Result<CompRedir, SfsError> {
-    // Compressed length is the first 4 bytes
+    // First read: get the compressed length (4 bytes) so we know how large
+    // the redirector is.
     let mut len_buf = [0u8; 4];
     layer2.read_block(redir_block, 0, &mut len_buf, true)?;
     let compressed_length = u32::from_le_bytes(len_buf);
@@ -990,13 +993,18 @@ fn read_comp_redir<L2: BlockLayer>(
 
     let biw = block_index_width as usize;
     let n_blocks = (compressed_length as usize).div_ceil(block_size);
-    let mut data_blocks = Vec::with_capacity(n_blocks);
 
-    // Read block pointers starting at offset 4
+    // Second read: read the entire redirector (length + all block pointers)
+    // in a single call, then parse block pointers from the buffer.
+    let buf_size = 4 + n_blocks * biw;
+    let mut buf = vec![0u8; buf_size];
+    layer2.read_block(redir_block, 0, &mut buf, true)?;
+
+    let mut data_blocks = Vec::with_capacity(n_blocks);
     for i in 0..n_blocks {
         let offset = 4 + i * biw;
         let mut idx_buf = [0u8; 8];
-        layer2.read_block(redir_block, offset, &mut idx_buf[..biw], true)?;
+        idx_buf[..biw].copy_from_slice(&buf[offset..offset + biw]);
         data_blocks.push(u64::from_le_bytes(idx_buf));
     }
 
@@ -1030,24 +1038,27 @@ fn write_comp_redir<L2: BlockLayer>(
 }
 
 /// Read and decompress a virtual block's data from a compression redirector.
-/// Returns a buffer of `virtual_block_size` bytes (zero-padded if the vblock
-/// extends beyond the stream's logical size).
+/// Writes the decompressed data into `out_buf` (whose length determines the
+/// virtual block size). Uses `compressed_buf` as a reusable scratch buffer for
+/// reading compressed data from physical blocks, avoiding per-call allocation.
 fn decompress_vblock<L2: BlockLayer>(
     layer2: &L2,
     redir_block: u64,
-    virtual_block_size: usize,
     block_size: usize,
     block_index_width: u8,
-) -> Result<Vec<u8>, SfsError> {
+    compressed_buf: &mut Vec<u8>,
+    out_buf: &mut [u8],
+) -> Result<(), SfsError> {
     let redir = read_comp_redir(layer2, redir_block, block_size, block_index_width)?;
 
     if redir.compressed_length == 0 {
-        return Ok(vec![0u8; virtual_block_size]);
+        out_buf.fill(0);
+        return Ok(());
     }
 
-    // Read compressed data from physical blocks
+    // Read compressed data from physical blocks into reusable buffer
     let total_compressed = redir.compressed_length as usize;
-    let mut compressed = vec![0u8; total_compressed];
+    compressed_buf.resize(total_compressed, 0);
     let mut bytes_remaining = total_compressed;
     let mut buf_offset = 0;
 
@@ -1056,7 +1067,7 @@ fn decompress_vblock<L2: BlockLayer>(
         layer2.read_block(
             data_block,
             0,
-            &mut compressed[buf_offset..buf_offset + to_read],
+            &mut compressed_buf[buf_offset..buf_offset + to_read],
             true,
         )?;
         buf_offset += to_read;
@@ -1064,13 +1075,14 @@ fn decompress_vblock<L2: BlockLayer>(
     }
 
     // Decompress
-    let decompressed = lz4_flex::decompress_size_prepended(&compressed)
+    let decompressed = lz4_flex::decompress_size_prepended(compressed_buf)
         .map_err(|e| SfsError::IoError(format!("lz4 decompression failed: {}", e)))?;
 
-    // Pad to virtual_block_size if needed (the compressor only stored the valid extent)
-    let mut result = decompressed;
-    result.resize(virtual_block_size, 0);
-    Ok(result)
+    // Copy into out_buf, zero-padding if the valid extent is smaller than virtual_block_size
+    let dec_len = decompressed.len();
+    out_buf[..dec_len].copy_from_slice(&decompressed);
+    out_buf[dec_len..].fill(0);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1111,6 +1123,10 @@ fn pyramid_read_compressed<L2: BlockLayer>(
     let mut bytes_read = 0;
     let mut current_pos = pos;
 
+    // Reusable buffers — allocated once, reused across loop iterations
+    let mut vblock_buf = vec![0u8; virtual_block_size];
+    let mut compressed_read_buf: Vec<u8> = Vec::new();
+
     while bytes_read < to_read {
         let vblock_idx = current_pos / virtual_block_size as u64;
         let offset_in_vblock = (current_pos % virtual_block_size as u64) as usize;
@@ -1141,20 +1157,21 @@ fn pyramid_read_compressed<L2: BlockLayer>(
             continue;
         }
 
-        // Read and decompress this virtual block
-        let decompressed = decompress_vblock(
+        // Read and decompress this virtual block into reusable buffer
+        decompress_vblock(
             layer2,
             redir_block,
-            virtual_block_size,
             block_size,
             block_index_width,
+            &mut compressed_read_buf,
+            &mut vblock_buf,
         )?;
 
         // Copy the requested range from the decompressed data
         let vblock_remaining = virtual_block_size - offset_in_vblock;
         let chunk = (to_read - bytes_read).min(vblock_remaining);
         buf[bytes_read..bytes_read + chunk]
-            .copy_from_slice(&decompressed[offset_in_vblock..offset_in_vblock + chunk]);
+            .copy_from_slice(&vblock_buf[offset_in_vblock..offset_in_vblock + chunk]);
         bytes_read += chunk;
         current_pos += chunk as u64;
     }
@@ -1200,6 +1217,13 @@ fn pyramid_write_compressed<L2: BlockLayer>(
     let mut bytes_written = 0;
     let mut current_pos = pos;
 
+    // Reusable buffers — allocated once, reused across loop iterations
+    let mut vblock_buf = vec![0u8; virtual_block_size];
+    let mut compressed_read_buf: Vec<u8> = Vec::new();
+    let mut new_data_blocks: Vec<u64> = Vec::new();
+    let mut excess_blocks: Vec<u64> = Vec::new();
+    let mut redir_write_buf: Vec<u8> = Vec::new();
+
     while bytes_written < buf.len() {
         let vblock_idx = current_pos / virtual_block_size as u64;
         let offset_in_vblock = (current_pos % virtual_block_size as u64) as usize;
@@ -1223,25 +1247,26 @@ fn pyramid_write_compressed<L2: BlockLayer>(
         // Read existing compressed data for this virtual block
         let old_redir = read_comp_redir(layer2, redir_block, block_size, biw)?;
 
-        let mut vblock_buf = if old_redir.compressed_length == 0 {
-            vec![0u8; virtual_block_size]
+        if old_redir.compressed_length == 0 {
+            vblock_buf.fill(0);
         } else {
-            // Read compressed data from physical blocks
+            // Read compressed data from physical blocks into reusable buffer
             let total_compressed = old_redir.compressed_length as usize;
-            let mut compressed = vec![0u8; total_compressed];
+            compressed_read_buf.resize(total_compressed, 0);
             let mut remaining = total_compressed;
             let mut off = 0;
             for &db in &old_redir.data_blocks {
                 let to_read = remaining.min(block_size);
-                layer2.read_block(db, 0, &mut compressed[off..off + to_read], true)?;
+                layer2.read_block(db, 0, &mut compressed_read_buf[off..off + to_read], true)?;
                 off += to_read;
                 remaining -= to_read;
             }
-            let mut dec = lz4_flex::decompress_size_prepended(&compressed)
+            let dec = lz4_flex::decompress_size_prepended(&compressed_read_buf)
                 .map_err(|e| SfsError::IoError(format!("lz4 decompression failed: {}", e)))?;
-            dec.resize(virtual_block_size, 0);
-            dec
-        };
+            let dec_len = dec.len();
+            vblock_buf[..dec_len].copy_from_slice(&dec);
+            vblock_buf[dec_len..].fill(0);
+        }
 
         // Overlay the write data
         let vblock_remaining = virtual_block_size - offset_in_vblock;
@@ -1266,7 +1291,7 @@ fn pyramid_write_compressed<L2: BlockLayer>(
         let old_block_count = old_redir.data_blocks.len();
 
         // Reconcile physical blocks: reuse existing, allocate/free the delta
-        let mut new_data_blocks = Vec::with_capacity(new_block_count);
+        new_data_blocks.clear();
 
         // Reuse as many existing blocks as we can
         let reuse_count = old_block_count.min(new_block_count);
@@ -1279,8 +1304,9 @@ fn pyramid_write_compressed<L2: BlockLayer>(
             new_data_blocks.extend_from_slice(&allocated);
         } else if old_block_count > new_block_count {
             // Free excess blocks
-            let mut excess: Vec<u64> = old_redir.data_blocks[new_block_count..].to_vec();
-            layer2.deallocate_blocks(&mut excess)?;
+            excess_blocks.clear();
+            excess_blocks.extend_from_slice(&old_redir.data_blocks[new_block_count..]);
+            layer2.deallocate_blocks(&mut excess_blocks)?;
         }
 
         // Write compressed data to physical blocks
@@ -1298,12 +1324,18 @@ fn pyramid_write_compressed<L2: BlockLayer>(
             comp_remaining -= to_write;
         }
 
-        // Update the compression redirector
-        let new_redir = CompRedir {
-            compressed_length: new_compressed_len as u32,
-            data_blocks: new_data_blocks,
-        };
-        write_comp_redir(layer2, redir_block, &new_redir, biw)?;
+        // Update the compression redirector (build inline to avoid cloning
+        // the reusable new_data_blocks vec)
+        let biw_sz = biw as usize;
+        let redir_buf_size = 4 + new_data_blocks.len() * biw_sz;
+        redir_write_buf.resize(redir_buf_size, 0);
+        redir_write_buf[0..4].copy_from_slice(&(new_compressed_len as u32).to_le_bytes());
+        for (i, &block_ptr) in new_data_blocks.iter().enumerate() {
+            let off = 4 + i * biw_sz;
+            let bytes = block_ptr.to_le_bytes();
+            redir_write_buf[off..off + biw_sz].copy_from_slice(&bytes[..biw_sz]);
+        }
+        layer2.write_block(redir_block, 0, &redir_write_buf[..redir_buf_size], true)?;
 
         bytes_written += chunk;
         current_pos += chunk as u64;

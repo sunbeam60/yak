@@ -52,6 +52,18 @@ The architecture discusses reserved capacity conceptually in the stream descript
 
 The architecture mentions reserve as a utility function but doesn't list it in the API. `tell()` is a natural complement to seek but isn't mentioned.
 
+### Terminology: "virtual block" → "compressed block"
+
+**Architecture says:** The compression section uses the term "compressed virtual blocks" in diagrams and occasionally "virtual block" when describing the larger conceptual blocks that compressed streams operate with.
+
+**Reality:** The codebase uses "compressed block" exclusively. All variable names, function names, and comments refer to `compressed_block_size_shift` / `cbss` / `cbs` / `cblock_*` etc. The old `virtual_block_*` / `vbss` / `vbs` / `vblock_*` naming has been fully replaced. The rationale: in a compressed stream, what was called a "virtual block" is simply a "compressed block" — a leaf-level block containing a compression redirector with the compressed length and pointers to the physical data blocks. In an uncompressed stream, the equivalent is a "data block." The term "virtual" added confusion without adding clarity.
+
+### L2 encryption not yet documented
+
+**Architecture says:** Nothing about encryption at the block layer.
+
+**Reality:** L2 now supports optional AES-XTS block-level encryption. When a password is provided at create/open time, all block data is encrypted transparently. The encryption state is stored in the L2 header, and a key-check mechanism validates passwords on open. The `BlockLayer` trait exposes `is_encrypted()` and the encryption/decryption is handled internally by L2.
+
 ### Verification chain not documented in API sections
 
 **Architecture says:** "A function to verify the integrity of an SFS file is provided" (in the thread safety section).

@@ -1,6 +1,7 @@
 mod block_layer;
 mod blocks_from_files;
 mod blocks_in_file;
+pub(crate) mod encryption;
 mod file_layer;
 mod file_on_disk;
 mod sfs;
@@ -35,19 +36,9 @@ pub type SfsBlockFileBacked = Sfs<StreamsFromBlocks<BlocksFromFiles>>;
 /// File-backed streams (L3 mock, debugging/testing tool).
 pub type SfsFileBacked = Sfs<StreamsFromFiles>;
 
-/// Returns a hello world greeting from the Stream File System library.
-pub fn hello() -> String {
-    "Hello from Stream File System!".to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_hello() {
-        assert_eq!(hello(), "Hello from Stream File System!");
-    }
 
     #[test]
     fn test_reopen() {
@@ -85,7 +76,7 @@ mod tests {
 
         // Test L3 directly via StreamsFromBlocks
         type L3 = StreamsFromBlocks<BlocksInFile<FileOnDisk, DEFAULT_CACHE_BUDGET_BYTES>>;
-        let l3 = L3::create(path_str, 4, 12, 0, std::collections::VecDeque::new()).unwrap();
+        let l3 = L3::create(path_str, 4, 12, 0, std::collections::VecDeque::new(), None).unwrap();
 
         // Initially no streams
         assert_eq!(l3.stream_count().unwrap(), 0);

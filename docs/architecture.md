@@ -346,8 +346,8 @@ The "pyramid" block linking layout has a number of advantages:
 * The depth of the redirector blocks can be calculated directly from the size of the stream. In addition, there's no overhead to mark a block out as a particular type; since we can reason about the depth, we know how far down the hierarchy the data blocks lie and everything before that is a redirector block.
 * Even with relatively small block sizes a *large* data stream can be tracked with low depth of tracking blocks. For example, if blocks are 4 kb and uint32 indices, an SFS stream can can grow to 4+ GB before needing a third redirector level.
 
-#### Reserved length
-For clarity of explanation, the explanation above does not deal with reserved capacity of a stream. A stream can be extended into being longer than needed to store the data in the stream. So while the explanation above is correct, it leaves out the fact that a stream descriptor actually has 3 fields: Top block, size and reserved, and that the resulting pyramid can therefore be larger than it needs to be to strictly hold the user-written data.
+#### Additional feature & complexity: Reserved length
+For clarity of explanation, the pyramid data structure explanation above does not deal with reserved capacity of a stream. A stream can be extended into being longer than needed to store the data in the stream. So while the explanation above is correct, it leaves out the fact that a stream descriptor actually has 3 fields: Top block, size and reserved, and that the resulting pyramid can therefore be larger than it needs to be to strictly hold the user-written data.
 
 L3 separates between size (how much data the caller has written to the stream) and reserved (how much data the stream has space for). This is to create the capability to reserve space in the stream, which creates a couple of significant performance opportunities in the SFS library: 
 
@@ -356,6 +356,56 @@ L3 separates between size (how much data the caller has written to the stream) a
 * Callers can achieve significantly faster trucations of streams when blocks contiguity is high.
 
 When a stream is truncated, all blocks - including those in any extended reserve - are returned as free blocks, in effect making the stream's size and reserved size very near to each other (reserved will include the unwritten space in the last data block, so tends to be every so slightly larger).
+
+#### Additional feature & complexity: Compression
+For additional clarity of explanation, the pyramid data structure above does not deal with compression. To achieve transparent compression/decompression of data streams, an additional layer of indirection can be found at L3.
+
+In an uncompressed data stream, the leaf nodes contain the data written by the caller. Observe Fig 1. below, with an uncompressed data stream, size 17, with a redirector block (15) pointing to two data blocks (4 and 10).
+
+```ASCII
+  Fig 1. Uncompressed.       Fig 2. Compressed                                               
+  ┌──────────┐                ┌──────────┐                                                    
+  │ Size: 17 │                │ Size: 75 │                                                    
+  │ Top: 15  │       -->      │ Top: 15  │ 
+  │ Cmprs: N │                │ Cmprs: Y │                                                    
+  └────┬─────┘                └────┬─────┘                                                    
+       ▼                           ▼                                                          
+15┌──────────┐              15┌──────────┐                                                    
+  │4 |10|  | │                │4 |10|  | │◄───────────── Redirector                           
+  └─┬────────┘                └─┬────────┘                                                    
+    ├ 4┌──────────┐             ├─4┌──────────┐                                               
+    │  │..........│             │  │14|50|33| │◄──────── Compression redirector               
+    │  └──────────┘             │  └─┬────────┘                                               
+    └10┌──────────┐             │    ├50┌──────────┐                                          
+       │.......   │             │    │  │..........│◄──┐                                      
+       └──────────┘             │    │  └──────────┘   ├ Compressed virtual blocks            
+                                │    └33┌──────────┐   │ (was size 40, compressed to size 14) 
+                                │       │....      │◄──┘                                      
+                                │       └──────────┘                                          
+                                └─10┌──────────┐                                              
+                                    │28|50|33|8│◄──────── Compression redirector              
+                                    └─┬────────┘                                              
+                                      ├50┌──────────┐                                         
+                                      │  │..........│◄──┐                                     
+                                      │  └──────────┘   │                                     
+                                      ├33┌──────────┐   │                                     
+                                      │  │..........│◄──┼ Compressed virtual blocks           
+                                      │  └──────────┘   │ (was size 35, compressed to size 28)
+                                      └─8┌──────────┐   │                                     
+                                         │........  │◄──┘                                     
+                                         └──────────┘                                         
+```
+In a compressed data stream however, a "compression redirector node" is inserted between the redirector pyramid above (i.e. one oe more redirector nodes) and the compressed data below. Each compression redirector holds the compressed length of the data, followed by a the necessary block indices where this compressed data is stored.
+
+It follows from this layout that:
+* There are only space savings to be made if a larger block is compressed into one or more smaller blocks. If a data stream of 4 kb was compressed into 2 kb, but it still needed to be stored in a 4 kb block, no space saving would be achieved.
+* The difference between the size of the larger conceptual blocks and the smaller real blocks defines the increments of savings. For example if an 8 kb block needs to be compressed into smaller 2 kb blocks, the space saving would happen in increments of 25% (2/8); either the compressed result of an 8 kb block fits into one 2 kb block (we saved 75%), two 2 kb blocks (we saved 50%), three 2 kb blocks (we saved 25%), four 2 kb blocks (we didn't save anything) or - dread! - five or more 2 kb blocks (we lost space from compression).
+
+Throughout this explanation of how transparent compression/decompression is achieved in SFS, the astute reader will note that we're suddenly talking about "larger blocks" (containing the uncompressed data) and smaller blocks (containing the compressed output data). This is achieved by decoupling the concept of the size of a real SFS block from the size that a data-block is meant to represent. For uncompressed streams, the data block storage size is the same as the physical block size. When a stream is compressed, however, L3 considers the data storage per data block to be larger by a set factor (by default this factor is 3-doubles (3 shifts),i.e. 4 kb physical blocks operate with 32 kb virtual blocks (4 -> 8 -> 16 -> 32) and 16 kb blocks would operate with 128 kb virtual blocks (16 -> 32 -> 64 -> 128). This means that when SFS navigates around in the pyramid of redirector blocks, it considers the real block 3 doublings larger (by default) than it actually is, knowing that the end block is in fact a compression redirector that "spans" over a data area that's 3 doublings larger than the real block size.
+
+The easiest way to express this is that a compression redirector at the bottom of the pyramid "represents" a fixed, larger area than were it a regular data block. Navigation logic in the pyramid (e.g. when a caller seeks to a new position in the stream) works on basis that the bottom of the pyramd is either a real data block (where representative size of the data block is equal to physical size) or a virtual data block (where representative size is 3 doublings larger than physical size). The navigation logic is the same; it just works with the representative size of the block.
+
+This does, of course, introduce some slow downs in that every time a virtual block needs modification, it needs to be decompressed, modified and then recompressed. SFS uses lz4, a very fast compression algorithm, to achieve this and, in some scenarios, operating with compression is faster because there is less IO (simply because more data can fit into the same IO). Having said all of that, compression is a penalty in many scenarios and callers must decide through testing whether compression is worthwhile for their scenario. It is given, but is nevertheless worth stating, that data that's already compressed before it is added to the SFS file will not compress further and will, in fact, end up larger if added to an SFS file as a compressed stream.
 
 ### Tracking streams in L3
 

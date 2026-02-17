@@ -37,6 +37,8 @@ pub enum SfsError {
     SeekOutOfBounds(String),
     IoError(String),
     ReadOnly(String),
+    WrongPassword(String),
+    EncryptionRequired(String),
 }
 
 impl fmt::Display for SfsError {
@@ -50,6 +52,8 @@ impl fmt::Display for SfsError {
             SfsError::SeekOutOfBounds(msg) => write!(f, "seek out of bounds: {}", msg),
             SfsError::IoError(msg) => write!(f, "I/O error: {}", msg),
             SfsError::ReadOnly(msg) => write!(f, "read-only: {}", msg),
+            SfsError::WrongPassword(msg) => write!(f, "wrong password: {}", msg),
+            SfsError::EncryptionRequired(msg) => write!(f, "encryption required: {}", msg),
         }
     }
 }
@@ -283,10 +287,10 @@ impl<L3: StreamLayer> Sfs<L3> {
     // SFS file lifecycle
     // -------------------------------------------------------------------
 
-    /// Default offset from block_size_shift to virtual_block_size_shift.
-    /// vbss = bss + 3 gives virtual blocks that are 8x the physical block size
-    /// (e.g. bss=12 → 4KB blocks, vbss=15 → 32KB virtual blocks).
-    const DEFAULT_VBSS_OFFSET: u8 = 3;
+    /// Default offset from block_size_shift to compressed_block_size_shift.
+    /// cbss = bss + 3 gives compressed blocks that are 8x the physical block size
+    /// (e.g. bss=12 → 4KB blocks, cbss=15 → 32KB compressed blocks).
+    const DEFAULT_CBSS_OFFSET: u8 = 3;
 
     /// Create a new SFS file. Compression support is always enabled.
     ///
@@ -294,39 +298,40 @@ impl<L3: StreamLayer> Sfs<L3> {
     /// on disk (e.g. 2, 4, or 8).
     /// `block_size_shift` is the power-of-2 exponent for block size
     /// (e.g. 12 → 4096 bytes).
-    /// The virtual block size defaults to 8x the physical block size
-    /// (bss + 3). Use `create_with_vbss` to override.
+    /// The compressed block size defaults to 8x the physical block size
+    /// (bss + 3). Use `create_with_cbss` to override.
     pub fn create(
         path: &str,
         block_index_width: u8,
         block_size_shift: u8,
     ) -> Result<Self, SfsError> {
-        let vbss = block_size_shift.saturating_add(Self::DEFAULT_VBSS_OFFSET);
-        Self::create_inner(path, block_index_width, block_size_shift, vbss)
+        let cbss = block_size_shift.saturating_add(Self::DEFAULT_CBSS_OFFSET);
+        Self::create_inner(path, block_index_width, block_size_shift, cbss, None)
     }
 
-    /// Create a new SFS file with a specific virtual block size shift.
+    /// Create a new SFS file with a specific compressed block size shift.
     ///
-    /// `virtual_block_size_shift` is the power-of-2 exponent for the virtual
-    /// block size used by compressed streams (e.g. 15 → 32768 bytes).
+    /// `compressed_block_size_shift` is the power-of-2 exponent for the
+    /// compressed block size used by compressed streams (e.g. 15 → 32768 bytes).
     /// Must be >= `block_size_shift`.
-    pub fn create_with_vbss(
+    pub fn create_with_cbss(
         path: &str,
         block_index_width: u8,
         block_size_shift: u8,
-        virtual_block_size_shift: u8,
+        compressed_block_size_shift: u8,
     ) -> Result<Self, SfsError> {
-        if virtual_block_size_shift < block_size_shift {
+        if compressed_block_size_shift < block_size_shift {
             return Err(SfsError::IoError(format!(
-                "virtual_block_size_shift ({}) must be >= block_size_shift ({})",
-                virtual_block_size_shift, block_size_shift
+                "compressed_block_size_shift ({}) must be >= block_size_shift ({})",
+                compressed_block_size_shift, block_size_shift
             )));
         }
         Self::create_inner(
             path,
             block_index_width,
             block_size_shift,
-            virtual_block_size_shift,
+            compressed_block_size_shift,
+            None,
         )
     }
 
@@ -334,15 +339,17 @@ impl<L3: StreamLayer> Sfs<L3> {
         path: &str,
         block_index_width: u8,
         block_size_shift: u8,
-        virtual_block_size_shift: u8,
+        compressed_block_size_shift: u8,
+        password: Option<&[u8]>,
     ) -> Result<Self, SfsError> {
         // Pass L4 payload size down through the layer chain so L1 can calculate data_offset
         let layer3 = L3::create(
             path,
             block_index_width,
             block_size_shift,
-            virtual_block_size_shift,
+            compressed_block_size_shift,
             VecDeque::from([L4_PAYLOAD_SIZE]),
+            password,
         )?;
         let root_id = layer3.create_stream(false)?;
 
@@ -368,7 +375,11 @@ impl<L3: StreamLayer> Sfs<L3> {
     /// - `OpenMode::Read`: shared process lock, write operations are rejected
     /// - `OpenMode::Write`: exclusive process lock, all operations allowed
     pub fn open(path: &str, mode: OpenMode) -> Result<Self, SfsError> {
-        let layer3 = L3::open(path, mode)?;
+        Self::open_inner(path, mode, None)
+    }
+
+    fn open_inner(path: &str, mode: OpenMode, password: Option<&[u8]>) -> Result<Self, SfsError> {
+        let layer3 = L3::open(path, mode, password)?;
 
         // Read L4 header payload via slot
         let l4_slot = layer3.header_slot_for_upper(0);
@@ -529,9 +540,67 @@ impl<L3: StreamLayer> Sfs<L3> {
         self.layer3.block_size_shift()
     }
 
-    /// Virtual block size shift (0 = compression not configured).
-    pub fn virtual_block_size_shift(&self) -> u8 {
-        self.layer3.virtual_block_size_shift()
+    /// Compressed block size shift (0 = compression not configured).
+    pub fn compressed_block_size_shift(&self) -> u8 {
+        self.layer3.compressed_block_size_shift()
+    }
+
+    /// Returns true if the underlying storage has encryption enabled.
+    pub fn is_encrypted(&self) -> bool {
+        self.layer3.is_encrypted()
+    }
+
+    /// Create a new encrypted SFS file. Compression support is always enabled.
+    ///
+    /// Same as `create`, but all block data is AES-XTS encrypted with a
+    /// password-derived key. The password is required for all subsequent opens.
+    pub fn create_encrypted(
+        path: &str,
+        block_index_width: u8,
+        block_size_shift: u8,
+        password: &[u8],
+    ) -> Result<Self, SfsError> {
+        let cbss = block_size_shift.saturating_add(Self::DEFAULT_CBSS_OFFSET);
+        Self::create_inner(
+            path,
+            block_index_width,
+            block_size_shift,
+            cbss,
+            Some(password),
+        )
+    }
+
+    /// Create a new encrypted SFS file with a specific compressed block size shift.
+    ///
+    /// Same as `create_with_cbss`, but with AES-XTS block encryption.
+    pub fn create_encrypted_with_cbss(
+        path: &str,
+        block_index_width: u8,
+        block_size_shift: u8,
+        compressed_block_size_shift: u8,
+        password: &[u8],
+    ) -> Result<Self, SfsError> {
+        if compressed_block_size_shift < block_size_shift {
+            return Err(SfsError::IoError(format!(
+                "compressed_block_size_shift ({}) must be >= block_size_shift ({})",
+                compressed_block_size_shift, block_size_shift
+            )));
+        }
+        Self::create_inner(
+            path,
+            block_index_width,
+            block_size_shift,
+            compressed_block_size_shift,
+            Some(password),
+        )
+    }
+
+    /// Open an existing encrypted SFS file.
+    ///
+    /// Returns `EncryptionRequired` if the file is encrypted but no password
+    /// is provided. Returns `WrongPassword` if the password is incorrect.
+    pub fn open_encrypted(path: &str, mode: OpenMode, password: &[u8]) -> Result<Self, SfsError> {
+        Self::open_inner(path, mode, Some(password))
     }
 
     // -------------------------------------------------------------------

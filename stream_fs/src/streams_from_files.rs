@@ -206,8 +206,9 @@ impl StreamLayer for StreamsFromFiles {
         path: &str,
         block_index_width: u8,
         block_size_shift: u8,
-        _virtual_block_size_shift: u8,
+        _compressed_block_size_shift: u8,
         mut slot_sizes: VecDeque<u16>,
+        _password: Option<&[u8]>,
     ) -> Result<Self, SfsError> {
         let root = PathBuf::from(path);
         if root.exists() {
@@ -270,7 +271,7 @@ impl StreamLayer for StreamsFromFiles {
         Ok(instance)
     }
 
-    fn open(path: &str, _mode: OpenMode) -> Result<Self, SfsError> {
+    fn open(path: &str, _mode: OpenMode, _password: Option<&[u8]>) -> Result<Self, SfsError> {
         let root = PathBuf::from(path);
         if !root.is_dir() {
             return Err(SfsError::NotFound(root.display().to_string()));
@@ -337,7 +338,7 @@ impl StreamLayer for StreamsFromFiles {
         self.block_size_shift
     }
 
-    fn virtual_block_size_shift(&self) -> u8 {
+    fn compressed_block_size_shift(&self) -> u8 {
         0 // File-backed mock does not support compression
     }
 

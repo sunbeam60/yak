@@ -105,35 +105,55 @@ impl Sfs {
     // -- Lifecycle -----------------------------------------------------------
 
     /// Create a new SFS file. Compression support is always enabled.
-    /// If `virtual_block_size_shift` is None, defaults to block_size_shift + 3
+    /// If `compressed_block_size_shift` is None, defaults to block_size_shift + 3
     /// (8x the physical block size).
+    /// If `password` is provided, the file is encrypted with AES-XTS.
     #[staticmethod]
-    #[pyo3(signature = (path, block_index_width=4, block_size_shift=12, virtual_block_size_shift=None))]
+    #[pyo3(signature = (path, block_index_width=4, block_size_shift=12, compressed_block_size_shift=None, password=None))]
     fn create(
         py: Python<'_>,
         path: &str,
         block_index_width: u8,
         block_size_shift: u8,
-        virtual_block_size_shift: Option<u8>,
+        compressed_block_size_shift: Option<u8>,
+        password: Option<&[u8]>,
     ) -> PyResult<Self> {
         let path = path.to_owned();
+        let pw: Option<Vec<u8>> = password.map(|p| p.to_vec());
         let sfs = py
-            .detach(move || match virtual_block_size_shift {
-                Some(vbss) => {
-                    SfsDefault::create_with_vbss(&path, block_index_width, block_size_shift, vbss)
+            .detach(move || match (compressed_block_size_shift, pw.as_deref()) {
+                (Some(cbss), Some(pw)) => SfsDefault::create_encrypted_with_cbss(
+                    &path,
+                    block_index_width,
+                    block_size_shift,
+                    cbss,
+                    pw,
+                ),
+                (Some(cbss), None) => {
+                    SfsDefault::create_with_cbss(&path, block_index_width, block_size_shift, cbss)
                 }
-                None => SfsDefault::create(&path, block_index_width, block_size_shift),
+                (None, Some(pw)) => {
+                    SfsDefault::create_encrypted(&path, block_index_width, block_size_shift, pw)
+                }
+                (None, None) => SfsDefault::create(&path, block_index_width, block_size_shift),
             })
             .map_err(to_py_err)?;
         Ok(Sfs { inner: Some(sfs) })
     }
 
+    /// Open an existing SFS file.
+    /// If the file is encrypted, `password` must be provided.
     #[staticmethod]
-    fn open(py: Python<'_>, path: &str, mode: OpenMode) -> PyResult<Self> {
+    #[pyo3(signature = (path, mode, password=None))]
+    fn open(py: Python<'_>, path: &str, mode: OpenMode, password: Option<&[u8]>) -> PyResult<Self> {
         let path = path.to_owned();
         let rust_mode = RustOpenMode::from(mode);
+        let pw: Option<Vec<u8>> = password.map(|p| p.to_vec());
         let sfs = py
-            .detach(move || SfsDefault::open(&path, rust_mode))
+            .detach(move || match pw.as_deref() {
+                Some(pw) => SfsDefault::open_encrypted(&path, rust_mode, pw),
+                None => SfsDefault::open(&path, rust_mode),
+            })
             .map_err(to_py_err)?;
         Ok(Sfs { inner: Some(sfs) })
     }
@@ -284,22 +304,18 @@ impl Sfs {
             .map_err(to_py_err)
     }
 
+    // -- Info ----------------------------------------------------------------
+
+    fn is_encrypted(&self) -> PyResult<bool> {
+        Ok(self.get()?.is_encrypted())
+    }
+
     // -- Verification --------------------------------------------------------
 
     fn verify(&self, py: Python<'_>) -> PyResult<Vec<String>> {
         let sfs = self.get()?;
         py.detach(|| sfs.verify()).map_err(to_py_err)
     }
-}
-
-// ---------------------------------------------------------------------------
-// Module-level functions
-// ---------------------------------------------------------------------------
-
-/// Returns a greeting string from the SFS library.
-#[pyfunction]
-fn hello() -> String {
-    stream_fs::hello()
 }
 
 // ---------------------------------------------------------------------------
@@ -313,6 +329,5 @@ fn sfs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<EntryType>()?;
     m.add_class::<DirEntry>()?;
     m.add("SfsError", m.py().get_type::<SfsError>())?;
-    m.add_function(wrap_pyfunction!(hello, m)?)?;
     Ok(())
 }

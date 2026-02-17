@@ -29,15 +29,22 @@ pub trait BlockLayer: Send + Sync {
         block_size_shift: u8,
         block_index_width: u8,
         slot_sizes: VecDeque<u16>,
+        password: Option<&[u8]>,
     ) -> Result<Self, SfsError>
     where
         Self: Sized;
 
     /// Open an existing L2 storage at the given path.
     /// `mode` is forwarded to L1 for file-level locking.
-    fn open(path: &str, mode: OpenMode) -> Result<Self, SfsError>
+    /// `password` is required if the file was created with encryption.
+    fn open(path: &str, mode: OpenMode, password: Option<&[u8]>) -> Result<Self, SfsError>
     where
         Self: Sized;
+
+    /// Returns true if this L2 instance has encryption enabled.
+    fn is_encrypted(&self) -> bool {
+        false
+    }
 
     /// Block size in bytes (convenience: `1 << block_size_shift`).
     fn block_size(&self) -> usize;

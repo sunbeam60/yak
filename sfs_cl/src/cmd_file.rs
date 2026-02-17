@@ -2,31 +2,38 @@ use stream_fs::{OpenMode, SfsDefault as Sfs};
 
 use crate::error::{CliError, CliResult};
 use crate::helpers::{
-    close_sfs, expect_args, open_sfs, DEFAULT_BLOCK_INDEX_WIDTH, DEFAULT_BLOCK_SIZE_SHIFT,
+    close_sfs, expect_args, open_sfs, resolve_password_create, DEFAULT_BLOCK_INDEX_WIDTH,
+    DEFAULT_BLOCK_SIZE_SHIFT,
 };
 
 pub fn cmd_create(args: &[String]) -> CliResult {
     if args.is_empty() {
-        return Err(CliError::new("Usage: sfs create <sfs-file> [--vbss N]"));
+        return Err(CliError::new(
+            "Usage: sfs create <sfs-file> [--cbss N] [--encrypted]",
+        ));
     }
 
     let path = &args[0];
-    let mut vbss: Option<u8> = None;
+    let mut cbss: Option<u8> = None;
+    let mut encrypted = false;
 
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--vbss" => {
+            "--cbss" => {
                 i += 1;
-                vbss = Some(
+                cbss = Some(
                     args.get(i)
                         .and_then(|s| s.parse().ok())
-                        .ok_or_else(|| CliError::new("--vbss requires a numeric argument"))?,
+                        .ok_or_else(|| CliError::new("--cbss requires a numeric argument"))?,
                 );
+            }
+            "--encrypted" => {
+                encrypted = true;
             }
             other => {
                 return Err(CliError::new(format!(
-                    "Unknown option: {}. Usage: sfs create <sfs-file> [--vbss N]",
+                    "Unknown option: {}. Usage: sfs create <sfs-file> [--cbss N] [--encrypted]",
                     other
                 )));
             }
@@ -34,16 +41,37 @@ pub fn cmd_create(args: &[String]) -> CliResult {
         i += 1;
     }
 
-    let sfs = match vbss {
-        Some(v) => {
-            Sfs::create_with_vbss(path, DEFAULT_BLOCK_INDEX_WIDTH, DEFAULT_BLOCK_SIZE_SHIFT, v)
+    let sfs = if encrypted {
+        let password = resolve_password_create()?;
+        let pw = password.as_bytes();
+        match cbss {
+            Some(v) => Sfs::create_encrypted_with_cbss(
+                path,
+                DEFAULT_BLOCK_INDEX_WIDTH,
+                DEFAULT_BLOCK_SIZE_SHIFT,
+                v,
+                pw,
+            ),
+            None => Sfs::create_encrypted(
+                path,
+                DEFAULT_BLOCK_INDEX_WIDTH,
+                DEFAULT_BLOCK_SIZE_SHIFT,
+                pw,
+            ),
         }
-        None => Sfs::create(path, DEFAULT_BLOCK_INDEX_WIDTH, DEFAULT_BLOCK_SIZE_SHIFT),
+    } else {
+        match cbss {
+            Some(v) => {
+                Sfs::create_with_cbss(path, DEFAULT_BLOCK_INDEX_WIDTH, DEFAULT_BLOCK_SIZE_SHIFT, v)
+            }
+            None => Sfs::create(path, DEFAULT_BLOCK_INDEX_WIDTH, DEFAULT_BLOCK_SIZE_SHIFT),
+        }
     }
     .map_err(|e| CliError::new(format!("Error creating SFS file: {}", e)))?;
 
     close_sfs(sfs)?;
-    println!("Created SFS file: {}", path);
+    let enc_label = if encrypted { " (encrypted)" } else { "" };
+    println!("Created SFS file{}: {}", enc_label, path);
     Ok(())
 }
 
@@ -116,9 +144,4 @@ pub fn cmd_info(args: &[String]) -> CliResult {
 
     let _ = sfs.close_stream(handle);
     close_sfs(sfs)
-}
-
-pub fn cmd_hello(_args: &[String]) -> CliResult {
-    println!("{}", stream_fs::hello());
-    Ok(())
 }

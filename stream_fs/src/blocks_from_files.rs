@@ -110,6 +110,7 @@ impl BlockLayer for BlocksFromFiles {
         block_size_shift: u8,
         block_index_width: u8,
         mut slot_sizes: VecDeque<u16>,
+        _password: Option<&[u8]>,
     ) -> Result<Self, SfsError> {
         let root = PathBuf::from(path);
         if root.exists() {
@@ -166,7 +167,7 @@ impl BlockLayer for BlocksFromFiles {
         Ok(instance)
     }
 
-    fn open(path: &str, _mode: OpenMode) -> Result<Self, SfsError> {
+    fn open(path: &str, _mode: OpenMode, _password: Option<&[u8]>) -> Result<Self, SfsError> {
         let root = PathBuf::from(path);
         if !root.is_dir() {
             return Err(SfsError::NotFound(root.display().to_string()));

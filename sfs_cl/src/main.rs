@@ -24,8 +24,8 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const COMMANDS: &[CommandEntry] = &[
     CommandEntry {
         name: "create",
-        usage: "sfs create <sfs-file> [--vbss N]",
-        description: "Create a new SFS file (--vbss overrides virtual block size)",
+        usage: "sfs create <sfs-file> [--cbss N] [--encrypted]",
+        description: "Create a new SFS file (--encrypted enables AES-XTS encryption)",
         run: cmd_file::cmd_create,
     },
     CommandEntry {
@@ -105,12 +105,6 @@ const COMMANDS: &[CommandEntry] = &[
         usage: "sfs bench <scenario> [options]",
         description: "Run benchmark scenario",
         run: bench::cmd_bench,
-    },
-    CommandEntry {
-        name: "hello",
-        usage: "sfs hello",
-        description: "Print a greeting",
-        run: cmd_file::cmd_hello,
     },
 ];
 

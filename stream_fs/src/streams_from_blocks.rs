@@ -5,7 +5,7 @@ use crate::block_layer::BlockLayer;
 use crate::stream_layer::StreamLayer;
 use crate::{HeaderSlotId, OpenMode, SfsError};
 
-/// L3 payload size: "pyra  "(6) + version(1) + size(8) + top_block(8) + reserved(8) + vbss(1) = 32 bytes.
+/// L3 payload size: "pyra  "(6) + version(1) + size(8) + top_block(8) + reserved(8) + cbss(1) = 32 bytes.
 const L3_PAYLOAD_SIZE: u16 = 32;
 
 // ---------------------------------------------------------------------------
@@ -48,7 +48,7 @@ struct StreamDescriptor {
     size: u64,
     top_block: u64,
     /// Allocated capacity in bytes (always a multiple of block_size or
-    /// virtual_block_size, or 0). Invariant: reserved >= size.
+    /// compressed_block_size, or 0). Invariant: reserved >= size.
     reserved: u64,
     /// Bit flags — see STREAM_FLAG_COMPRESSED.
     flags: u8,
@@ -136,10 +136,10 @@ pub struct StreamsFromBlocks<L2: BlockLayer> {
     /// L3's own header slot ID.
     my_slot: HeaderSlotId,
 
-    /// Virtual block size shift (0 = no compression configured).
-    /// When non-zero, compressed streams use 2^vbss bytes as their virtual
-    /// block size (the unit of compression). Filesystem-wide setting.
-    virtual_block_size_shift: u8,
+    /// Compressed block size shift (0 = no compression configured).
+    /// When non-zero, compressed streams use 2^cbss bytes as their
+    /// compressed block size (the unit of compression). Filesystem-wide setting.
+    compressed_block_size_shift: u8,
 
     /// Bookkeeping state: per-stream locks, open handles.
     state: Mutex<StreamsFromBlocksState>,
@@ -1037,11 +1037,11 @@ fn write_comp_redir<L2: BlockLayer>(
     Ok(())
 }
 
-/// Read and decompress a virtual block's data from a compression redirector.
+/// Read and decompress a compressed block's data from a compression redirector.
 /// Writes the decompressed data into `out_buf` (whose length determines the
-/// virtual block size). Uses `compressed_buf` as a reusable scratch buffer for
+/// compressed block size). Uses `compressed_buf` as a reusable scratch buffer for
 /// reading compressed data from physical blocks, avoiding per-call allocation.
-fn decompress_vblock<L2: BlockLayer>(
+fn decompress_cblock<L2: BlockLayer>(
     layer2: &L2,
     redir_block: u64,
     block_size: usize,
@@ -1078,7 +1078,7 @@ fn decompress_vblock<L2: BlockLayer>(
     let decompressed = lz4_flex::decompress_size_prepended(compressed_buf)
         .map_err(|e| SfsError::IoError(format!("lz4 decompression failed: {}", e)))?;
 
-    // Copy into out_buf, zero-padding if the valid extent is smaller than virtual_block_size
+    // Copy into out_buf, zero-padding if the valid extent is smaller than compressed_block_size
     let dec_len = decompressed.len();
     out_buf[..dec_len].copy_from_slice(&decompressed);
     out_buf[dec_len..].fill(0);
@@ -1089,9 +1089,9 @@ fn decompress_vblock<L2: BlockLayer>(
 // Compressed pyramid operations
 // ---------------------------------------------------------------------------
 
-/// Calculate the number of virtual blocks needed for `size` bytes.
-fn virtual_blocks_needed(size: u64, virtual_block_size: usize) -> u64 {
-    size.div_ceil(virtual_block_size as u64)
+/// Calculate the number of compressed blocks needed for `size` bytes.
+fn compressed_blocks_needed(size: u64, compressed_block_size: usize) -> u64 {
+    size.div_ceil(compressed_block_size as u64)
 }
 
 /// Read bytes from a compressed stream.
@@ -1100,7 +1100,7 @@ fn pyramid_read_compressed<L2: BlockLayer>(
     descriptor: &StreamDescriptor,
     pos: u64,
     buf: &mut [u8],
-    virtual_block_size: usize,
+    compressed_block_size: usize,
     fan_out: u64,
     block_index_width: u8,
 ) -> Result<usize, SfsError> {
@@ -1116,20 +1116,20 @@ fn pyramid_read_compressed<L2: BlockLayer>(
     }
 
     let capacity = descriptor.reserved.max(descriptor.size);
-    let num_vblocks = virtual_blocks_needed(capacity, virtual_block_size);
-    let depth = pyramid_depth(num_vblocks, fan_out);
+    let num_cblocks = compressed_blocks_needed(capacity, compressed_block_size);
+    let depth = pyramid_depth(num_cblocks, fan_out);
     let sentinel = block_sentinel(block_index_width);
 
     let mut bytes_read = 0;
     let mut current_pos = pos;
 
     // Reusable buffers — allocated once, reused across loop iterations
-    let mut vblock_buf = vec![0u8; virtual_block_size];
+    let mut cblock_buf = vec![0u8; compressed_block_size];
     let mut compressed_read_buf: Vec<u8> = Vec::new();
 
     while bytes_read < to_read {
-        let vblock_idx = current_pos / virtual_block_size as u64;
-        let offset_in_vblock = (current_pos % virtual_block_size as u64) as usize;
+        let cblock_idx = current_pos / compressed_block_size as u64;
+        let offset_in_cblock = (current_pos % compressed_block_size as u64) as usize;
 
         // Navigate pyramid to get the compression redirector block
         let redir_block = if depth == 0 {
@@ -1138,40 +1138,40 @@ fn pyramid_read_compressed<L2: BlockLayer>(
             let leaf = navigate_to_leaf(
                 layer2,
                 descriptor,
-                vblock_idx,
+                cblock_idx,
                 depth,
                 fan_out,
                 block_index_width,
             )?;
-            let slot = vblock_idx % fan_out;
+            let slot = cblock_idx % fan_out;
             read_block_index(layer2, leaf, slot, block_index_width)?
         };
 
         if redir_block == sentinel {
-            // Unallocated virtual block — return zeros
-            let vblock_remaining = virtual_block_size - offset_in_vblock;
-            let chunk = (to_read - bytes_read).min(vblock_remaining);
+            // Unallocated compressed block — return zeros
+            let cblock_remaining = compressed_block_size - offset_in_cblock;
+            let chunk = (to_read - bytes_read).min(cblock_remaining);
             buf[bytes_read..bytes_read + chunk].fill(0);
             bytes_read += chunk;
             current_pos += chunk as u64;
             continue;
         }
 
-        // Read and decompress this virtual block into reusable buffer
-        decompress_vblock(
+        // Read and decompress this compressed block into reusable buffer
+        decompress_cblock(
             layer2,
             redir_block,
             block_size,
             block_index_width,
             &mut compressed_read_buf,
-            &mut vblock_buf,
+            &mut cblock_buf,
         )?;
 
         // Copy the requested range from the decompressed data
-        let vblock_remaining = virtual_block_size - offset_in_vblock;
-        let chunk = (to_read - bytes_read).min(vblock_remaining);
+        let cblock_remaining = compressed_block_size - offset_in_cblock;
+        let chunk = (to_read - bytes_read).min(cblock_remaining);
         buf[bytes_read..bytes_read + chunk]
-            .copy_from_slice(&vblock_buf[offset_in_vblock..offset_in_vblock + chunk]);
+            .copy_from_slice(&cblock_buf[offset_in_cblock..offset_in_cblock + chunk]);
         bytes_read += chunk;
         current_pos += chunk as u64;
     }
@@ -1185,7 +1185,7 @@ fn pyramid_write_compressed<L2: BlockLayer>(
     descriptor: &mut StreamDescriptor,
     pos: u64,
     buf: &[u8],
-    virtual_block_size: usize,
+    compressed_block_size: usize,
     fan_out: u64,
     block_index_width: u8,
 ) -> Result<usize, SfsError> {
@@ -1202,15 +1202,15 @@ fn pyramid_write_compressed<L2: BlockLayer>(
         descriptor,
         end_pos.max(descriptor.size),
         block_size,
-        virtual_block_size,
+        compressed_block_size,
         fan_out,
         block_index_width,
     )?;
 
     let old_size = descriptor.size;
     let capacity = descriptor.reserved.max(descriptor.size);
-    let num_vblocks = virtual_blocks_needed(capacity, virtual_block_size);
-    let depth = pyramid_depth(num_vblocks, fan_out);
+    let num_cblocks = compressed_blocks_needed(capacity, compressed_block_size);
+    let depth = pyramid_depth(num_cblocks, fan_out);
     let sentinel = block_sentinel(block_index_width);
     let biw = block_index_width;
 
@@ -1218,37 +1218,37 @@ fn pyramid_write_compressed<L2: BlockLayer>(
     let mut current_pos = pos;
 
     // Reusable buffers — allocated once, reused across loop iterations
-    let mut vblock_buf = vec![0u8; virtual_block_size];
+    let mut cblock_buf = vec![0u8; compressed_block_size];
     let mut compressed_read_buf: Vec<u8> = Vec::new();
     let mut new_data_blocks: Vec<u64> = Vec::new();
     let mut excess_blocks: Vec<u64> = Vec::new();
     let mut redir_write_buf: Vec<u8> = Vec::new();
 
     while bytes_written < buf.len() {
-        let vblock_idx = current_pos / virtual_block_size as u64;
-        let offset_in_vblock = (current_pos % virtual_block_size as u64) as usize;
+        let cblock_idx = current_pos / compressed_block_size as u64;
+        let offset_in_cblock = (current_pos % compressed_block_size as u64) as usize;
 
-        // Find the compression redirector block for this virtual block
+        // Find the compression redirector block for this compressed block
         let redir_block = if depth == 0 {
             descriptor.top_block
         } else {
-            let leaf = navigate_to_leaf(layer2, descriptor, vblock_idx, depth, fan_out, biw)?;
-            let slot = vblock_idx % fan_out;
+            let leaf = navigate_to_leaf(layer2, descriptor, cblock_idx, depth, fan_out, biw)?;
+            let slot = cblock_idx % fan_out;
             read_block_index(layer2, leaf, slot, biw)?
         };
 
         if redir_block == sentinel {
             return Err(SfsError::IoError(format!(
-                "compressed write: no redirector at vblock {}",
-                vblock_idx
+                "compressed write: no redirector at cblock {}",
+                cblock_idx
             )));
         }
 
-        // Read existing compressed data for this virtual block
+        // Read existing compressed data for this compressed block
         let old_redir = read_comp_redir(layer2, redir_block, block_size, biw)?;
 
         if old_redir.compressed_length == 0 {
-            vblock_buf.fill(0);
+            cblock_buf.fill(0);
         } else {
             // Read compressed data from physical blocks into reusable buffer
             let total_compressed = old_redir.compressed_length as usize;
@@ -1264,28 +1264,28 @@ fn pyramid_write_compressed<L2: BlockLayer>(
             let dec = lz4_flex::decompress_size_prepended(&compressed_read_buf)
                 .map_err(|e| SfsError::IoError(format!("lz4 decompression failed: {}", e)))?;
             let dec_len = dec.len();
-            vblock_buf[..dec_len].copy_from_slice(&dec);
-            vblock_buf[dec_len..].fill(0);
+            cblock_buf[..dec_len].copy_from_slice(&dec);
+            cblock_buf[dec_len..].fill(0);
         }
 
         // Overlay the write data
-        let vblock_remaining = virtual_block_size - offset_in_vblock;
-        let chunk = (buf.len() - bytes_written).min(vblock_remaining);
-        vblock_buf[offset_in_vblock..offset_in_vblock + chunk]
+        let cblock_remaining = compressed_block_size - offset_in_cblock;
+        let chunk = (buf.len() - bytes_written).min(cblock_remaining);
+        cblock_buf[offset_in_cblock..offset_in_cblock + chunk]
             .copy_from_slice(&buf[bytes_written..bytes_written + chunk]);
 
-        // Determine the valid extent for compression: how much of this vblock
+        // Determine the valid extent for compression: how much of this cblock
         // actually contains stream data (not trailing zeros beyond stream end)
-        let vblock_start = vblock_idx * virtual_block_size as u64;
+        let cblock_start = cblock_idx * compressed_block_size as u64;
         let stream_size_after = end_pos.max(old_size);
-        let valid_extent = if vblock_start + virtual_block_size as u64 <= stream_size_after {
-            virtual_block_size
+        let valid_extent = if cblock_start + compressed_block_size as u64 <= stream_size_after {
+            compressed_block_size
         } else {
-            (stream_size_after - vblock_start) as usize
+            (stream_size_after - cblock_start) as usize
         };
 
         // Compress the valid extent
-        let compressed = lz4_flex::compress_prepend_size(&vblock_buf[..valid_extent]);
+        let compressed = lz4_flex::compress_prepend_size(&cblock_buf[..valid_extent]);
         let new_compressed_len = compressed.len();
         let new_block_count = new_compressed_len.div_ceil(block_size);
         let old_block_count = old_redir.data_blocks.len();
@@ -1355,7 +1355,7 @@ fn pyramid_reserve_compressed<L2: BlockLayer>(
     descriptor: &mut StreamDescriptor,
     n_bytes: u64,
     block_size: usize,
-    virtual_block_size: usize,
+    compressed_block_size: usize,
     fan_out: u64,
     block_index_width: u8,
 ) -> Result<(), SfsError> {
@@ -1369,40 +1369,40 @@ fn pyramid_reserve_compressed<L2: BlockLayer>(
         return Ok(());
     }
 
-    let target_vblocks = virtual_blocks_needed(n_bytes, virtual_block_size);
+    let target_cblocks = compressed_blocks_needed(n_bytes, compressed_block_size);
 
     ensure_capacity_compressed(
         layer2,
         descriptor,
-        target_vblocks,
+        target_cblocks,
         block_size,
-        virtual_block_size,
+        compressed_block_size,
         fan_out,
         block_index_width,
     )?;
-    descriptor.reserved = target_vblocks * virtual_block_size as u64;
+    descriptor.reserved = target_cblocks * compressed_block_size as u64;
     Ok(())
 }
 
-/// Grow the compressed pyramid to support `target_vblocks` virtual blocks.
-/// Allocates compression redirector blocks (one per new virtual block),
+/// Grow the compressed pyramid to support `target_cblocks` compressed blocks.
+/// Allocates compression redirector blocks (one per new compressed block),
 /// each initialized with compressed_length=0.
 fn ensure_capacity_compressed<L2: BlockLayer>(
     layer2: &L2,
     descriptor: &mut StreamDescriptor,
-    target_vblocks: u64,
+    target_cblocks: u64,
     block_size: usize,
-    virtual_block_size: usize,
+    compressed_block_size: usize,
     fan_out: u64,
     block_index_width: u8,
 ) -> Result<(), SfsError> {
-    if target_vblocks == 0 {
+    if target_cblocks == 0 {
         return Ok(());
     }
 
-    let current_vblocks = virtual_blocks_needed(descriptor.reserved, virtual_block_size);
-    let current_depth = pyramid_depth(current_vblocks, fan_out);
-    let target_depth = pyramid_depth(target_vblocks, fan_out);
+    let current_cblocks = compressed_blocks_needed(descriptor.reserved, compressed_block_size);
+    let current_depth = pyramid_depth(current_cblocks, fan_out);
+    let target_depth = pyramid_depth(target_cblocks, fan_out);
 
     // Handle empty stream: allocate first compression redirector block
     if descriptor.reserved == 0 && descriptor.top_block == 0 {
@@ -1415,13 +1415,13 @@ fn ensure_capacity_compressed<L2: BlockLayer>(
         write_comp_redir(layer2, redir_block, &zero_redir, block_index_width)?;
         descriptor.top_block = redir_block;
 
-        if target_vblocks <= 1 {
+        if target_cblocks <= 1 {
             return Ok(());
         }
     }
 
     // Grow depth if needed: wrap current top in new redirector layers
-    let effective_current_depth = if descriptor.reserved == 0 && current_vblocks == 0 {
+    let effective_current_depth = if descriptor.reserved == 0 && current_cblocks == 0 {
         0
     } else {
         current_depth
@@ -1437,12 +1437,12 @@ fn ensure_capacity_compressed<L2: BlockLayer>(
     descriptor.top_block = current_top;
 
     // Allocate missing compression redirector blocks
-    let effective_current = if current_vblocks == 0 {
+    let effective_current = if current_cblocks == 0 {
         1
     } else {
-        current_vblocks
+        current_cblocks
     };
-    let redirs_needed = target_vblocks - effective_current;
+    let redirs_needed = target_cblocks - effective_current;
     if redirs_needed > 0 {
         let new_redir_blocks = layer2.allocate_blocks(redirs_needed)?;
 
@@ -1468,14 +1468,14 @@ fn ensure_capacity_compressed<L2: BlockLayer>(
     Ok(())
 }
 
-/// Truncate a compressed stream. Deallocates virtual blocks beyond `new_len`,
+/// Truncate a compressed stream. Deallocates compressed blocks beyond `new_len`,
 /// including their compression redirectors and physical data blocks.
 fn pyramid_truncate_compressed<L2: BlockLayer>(
     layer2: &L2,
     descriptor: &mut StreamDescriptor,
     new_len: u64,
     block_size: usize,
-    virtual_block_size: usize,
+    compressed_block_size: usize,
     fan_out: u64,
     block_index_width: u8,
 ) -> Result<(), SfsError> {
@@ -1487,8 +1487,8 @@ fn pyramid_truncate_compressed<L2: BlockLayer>(
         // Deallocate the entire compressed tree
         let capacity = descriptor.reserved.max(descriptor.size);
         if capacity > 0 && descriptor.top_block != 0 {
-            let old_vblocks = virtual_blocks_needed(capacity, virtual_block_size);
-            let old_depth = pyramid_depth(old_vblocks, fan_out);
+            let old_cblocks = compressed_blocks_needed(capacity, compressed_block_size);
+            let old_depth = pyramid_depth(old_cblocks, fan_out);
             deallocate_compressed_tree(
                 layer2,
                 descriptor.top_block,
@@ -1505,19 +1505,19 @@ fn pyramid_truncate_compressed<L2: BlockLayer>(
     }
 
     let capacity = descriptor.reserved.max(descriptor.size);
-    let old_vblocks = virtual_blocks_needed(capacity, virtual_block_size);
-    let new_vblocks = virtual_blocks_needed(new_len, virtual_block_size);
-    let old_depth = pyramid_depth(old_vblocks, fan_out);
-    let new_depth = pyramid_depth(new_vblocks, fan_out);
+    let old_cblocks = compressed_blocks_needed(capacity, compressed_block_size);
+    let new_cblocks = compressed_blocks_needed(new_len, compressed_block_size);
+    let old_depth = pyramid_depth(old_cblocks, fan_out);
+    let new_depth = pyramid_depth(new_cblocks, fan_out);
 
-    // Deallocate excess virtual blocks (their redirectors + data blocks)
-    if new_vblocks < old_vblocks {
+    // Deallocate excess compressed blocks (their redirectors + data blocks)
+    if new_cblocks < old_cblocks {
         deallocate_excess_compressed_blocks(
             layer2,
             descriptor.top_block,
             old_depth,
-            new_vblocks,
-            old_vblocks,
+            new_cblocks,
+            old_cblocks,
             fan_out,
             block_index_width,
         )?;
@@ -1532,7 +1532,7 @@ fn pyramid_truncate_compressed<L2: BlockLayer>(
     }
     descriptor.top_block = current_top;
     descriptor.size = new_len;
-    descriptor.reserved = new_vblocks * virtual_block_size as u64;
+    descriptor.reserved = new_cblocks * compressed_block_size as u64;
 
     Ok(())
 }
@@ -1659,22 +1659,22 @@ fn collect_compressed_tree_blocks<L2: BlockLayer>(
     }
 }
 
-/// Deallocate excess compressed virtual blocks from `keep_vblocks` to `total_vblocks - 1`.
+/// Deallocate excess compressed compressed blocks from `keep_cblocks` to `total_cblocks - 1`.
 fn deallocate_excess_compressed_blocks<L2: BlockLayer>(
     layer2: &L2,
     top_block: u64,
     depth: u32,
-    keep_vblocks: u64,
-    total_vblocks: u64,
+    keep_cblocks: u64,
+    total_cblocks: u64,
     fan_out: u64,
     block_index_width: u8,
 ) -> Result<(), SfsError> {
     let block_size = layer2.block_size();
-    for vblock_idx in keep_vblocks..total_vblocks {
-        deallocate_compressed_vblock_at(
+    for cblock_idx in keep_cblocks..total_cblocks {
+        deallocate_cblock_at(
             layer2,
             top_block,
-            vblock_idx,
+            cblock_idx,
             depth,
             block_size,
             fan_out,
@@ -1684,12 +1684,12 @@ fn deallocate_excess_compressed_blocks<L2: BlockLayer>(
     Ok(())
 }
 
-/// Deallocate a single compressed virtual block: free its physical data blocks,
+/// Deallocate a single compressed compressed block: free its physical data blocks,
 /// free the compression redirector block, and sentinel the leaf slot.
-fn deallocate_compressed_vblock_at<L2: BlockLayer>(
+fn deallocate_cblock_at<L2: BlockLayer>(
     layer2: &L2,
     top_block: u64,
-    vblock_idx: u64,
+    cblock_idx: u64,
     depth: u32,
     block_size: usize,
     fan_out: u64,
@@ -1705,7 +1705,7 @@ fn deallocate_compressed_vblock_at<L2: BlockLayer>(
     // Navigate to find the compression redirector block
     let mut path: Vec<(u64, u64)> = Vec::new(); // (block, slot)
     let mut current_block = top_block;
-    let mut remaining_idx = vblock_idx;
+    let mut remaining_idx = cblock_idx;
 
     for level in (1..depth).rev() {
         let span = fan_out.pow(level);
@@ -1926,21 +1926,21 @@ impl<L2: BlockLayer> StreamsFromBlocks<L2> {
     }
 
     /// Serialize the L3 header (no length prefix).
-    /// Format: | "pyra  ": [u8;6] | version: u8 | size: u64 | top_block: u64 | reserved: u64 | vbss: u8 |
-    fn serialize_header(streams_desc: &StreamDescriptor, vbss: u8) -> Vec<u8> {
+    /// Format: | "pyra  ": [u8;6] | version: u8 | size: u64 | top_block: u64 | reserved: u64 | cbss: u8 |
+    fn serialize_header(streams_desc: &StreamDescriptor, cbss: u8) -> Vec<u8> {
         let mut buf = Vec::with_capacity(L3_PAYLOAD_SIZE as usize);
         buf.extend_from_slice(b"pyra  ");
-        buf.push(2); // version 2: adds vbss and per-stream compressed flags
+        buf.push(2); // version 2: adds cbss and per-stream compressed flags
         buf.extend_from_slice(&streams_desc.size.to_le_bytes());
         buf.extend_from_slice(&streams_desc.top_block.to_le_bytes());
         buf.extend_from_slice(&streams_desc.reserved.to_le_bytes());
-        buf.push(vbss);
+        buf.push(cbss);
         buf
     }
 
     /// Deserialize the L3 header (no length prefix).
     /// Input: 32 bytes — identifier starts at byte 0.
-    /// Returns (streams_descriptor, virtual_block_size_shift).
+    /// Returns (streams_descriptor, compressed_block_size_shift).
     fn deserialize_header(data: &[u8]) -> Result<(StreamDescriptor, u8), SfsError> {
         if data.len() < L3_PAYLOAD_SIZE as usize {
             return Err(SfsError::IoError(format!(
@@ -1963,11 +1963,11 @@ impl<L2: BlockLayer> StreamsFromBlocks<L2> {
             )));
         }
         // payload[7..15] = streams_size, [15..23] = streams_top_block,
-        // [23..31] = streams_reserved, [31] = vbss
+        // [23..31] = streams_reserved, [31] = cbss
         let streams_size = u64::from_le_bytes(data[7..15].try_into().unwrap());
         let streams_top_block = u64::from_le_bytes(data[15..23].try_into().unwrap());
         let streams_reserved = u64::from_le_bytes(data[23..31].try_into().unwrap());
-        let vbss = data[31];
+        let cbss = data[31];
         Ok((
             StreamDescriptor {
                 size: streams_size,
@@ -1975,14 +1975,14 @@ impl<L2: BlockLayer> StreamsFromBlocks<L2> {
                 reserved: streams_reserved,
                 flags: 0, // Streams-stream descriptor doesn't use flags
             },
-            vbss,
+            cbss,
         ))
     }
 
     /// Persist the L3 header payload to L2 via its slot.
     /// Caller must hold the STREAMS_STREAM_ID lock.
     fn persist_l3_header(&self, streams_desc: &StreamDescriptor) -> Result<(), SfsError> {
-        let payload = Self::serialize_header(streams_desc, self.virtual_block_size_shift);
+        let payload = Self::serialize_header(streams_desc, self.compressed_block_size_shift);
         self.layer2.write_header_slot(self.my_slot, &payload)
     }
 }
@@ -1998,8 +1998,9 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
         path: &str,
         block_index_width: u8,
         block_size_shift: u8,
-        virtual_block_size_shift: u8,
+        compressed_block_size_shift: u8,
         mut slot_sizes: VecDeque<u16>,
+        password: Option<&[u8]>,
     ) -> Result<Self, SfsError>
     where
         Self: Sized,
@@ -2007,7 +2008,13 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
         // Push L3 payload size to front (on-disk order: L3 before L4)
         slot_sizes.push_front(L3_PAYLOAD_SIZE);
 
-        let layer2 = L2::create(path, block_size_shift, block_index_width, slot_sizes)?;
+        let layer2 = L2::create(
+            path,
+            block_size_shift,
+            block_index_width,
+            slot_sizes,
+            password,
+        )?;
         let my_slot = layer2.header_slot_for_upper(0);
 
         // Write initial L3 payload
@@ -2017,14 +2024,14 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
             reserved: 0,
             flags: 0,
         };
-        let l3_payload = Self::serialize_header(&streams_desc, virtual_block_size_shift);
+        let l3_payload = Self::serialize_header(&streams_desc, compressed_block_size_shift);
         layer2.write_header_slot(my_slot, &l3_payload)?;
 
         Ok(StreamsFromBlocks {
             layer2,
             streams_descriptor: Mutex::new(streams_desc),
             my_slot,
-            virtual_block_size_shift,
+            compressed_block_size_shift,
             state: Mutex::new(StreamsFromBlocksState {
                 next_handle_id: 0,
                 locks: HashMap::new(),
@@ -2034,22 +2041,22 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
         })
     }
 
-    fn open(path: &str, mode: OpenMode) -> Result<Self, SfsError>
+    fn open(path: &str, mode: OpenMode, password: Option<&[u8]>) -> Result<Self, SfsError>
     where
         Self: Sized,
     {
-        let layer2 = L2::open(path, mode)?;
+        let layer2 = L2::open(path, mode, password)?;
         let my_header_slot = layer2.header_slot_for_upper(0);
 
         // Read and parse L3 payload
         let header_buffer = layer2.read_header_slot(my_header_slot)?;
-        let (streams_desc, vbss) = Self::deserialize_header(&header_buffer)?;
+        let (streams_desc, cbss) = Self::deserialize_header(&header_buffer)?;
 
         Ok(StreamsFromBlocks {
             layer2,
             streams_descriptor: Mutex::new(streams_desc),
             my_slot: my_header_slot,
-            virtual_block_size_shift: vbss,
+            compressed_block_size_shift: cbss,
             state: Mutex::new(StreamsFromBlocksState {
                 next_handle_id: 0,
                 locks: HashMap::new(),
@@ -2067,12 +2074,16 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
         self.layer2.block_size_shift()
     }
 
-    fn virtual_block_size_shift(&self) -> u8 {
-        self.virtual_block_size_shift
+    fn compressed_block_size_shift(&self) -> u8 {
+        self.compressed_block_size_shift
+    }
+
+    fn is_encrypted(&self) -> bool {
+        self.layer2.is_encrypted()
     }
 
     fn create_stream(&self, compressed: bool) -> Result<u64, SfsError> {
-        if compressed && self.virtual_block_size_shift == 0 {
+        if compressed && self.compressed_block_size_shift == 0 {
             return Err(SfsError::IoError(
                 "compression not configured for this filesystem".to_string(),
             ));
@@ -2285,9 +2296,9 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
                 let fo = self.fan_out();
                 let biw = self.block_index_width_val();
                 if desc.is_compressed() {
-                    let vbs = 1usize << self.virtual_block_size_shift;
-                    let num_vblocks = virtual_blocks_needed(capacity, vbs);
-                    let depth = pyramid_depth(num_vblocks, fo);
+                    let cbs = 1usize << self.compressed_block_size_shift;
+                    let num_cblocks = compressed_blocks_needed(capacity, cbs);
+                    let depth = pyramid_depth(num_cblocks, fo);
                     deallocate_compressed_tree(&self.layer2, desc.top_block, depth, bs, fo, biw)?;
                 } else {
                     let num_blocks = data_blocks_needed(capacity, bs);
@@ -2327,8 +2338,8 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
         let fo = self.fan_out();
         let biw = self.block_index_width_val();
         if desc.is_compressed() {
-            let vbs = 1usize << self.virtual_block_size_shift;
-            pyramid_read_compressed(&self.layer2, &desc, pos, buf, vbs, fo, biw)
+            let cbs = 1usize << self.compressed_block_size_shift;
+            pyramid_read_compressed(&self.layer2, &desc, pos, buf, cbs, fo, biw)
         } else {
             pyramid_read(&self.layer2, &desc, pos, buf, bs, fo, biw)
         }
@@ -2356,8 +2367,8 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
         let fo = self.fan_out();
         let biw = self.block_index_width_val();
         let n = if desc.is_compressed() {
-            let vbs = 1usize << self.virtual_block_size_shift;
-            pyramid_write_compressed(&self.layer2, &mut desc, pos, buf, vbs, fo, biw)?
+            let cbs = 1usize << self.compressed_block_size_shift;
+            pyramid_write_compressed(&self.layer2, &mut desc, pos, buf, cbs, fo, biw)?
         } else {
             pyramid_write(&self.layer2, &mut desc, pos, buf, bs, fo, biw)?
         };
@@ -2400,8 +2411,8 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
         let fo = self.fan_out();
         let biw = self.block_index_width_val();
         if desc.is_compressed() {
-            let vbs = 1usize << self.virtual_block_size_shift;
-            pyramid_truncate_compressed(&self.layer2, &mut desc, new_len, bs, vbs, fo, biw)?;
+            let cbs = 1usize << self.compressed_block_size_shift;
+            pyramid_truncate_compressed(&self.layer2, &mut desc, new_len, bs, cbs, fo, biw)?;
         } else {
             pyramid_truncate(&self.layer2, &mut desc, new_len, bs, fo, biw)?;
         }
@@ -2435,8 +2446,8 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
         let fo = self.fan_out();
         let biw = self.block_index_width_val();
         if desc.is_compressed() {
-            let vbs = 1usize << self.virtual_block_size_shift;
-            pyramid_reserve_compressed(&self.layer2, &mut desc, n_bytes, bs, vbs, fo, biw)?;
+            let cbs = 1usize << self.compressed_block_size_shift;
+            pyramid_reserve_compressed(&self.layer2, &mut desc, n_bytes, bs, cbs, fo, biw)?;
         } else {
             pyramid_reserve(&self.layer2, &mut desc, n_bytes, bs, fo, biw)?;
         }
@@ -2547,9 +2558,9 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
                                 label: &stream_label,
                             };
                             if desc.is_compressed() {
-                                let vbs = 1usize << self.virtual_block_size_shift;
-                                let num_vblocks = virtual_blocks_needed(capacity, vbs);
-                                let depth = pyramid_depth(num_vblocks, fo);
+                                let cbs = 1usize << self.compressed_block_size_shift;
+                                let num_cblocks = compressed_blocks_needed(capacity, cbs);
+                                let depth = pyramid_depth(num_cblocks, fo);
                                 collect_compressed_tree_blocks(
                                     &self.layer2,
                                     desc.top_block,

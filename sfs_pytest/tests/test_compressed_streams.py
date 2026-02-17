@@ -5,11 +5,11 @@ import pytest
 import sfs
 
 
-# Default parameters: 4KB blocks, 32KB virtual blocks
+# Default parameters: 4KB blocks, 32KB compressed blocks
 BLOCK_INDEX_WIDTH = 4
 BLOCK_SIZE_SHIFT = 12  # 4096 bytes
-VIRTUAL_BLOCK_SIZE_SHIFT = 15  # 32768 bytes
-VIRTUAL_BLOCK_SIZE = 1 << VIRTUAL_BLOCK_SIZE_SHIFT
+COMPRESSED_BLOCK_SIZE_SHIFT = 15  # 32768 bytes
+COMPRESSED_BLOCK_SIZE = 1 << COMPRESSED_BLOCK_SIZE_SHIFT
 BLOCK_SIZE = 1 << BLOCK_SIZE_SHIFT
 
 
@@ -68,8 +68,8 @@ class TestCompressedStreamIO:
         assert fs.stream_length(handle) == 11
         fs.close_stream(handle)
 
-    def test_partial_virtual_block(self, fs):
-        """Write less than one virtual block, read back correctly."""
+    def test_partial_compressed_block(self, fs):
+        """Write less than one compressed block, read back correctly."""
         data = b"small data"
         handle = fs.create_stream("small.bin", compressed=True)
         fs.write(handle, data)
@@ -78,21 +78,21 @@ class TestCompressedStreamIO:
         assert result == data
         fs.close_stream(handle)
 
-    def test_exact_virtual_block(self, fs):
-        """Write exactly one virtual block of data."""
-        data = bytes(range(256)) * (VIRTUAL_BLOCK_SIZE // 256)
-        assert len(data) == VIRTUAL_BLOCK_SIZE
+    def test_exact_compressed_block(self, fs):
+        """Write exactly one compressed block of data."""
+        data = bytes(range(256)) * (COMPRESSED_BLOCK_SIZE // 256)
+        assert len(data) == COMPRESSED_BLOCK_SIZE
         handle = fs.create_stream("exact.bin", compressed=True)
         fs.write(handle, data)
-        assert fs.stream_length(handle) == VIRTUAL_BLOCK_SIZE
+        assert fs.stream_length(handle) == COMPRESSED_BLOCK_SIZE
         fs.seek(handle, 0)
-        result = fs.read(handle, VIRTUAL_BLOCK_SIZE)
+        result = fs.read(handle, COMPRESSED_BLOCK_SIZE)
         assert result == data
         fs.close_stream(handle)
 
-    def test_multi_virtual_block(self, fs):
-        """Write data spanning multiple virtual blocks."""
-        size = VIRTUAL_BLOCK_SIZE * 3 + 1000
+    def test_multi_compressed_block(self, fs):
+        """Write data spanning multiple compressed blocks."""
+        size = COMPRESSED_BLOCK_SIZE * 3 + 1000
         data = bytes(i & 0xFF for i in range(size))
         handle = fs.create_stream("multi.bin", compressed=True)
         fs.write(handle, data)
@@ -102,8 +102,8 @@ class TestCompressedStreamIO:
         assert result == data
         fs.close_stream(handle)
 
-    def test_overwrite_within_virtual_block(self, fs):
-        """Write, then overwrite a portion within the same virtual block."""
+    def test_overwrite_within_compressed_block(self, fs):
+        """Write, then overwrite a portion within the same compressed block."""
         original = b"A" * 1000
         handle = fs.create_stream("over.bin", compressed=True)
         fs.write(handle, original)
@@ -169,9 +169,9 @@ class TestCompressedPersistence:
         fs.close()
 
     def test_persistence_large(self, tmp_path):
-        """Write multi-virtual-block data, close, reopen, read back."""
+        """Write multi-compressed-block data, close, reopen, read back."""
         sfs_path = str(tmp_path / "test.sfs")
-        size = VIRTUAL_BLOCK_SIZE * 2 + 5000
+        size = COMPRESSED_BLOCK_SIZE * 2 + 5000
         data = bytes(i & 0xFF for i in range(size))
 
         fs = sfs.Sfs.create(sfs_path, BLOCK_INDEX_WIDTH, BLOCK_SIZE_SHIFT)
@@ -232,7 +232,7 @@ class TestCompressibility:
         """Highly compressible data should produce a smaller file than uncompressed."""
         comp_path = str(tmp_path / "compressed.sfs")
         plain_path = str(tmp_path / "plain.sfs")
-        size = VIRTUAL_BLOCK_SIZE * 4  # 128KB of zeros — highly compressible
+        size = COMPRESSED_BLOCK_SIZE * 4  # 128KB of zeros — highly compressible
 
         # Write compressed
         fs = sfs.Sfs.create(comp_path, BLOCK_INDEX_WIDTH, BLOCK_SIZE_SHIFT)
@@ -260,7 +260,7 @@ class TestCompressibility:
 
         sfs_path = str(tmp_path / "test.sfs")
         random.seed(42)
-        data = bytes(random.getrandbits(8) for _ in range(VIRTUAL_BLOCK_SIZE + 1000))
+        data = bytes(random.getrandbits(8) for _ in range(COMPRESSED_BLOCK_SIZE + 1000))
 
         fs = sfs.Sfs.create(sfs_path, BLOCK_INDEX_WIDTH, BLOCK_SIZE_SHIFT)
         handle = fs.create_stream("random.bin", compressed=True)
@@ -297,12 +297,12 @@ class TestCompressedTruncate:
 
     def test_truncate_mid_stream(self, fs):
         """Truncate compressed stream to a shorter length."""
-        size = VIRTUAL_BLOCK_SIZE * 3
+        size = COMPRESSED_BLOCK_SIZE * 3
         data = bytes(i & 0xFF for i in range(size))
         handle = fs.create_stream("data.bin", compressed=True)
         fs.write(handle, data)
 
-        new_len = VIRTUAL_BLOCK_SIZE + 5000
+        new_len = COMPRESSED_BLOCK_SIZE + 5000
         fs.truncate(handle, new_len)
         assert fs.stream_length(handle) == new_len
 
@@ -369,7 +369,7 @@ class TestCompressedVerify:
 
         # Compressed stream
         h = fs.create_stream("comp.bin", compressed=True)
-        fs.write(h, b"x" * (VIRTUAL_BLOCK_SIZE * 2))
+        fs.write(h, b"x" * (COMPRESSED_BLOCK_SIZE * 2))
         fs.close_stream(h)
 
         # Uncompressed stream
@@ -446,7 +446,7 @@ class TestCompressedErrors:
     """Error conditions for compressed streams."""
 
     def test_compressed_works_on_default_create(self, tmp_path):
-        """Compressed streams work on a default-created SFS (vbss always enabled)."""
+        """Compressed streams work on a default-created SFS (cbss always enabled)."""
         sfs_path = str(tmp_path / "test.sfs")
         fs = sfs.Sfs.create(sfs_path)
         handle = fs.create_stream("data.bin", compressed=True)
@@ -458,25 +458,25 @@ class TestCompressedErrors:
 
 
 class TestCompressedParametrized:
-    """Test with different block size / virtual block size combinations."""
+    """Test with different block size / compressed block size combinations."""
 
     @pytest.mark.parametrize(
-        "bss,vbss",
+        "bss,cbss",
         [
-            (10, 13),  # 1KB blocks, 8KB virtual
-            (12, 15),  # 4KB blocks, 32KB virtual
-            (12, 16),  # 4KB blocks, 64KB virtual
+            (10, 13),  # 1KB blocks, 8KB compressed
+            (12, 15),  # 4KB blocks, 32KB compressed
+            (12, 16),  # 4KB blocks, 64KB compressed
         ],
     )
-    def test_write_read_various_sizes(self, tmp_path, bss, vbss):
-        """Write and read back with various block/virtual block sizes."""
-        sfs_path = str(tmp_path / f"test_{bss}_{vbss}.sfs")
-        vbs = 1 << vbss
-        # Write 3 virtual blocks + partial
-        size = vbs * 3 + 500
+    def test_write_read_various_sizes(self, tmp_path, bss, cbss):
+        """Write and read back with various block/compressed block sizes."""
+        sfs_path = str(tmp_path / f"test_{bss}_{cbss}.sfs")
+        cbs = 1 << cbss
+        # Write 3 compressed blocks + partial
+        size = cbs * 3 + 500
         data = bytes(i & 0xFF for i in range(size))
 
-        fs = sfs.Sfs.create(sfs_path, BLOCK_INDEX_WIDTH, bss, vbss)
+        fs = sfs.Sfs.create(sfs_path, BLOCK_INDEX_WIDTH, bss, cbss)
         handle = fs.create_stream("data.bin", compressed=True)
         fs.write(handle, data)
         fs.seek(handle, 0)

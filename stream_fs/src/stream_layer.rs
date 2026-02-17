@@ -26,9 +26,9 @@ pub trait StreamLayer: Send + Sync {
     /// disk (e.g. 2, 4, or 8).
     /// `block_size_shift` is the power-of-2 exponent for block size
     /// (e.g. 12 → 4096 bytes).
-    /// `virtual_block_size_shift` is the power-of-2 exponent for the virtual
-    /// block size used by compressed streams (0 = compression not configured).
-    /// Must be >= `block_size_shift` when non-zero.
+    /// `compressed_block_size_shift` is the power-of-2 exponent for the
+    /// compressed block size used by compressed streams (0 = compression not
+    /// configured). Must be >= `block_size_shift` when non-zero.
     /// `slot_sizes` accumulates payload sizes (NOT including the
     /// 2-byte length prefix) as they flow down through the layer chain.
     /// L3 push_front's its own payload size and passes the deque down to L2.
@@ -36,8 +36,9 @@ pub trait StreamLayer: Send + Sync {
         path: &str,
         block_index_width: u8,
         block_size_shift: u8,
-        virtual_block_size_shift: u8,
+        compressed_block_size_shift: u8,
         slot_sizes: VecDeque<u16>,
+        password: Option<&[u8]>,
     ) -> Result<Self, SfsError>
     where
         Self: Sized;
@@ -45,9 +46,15 @@ pub trait StreamLayer: Send + Sync {
     /// Open an existing L3 storage at the given path.
     /// Reads `block_index_width` and `block_size_shift` from the stored metadata.
     /// `mode` is forwarded to L2/L1 for file-level locking.
-    fn open(path: &str, mode: OpenMode) -> Result<Self, SfsError>
+    /// `password` is forwarded to L2 for encryption support.
+    fn open(path: &str, mode: OpenMode, password: Option<&[u8]>) -> Result<Self, SfsError>
     where
         Self: Sized;
+
+    /// Returns true if the underlying storage has encryption enabled.
+    fn is_encrypted(&self) -> bool {
+        false
+    }
 
     /// The number of bytes used for block indices on disk.
     fn block_index_width(&self) -> u8;
@@ -55,12 +62,12 @@ pub trait StreamLayer: Send + Sync {
     /// Block size as a power of 2 (e.g. 12 → 4096 bytes).
     fn block_size_shift(&self) -> u8;
 
-    /// Virtual block size shift (0 = compression not configured).
-    fn virtual_block_size_shift(&self) -> u8;
+    /// Compressed block size shift (0 = compression not configured).
+    fn compressed_block_size_shift(&self) -> u8;
 
     /// Create a new stream. Returns the stream identifier.
     /// If `compressed` is true, the stream will use leaf-level compression.
-    /// Requires virtual_block_size_shift > 0 when `compressed` is true.
+    /// Requires compressed_block_size_shift > 0 when `compressed` is true.
     fn create_stream(&self, compressed: bool) -> Result<u64, SfsError>;
 
     /// Check whether a stream with the given identifier exists.

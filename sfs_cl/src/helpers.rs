@@ -1,4 +1,6 @@
-use stream_fs::{OpenMode, SfsDefault as Sfs};
+use std::io::Write;
+
+use stream_fs::{OpenMode, SfsDefault as Sfs, SfsError};
 
 use crate::error::{CliError, CliResult};
 
@@ -6,6 +8,11 @@ use crate::error::{CliError, CliResult};
 pub const DEFAULT_BLOCK_INDEX_WIDTH: u8 = 4;
 /// Default block size shift: 12 (2^12 = 4096-byte blocks)
 pub const DEFAULT_BLOCK_SIZE_SHIFT: u8 = 12;
+
+/// Environment variable for dev/test convenience.
+/// If set, its value is used as the password instead of prompting interactively.
+/// NOT intended for production use.
+const PASSWORD_ENV_VAR: &str = "SFS_PASSWORD";
 
 /// Validate that `args` has exactly `expected` elements.
 pub fn expect_args(args: &[String], expected: usize, usage: &str) -> Result<(), CliError> {
@@ -30,9 +37,54 @@ pub fn expect_args_range(
     }
 }
 
-/// Open an existing SFS file.
+/// Resolve a password for opening an encrypted file.
+///
+/// 1. If `SFS_PASSWORD` env var is set, use its value.
+/// 2. Otherwise, prompt interactively via rpassword.
+pub fn resolve_password() -> Result<String, CliError> {
+    if let Ok(pw) = std::env::var(PASSWORD_ENV_VAR) {
+        return Ok(pw);
+    }
+    eprint!("Password: ");
+    std::io::stderr().flush().ok();
+    rpassword::read_password().map_err(|e| CliError::new(format!("Error reading password: {}", e)))
+}
+
+/// Resolve a password for creating an encrypted file.
+///
+/// 1. If `SFS_PASSWORD` env var is set, use its value (no confirmation).
+/// 2. Otherwise, prompt interactively twice for confirmation.
+pub fn resolve_password_create() -> Result<String, CliError> {
+    if let Ok(pw) = std::env::var(PASSWORD_ENV_VAR) {
+        return Ok(pw);
+    }
+    eprint!("Password: ");
+    std::io::stderr().flush().ok();
+    let pw1 = rpassword::read_password()
+        .map_err(|e| CliError::new(format!("Error reading password: {}", e)))?;
+    eprint!("Confirm password: ");
+    std::io::stderr().flush().ok();
+    let pw2 = rpassword::read_password()
+        .map_err(|e| CliError::new(format!("Error reading password: {}", e)))?;
+    if pw1 != pw2 {
+        return Err(CliError::new("Passwords do not match"));
+    }
+    Ok(pw1)
+}
+
+/// Open an existing SFS file. If the file is encrypted, automatically
+/// resolves the password (via env var or interactive prompt) and retries.
 pub fn open_sfs(path: &str, mode: OpenMode) -> Result<Sfs, CliError> {
-    Sfs::open(path, mode).map_err(|e| CliError::new(format!("Error opening SFS file: {}", e)))
+    match Sfs::open(path, mode) {
+        Ok(sfs) => Ok(sfs),
+        Err(SfsError::EncryptionRequired(_)) => {
+            // File is encrypted — resolve password and retry
+            let password = resolve_password()?;
+            Sfs::open_encrypted(path, mode, password.as_bytes())
+                .map_err(|e| CliError::new(format!("Error opening encrypted SFS file: {}", e)))
+        }
+        Err(e) => Err(CliError::new(format!("Error opening SFS file: {}", e))),
+    }
 }
 
 /// Close an SFS file.

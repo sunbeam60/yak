@@ -6,26 +6,36 @@ use lru::LruCache;
 use thread_local::ThreadLocal;
 
 use crate::block_layer::BlockLayer;
+use crate::encryption::{self, BlockCipher, EncryptionConfig};
 use crate::file_layer::FileLayer;
 use std::collections::VecDeque;
 
 use crate::{HeaderSlotId, OpenMode, SfsError};
 
 // L2 header payload layout (offsets within the payload, WITHOUT the 2-byte length prefix):
-// | "blocks": [u8;6] | version: u8 | bss: u8 | biw: u8 | free_list_head: u64 |
+// | "blocks": [u8;6] | version: u8 | bss: u8 | biw: u8 | free_list_head: u64 | encrypted: u8 |
+// If encrypted == 1, the remaining bytes are the encryption config (129 bytes).
 // total_blocks is derived at runtime from file size: (file_len - data_offset) / block_size
 const P_ID_OFFSET: usize = 0;
 const P_VERSION_OFFSET: usize = P_ID_OFFSET + 6;
 const P_BSS_OFFSET: usize = P_VERSION_OFFSET + 1;
 const P_BIW_OFFSET: usize = P_BSS_OFFSET + 1;
 const P_FREE_LIST_OFFSET: usize = P_BIW_OFFSET + 1;
-const L2_PAYLOAD_SIZE: u16 = (P_FREE_LIST_OFFSET + 8) as u16; // = 17
+const P_ENCRYPTED_FLAG_OFFSET: usize = P_FREE_LIST_OFFSET + 8;
+const P_ENCRYPTION_CONFIG_OFFSET: usize = P_ENCRYPTED_FLAG_OFFSET + 1;
+
+/// L2 payload size for unencrypted files (base fields + encrypted_flag byte).
+const L2_PAYLOAD_SIZE_PLAIN: u16 = P_ENCRYPTION_CONFIG_OFFSET as u16; // = 18
+
+/// L2 payload size for encrypted files (base fields + encrypted_flag + encryption config).
+const L2_PAYLOAD_SIZE_ENCRYPTED: u16 =
+    L2_PAYLOAD_SIZE_PLAIN + encryption::ENCRYPTION_CONFIG_SIZE as u16; // = 147
 
 /// L2 identifier in the header section.
 const L2_IDENTIFIER: &[u8; 6] = b"blocks";
 
-/// L2 header version.
-const L2_VERSION: u8 = 0;
+/// L2 header version. Bumped from 0 to 1 to indicate the new format with encryption support.
+const L2_VERSION: u8 = 1;
 
 /// Default memory budget (in bytes) for the per-thread block cache.
 /// Each thread gets its own independent LRU cache up to this size.
@@ -63,11 +73,17 @@ pub struct BlocksInFile<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> {
     state: Mutex<BlocksInFileState>,
     /// L2's own header slot ID.
     my_slot: HeaderSlotId,
-    /// Per-thread LRU cache of full block contents.
+    /// Per-thread LRU cache of full **decrypted** block contents.
     /// Key: block index. Value: full block as Vec<u8>.
     block_cache: ThreadLocal<RefCell<LruCache<u64, Vec<u8>>>>,
     /// Precomputed cache capacity (entry count) for this instance's block size.
     cache_capacity: NonZeroUsize,
+    /// Runtime cipher for block encryption/decryption. None = unencrypted.
+    cipher: Option<BlockCipher>,
+    /// On-disk encryption config. Stored so we can re-serialize the full L2
+    /// header on every `persist_l2_header` call (which happens on every
+    /// allocate/deallocate).
+    encryption_config: Option<EncryptionConfig>,
 }
 
 impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlocksInFile<L1, CACHE_BUDGET_BYTES> {
@@ -86,13 +102,25 @@ impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlocksInFile<L1, CACHE_BUDG
         block_size_shift: u8,
         block_index_width: u8,
         free_list_head: u64,
+        encryption_config: Option<&EncryptionConfig>,
     ) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(L2_PAYLOAD_SIZE as usize);
+        let payload_size = if encryption_config.is_some() {
+            L2_PAYLOAD_SIZE_ENCRYPTED
+        } else {
+            L2_PAYLOAD_SIZE_PLAIN
+        };
+        let mut buf = Vec::with_capacity(payload_size as usize);
         buf.extend_from_slice(L2_IDENTIFIER);
         buf.push(L2_VERSION);
         buf.push(block_size_shift);
         buf.push(block_index_width);
         buf.extend_from_slice(&free_list_head.to_le_bytes());
+        if let Some(config) = encryption_config {
+            buf.push(1); // encrypted_flag = 1
+            buf.extend_from_slice(&encryption::serialize_config(config));
+        } else {
+            buf.push(0); // encrypted_flag = 0
+        }
         buf
     }
 
@@ -102,6 +130,7 @@ impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlocksInFile<L1, CACHE_BUDG
             self.block_size_shift,
             self.block_index_width,
             free_list_head,
+            self.encryption_config.as_ref(),
         );
         self.layer1.write_header_slot(self.my_slot, &payload)
     }
@@ -143,11 +172,31 @@ impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlockLayer
         block_size_shift: u8,
         block_index_width: u8,
         mut slot_sizes: VecDeque<u16>,
+        password: Option<&[u8]>,
     ) -> Result<Self, SfsError> {
         let sentinel = block_sentinel(block_index_width);
 
+        // Set up encryption if a password is provided
+        let (cipher, encryption_config) = if let Some(pw) = password {
+            // AES-XTS requires at least 16 bytes per block
+            if block_size_shift < 4 {
+                return Err(SfsError::IoError(
+                    "encrypted files require block_size_shift >= 4 (16 bytes minimum)".to_string(),
+                ));
+            }
+            let (config, cipher) = encryption::create_encryption(pw)?;
+            (Some(cipher), Some(config))
+        } else {
+            (None, None)
+        };
+
         // Push L2 payload size to front (on-disk order: L2 first)
-        slot_sizes.push_front(L2_PAYLOAD_SIZE);
+        let payload_size = if encryption_config.is_some() {
+            L2_PAYLOAD_SIZE_ENCRYPTED
+        } else {
+            L2_PAYLOAD_SIZE_PLAIN
+        };
+        slot_sizes.push_front(payload_size);
 
         let layer1 = L1::create(path, slot_sizes)?;
         let my_slot = layer1.header_slot_for_upper(0);
@@ -157,6 +206,7 @@ impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlockLayer
             block_size_shift,
             block_index_width,
             sentinel, // free_list_head (empty list)
+            encryption_config.as_ref(),
         );
         layer1.write_header_slot(my_slot, &l2_payload)?;
 
@@ -171,21 +221,25 @@ impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlockLayer
             my_slot,
             block_cache: ThreadLocal::new(),
             cache_capacity: Self::compute_cache_capacity(block_size_shift),
+            cipher,
+            encryption_config,
         })
     }
 
-    fn open(path: &str, mode: OpenMode) -> Result<Self, SfsError> {
+    fn open(path: &str, mode: OpenMode, password: Option<&[u8]>) -> Result<Self, SfsError> {
         let layer1 = L1::open(path, mode)?;
         let my_slot = layer1.header_slot_for_upper(0);
 
         // Read L2 payload via slot (no length prefix)
         let header_buffer = layer1.read_header_slot(my_slot)?;
 
-        if header_buffer.len() < L2_PAYLOAD_SIZE as usize {
+        // Minimum size: the base fields before the encrypted_flag
+        let min_size = P_ENCRYPTED_FLAG_OFFSET;
+        if header_buffer.len() < min_size {
             return Err(SfsError::IoError(format!(
                 "L2 payload too short: {} < {}",
                 header_buffer.len(),
-                L2_PAYLOAD_SIZE
+                min_size
             )));
         }
 
@@ -196,13 +250,39 @@ impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlockLayer
             )));
         }
 
+        let version = header_buffer[P_VERSION_OFFSET];
         let block_size_shift = header_buffer[P_BSS_OFFSET];
         let block_index_width = header_buffer[P_BIW_OFFSET];
         let free_list_head = u64::from_le_bytes(
-            header_buffer[P_FREE_LIST_OFFSET..L2_PAYLOAD_SIZE as usize]
+            header_buffer[P_FREE_LIST_OFFSET..P_ENCRYPTED_FLAG_OFFSET]
                 .try_into()
                 .unwrap(),
         );
+
+        // Handle encryption based on version and encrypted_flag
+        let (cipher, encryption_config) = if version >= 1
+            && header_buffer.len() > P_ENCRYPTED_FLAG_OFFSET
+            && header_buffer[P_ENCRYPTED_FLAG_OFFSET] == 1
+        {
+            // File is encrypted — deserialize config and verify password
+            let config =
+                encryption::deserialize_config(&header_buffer[P_ENCRYPTION_CONFIG_OFFSET..])?;
+            let pw = password.ok_or_else(|| {
+                SfsError::EncryptionRequired(
+                    "file is encrypted but no password was provided".to_string(),
+                )
+            })?;
+            let cipher = encryption::open_encryption(&config, pw)?;
+            (Some(cipher), Some(config))
+        } else {
+            // File is not encrypted
+            if password.is_some() {
+                return Err(SfsError::IoError(
+                    "password provided but file is not encrypted".to_string(),
+                ));
+            }
+            (None, None)
+        };
 
         // Derive total_blocks from file size rather than storing it in the header
         let block_size = 1u64 << block_size_shift;
@@ -219,7 +299,13 @@ impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlockLayer
             my_slot,
             block_cache: ThreadLocal::new(),
             cache_capacity: Self::compute_cache_capacity(block_size_shift),
+            cipher,
+            encryption_config,
         })
+    }
+
+    fn is_encrypted(&self) -> bool {
+        self.cipher.is_some()
     }
 
     fn block_size(&self) -> usize {
@@ -254,8 +340,17 @@ impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlockLayer
         while (result.len() as u64) < count && state.free_list_head != sentinel {
             let block_id = state.free_list_head;
             let mut next_buf = [0u8; 8];
-            self.layer1
-                .read(self.block_offset(block_id), &mut next_buf[..biw])?;
+            if let Some(cipher) = &self.cipher {
+                // Encrypted: read full block, decrypt, extract free-list pointer
+                let mut full_block = vec![0u8; block_size];
+                self.layer1
+                    .read(self.block_offset(block_id), &mut full_block)?;
+                encryption::decrypt_block(cipher, block_id, &mut full_block);
+                next_buf[..biw].copy_from_slice(&full_block[..biw]);
+            } else {
+                self.layer1
+                    .read(self.block_offset(block_id), &mut next_buf[..biw])?;
+            }
             state.free_list_head = u64::from_le_bytes(next_buf);
             result.push(block_id);
         }
@@ -299,9 +394,18 @@ impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlockLayer
         // Phase 3: zero free-list blocks only (file-growth blocks are already
         // zero from set_len — guaranteed on Linux, macOS, and Windows)
         if free_list_count > 0 {
-            let zeros = vec![0u8; block_size];
-            for &block_id in &result[..free_list_count] {
-                self.layer1.write(self.block_offset(block_id), &zeros)?;
+            if let Some(cipher) = &self.cipher {
+                // Encrypted: encrypt zeros per-block (each gets its own tweak)
+                for &block_id in &result[..free_list_count] {
+                    let mut zeros = vec![0u8; block_size];
+                    encryption::encrypt_block(cipher, block_id, &mut zeros);
+                    self.layer1.write(self.block_offset(block_id), &zeros)?;
+                }
+            } else {
+                let zeros = vec![0u8; block_size];
+                for &block_id in &result[..free_list_count] {
+                    self.layer1.write(self.block_offset(block_id), &zeros)?;
+                }
             }
         }
 
@@ -330,8 +434,18 @@ impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlockLayer
         // Write the current free_list_head into the first block_index_width bytes of this block
         let biw = self.block_index_width as usize;
         let head_bytes = state.free_list_head.to_le_bytes();
-        self.layer1
-            .write(self.block_offset(index), &head_bytes[..biw])?;
+        if let Some(cipher) = &self.cipher {
+            // Encrypted: zero-fill block, write pointer, encrypt, then write full block.
+            // This also securely zeroes old data in deallocated blocks.
+            let block_size = self.block_size();
+            let mut block = vec![0u8; block_size];
+            block[..biw].copy_from_slice(&head_bytes[..biw]);
+            encryption::encrypt_block(cipher, index, &mut block);
+            self.layer1.write(self.block_offset(index), &block)?;
+        } else {
+            self.layer1
+                .write(self.block_offset(index), &head_bytes[..biw])?;
+        }
 
         // Update free_list_head to point to this block
         state.free_list_head = index;
@@ -365,17 +479,37 @@ impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlockLayer
         let biw = self.block_index_width as usize;
 
         // Chain: indices[0] → indices[1] → … → indices[n-1] → old free_list_head
-        for i in 0..indices.len() - 1 {
-            let next = indices[i + 1].to_le_bytes();
-            self.layer1
-                .write(self.block_offset(indices[i]), &next[..biw])?;
+        if let Some(cipher) = &self.cipher {
+            // Encrypted: zero-fill + pointer per block, encrypt, write full blocks.
+            // Securely zeroes old data in deallocated blocks.
+            let block_size = self.block_size();
+            for i in 0..indices.len() - 1 {
+                let mut block = vec![0u8; block_size];
+                let next = indices[i + 1].to_le_bytes();
+                block[..biw].copy_from_slice(&next[..biw]);
+                encryption::encrypt_block(cipher, indices[i], &mut block);
+                self.layer1.write(self.block_offset(indices[i]), &block)?;
+            }
+            // Last freed block points to the previous head
+            let mut block = vec![0u8; block_size];
+            let head_bytes = state.free_list_head.to_le_bytes();
+            block[..biw].copy_from_slice(&head_bytes[..biw]);
+            let last_idx = *indices.last().unwrap();
+            encryption::encrypt_block(cipher, last_idx, &mut block);
+            self.layer1.write(self.block_offset(last_idx), &block)?;
+        } else {
+            for i in 0..indices.len() - 1 {
+                let next = indices[i + 1].to_le_bytes();
+                self.layer1
+                    .write(self.block_offset(indices[i]), &next[..biw])?;
+            }
+            // Last freed block points to the previous head
+            let head_bytes = state.free_list_head.to_le_bytes();
+            self.layer1.write(
+                self.block_offset(*indices.last().unwrap()),
+                &head_bytes[..biw],
+            )?;
         }
-        // Last freed block points to the previous head
-        let head_bytes = state.free_list_head.to_le_bytes();
-        self.layer1.write(
-            self.block_offset(*indices.last().unwrap()),
-            &head_bytes[..biw],
-        )?;
 
         // New head is the lowest-numbered freed block
         state.free_list_head = indices[0];
@@ -423,7 +557,7 @@ impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlockLayer
         if cache && CACHE_BUDGET_BYTES > 0 {
             let mut lru = self.thread_cache().borrow_mut();
 
-            // Cache hit: serve from cached full block
+            // Cache hit: serve from cached full block (already decrypted)
             if let Some(cached_block) = lru.get(&index) {
                 buf.copy_from_slice(&cached_block[offset..offset + buf.len()]);
                 return Ok(buf.len());
@@ -434,6 +568,11 @@ impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlockLayer
         let mut full_block = vec![0u8; block_size];
         let file_offset = self.block_offset(index);
         let n = self.layer1.read(file_offset, &mut full_block)?;
+
+        // Decrypt if encrypted
+        if let Some(cipher) = &self.cipher {
+            encryption::decrypt_block(cipher, index, &mut full_block);
+        }
 
         // Copy requested sub-region to caller's buffer
         buf.copy_from_slice(&full_block[offset..offset + buf.len()]);
@@ -463,17 +602,53 @@ impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlockLayer
             )));
         }
 
-        // Write through to L1 first
-        let file_offset = self.block_offset(index) + offset as u64;
-        self.layer1.write(file_offset, buf)?;
+        if let Some(cipher) = &self.cipher {
+            // Encrypted path: XTS operates on full blocks, so partial writes
+            // require read-modify-write.
+            let mut full_block = vec![0u8; block_size];
 
-        // Update cache if caller requested caching and block is already cached
-        if cache && CACHE_BUDGET_BYTES > 0 {
-            let mut lru = self.thread_cache().borrow_mut();
-            if let Some(cached_block) = lru.get_mut(&index) {
-                cached_block[offset..offset + buf.len()].copy_from_slice(buf);
+            // Try cache first for the plaintext block
+            let mut from_cache = false;
+            if CACHE_BUDGET_BYTES > 0 {
+                let lru = self.thread_cache().borrow();
+                if let Some(cached) = lru.peek(&index) {
+                    full_block.copy_from_slice(cached);
+                    from_cache = true;
+                }
             }
-            // If not in cache, don't insert — we only have partial data
+
+            if !from_cache {
+                // Read from L1 and decrypt
+                let file_offset = self.block_offset(index);
+                self.layer1.read(file_offset, &mut full_block)?;
+                encryption::decrypt_block(cipher, index, &mut full_block);
+            }
+
+            // Apply the partial write to plaintext
+            full_block[offset..offset + buf.len()].copy_from_slice(buf);
+
+            // Encrypt a copy and write to L1
+            let mut encrypted = full_block.clone();
+            encryption::encrypt_block(cipher, index, &mut encrypted);
+            let file_offset = self.block_offset(index);
+            self.layer1.write(file_offset, &encrypted)?;
+
+            // Update cache with plaintext
+            if cache && CACHE_BUDGET_BYTES > 0 {
+                self.thread_cache().borrow_mut().put(index, full_block);
+            }
+        } else {
+            // Unencrypted path: write partial data directly to L1
+            let file_offset = self.block_offset(index) + offset as u64;
+            self.layer1.write(file_offset, buf)?;
+
+            // Update cache if caller requested caching and block is already cached
+            if cache && CACHE_BUDGET_BYTES > 0 {
+                let mut lru = self.thread_cache().borrow_mut();
+                if let Some(cached_block) = lru.get_mut(&index) {
+                    cached_block[offset..offset + buf.len()].copy_from_slice(buf);
+                }
+            }
         }
 
         Ok(buf.len())
@@ -485,8 +660,27 @@ impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlockLayer
         offset: usize,
         buf: &mut [u8],
     ) -> Result<usize, SfsError> {
-        let file_offset = self.block_offset(start_index) + offset as u64;
-        self.layer1.read(file_offset, buf)
+        if self.cipher.is_none() {
+            // Unencrypted: single L1 read
+            let file_offset = self.block_offset(start_index) + offset as u64;
+            return self.layer1.read(file_offset, buf);
+        }
+
+        // Encrypted: read full blocks from L1, decrypt each, copy requested region
+        let bs = self.block_size();
+        let last_byte = offset + buf.len();
+        let blocks_needed = last_byte.div_ceil(bs);
+
+        let mut raw = vec![0u8; blocks_needed * bs];
+        let file_offset = self.block_offset(start_index);
+        self.layer1.read(file_offset, &mut raw)?;
+
+        // Decrypt each block in place
+        let cipher = self.cipher.as_ref().unwrap();
+        encryption::decrypt_blocks(cipher, &mut raw, bs, start_index);
+
+        buf.copy_from_slice(&raw[offset..offset + buf.len()]);
+        Ok(buf.len())
     }
 
     fn write_contiguous_blocks(
@@ -495,8 +689,37 @@ impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlockLayer
         offset: usize,
         buf: &[u8],
     ) -> Result<usize, SfsError> {
-        let file_offset = self.block_offset(start_index) + offset as u64;
-        self.layer1.write(file_offset, buf)?;
+        if self.cipher.is_none() {
+            // Unencrypted: single L1 write
+            let file_offset = self.block_offset(start_index) + offset as u64;
+            self.layer1.write(file_offset, buf)?;
+            return Ok(buf.len());
+        }
+
+        let bs = self.block_size();
+        let cipher = self.cipher.as_ref().unwrap();
+        let last_byte = offset + buf.len();
+        let blocks_needed = last_byte.div_ceil(bs);
+
+        let mut raw = vec![0u8; blocks_needed * bs];
+
+        // If partial first block or partial last block, read-modify-write
+        let is_aligned = offset == 0 && buf.len().is_multiple_of(bs);
+        if !is_aligned {
+            let file_offset = self.block_offset(start_index);
+            self.layer1.read(file_offset, &mut raw)?;
+            encryption::decrypt_blocks(cipher, &mut raw, bs, start_index);
+        }
+
+        // Apply the write
+        raw[offset..offset + buf.len()].copy_from_slice(buf);
+
+        // Encrypt each block
+        encryption::encrypt_blocks(cipher, &mut raw, bs, start_index);
+
+        // Single L1 write
+        let file_offset = self.block_offset(start_index);
+        self.layer1.write(file_offset, &raw)?;
         Ok(buf.len())
     }
 
@@ -573,8 +796,17 @@ impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlockLayer
             // Read next pointer from block
             let biw = self.block_index_width as usize;
             let mut next_buf = [0u8; 8];
-            self.layer1
-                .read(self.block_offset(current), &mut next_buf[..biw])?;
+            if let Some(cipher) = &self.cipher {
+                // Encrypted: read full block, decrypt, extract free-list pointer
+                let mut full_block = vec![0u8; block_size as usize];
+                self.layer1
+                    .read(self.block_offset(current), &mut full_block)?;
+                encryption::decrypt_block(cipher, current, &mut full_block);
+                next_buf[..biw].copy_from_slice(&full_block[..biw]);
+            } else {
+                self.layer1
+                    .read(self.block_offset(current), &mut next_buf[..biw])?;
+            }
             current = u64::from_le_bytes(next_buf);
         }
 

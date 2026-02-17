@@ -14,4 +14,11 @@ categories = ["filesystem", "data-structures"]
 fs2 = "0.4.3"
 thread_local = "1.1"
 lru = "0.12"
-lz4_flex = "0.11"
+lz4_flex = { version = "0.11", default-features = false }
+# Encryption support (L2 optional AES-XTS block encryption)
+aes = "0.8"
+xts-mode = "0.5"
+argon2 = "0.5"
+aes-kw = "0.2"
+sha2 = "0.10"
+rand = "0.8"

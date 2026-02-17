@@ -23,21 +23,51 @@ typedef struct SfsVerifyResult SfsVerifyResult;
 
 const char *sfs_last_error_message(void);
 
-char *sfs_hello(void);
-
-// # Safety
-// `s` must have been returned by `sfs_hello` and not yet freed.
-void sfs_free_string(char *s);
-
 // # Safety
 // `path` must be a valid, null-terminated UTF-8 string.
 struct SfsFile *sfs_create(const char *path, uint8_t block_index_width, uint8_t block_size_shift);
+
+// Create a new SFS file with a custom compressed block size shift for compression.
+// `compressed_block_size_shift` must be >= `block_size_shift`.
+//
+// # Safety
+// `path` must be a valid, null-terminated UTF-8 string.
+struct SfsFile *sfs_create_with_cbss(const char *path,
+                                     uint8_t block_index_width,
+                                     uint8_t block_size_shift,
+                                     uint8_t compressed_block_size_shift);
 
 // Open an existing SFS file. mode: 0=READ, 1=WRITE.
 //
 // # Safety
 // `path` must be a valid, null-terminated UTF-8 string.
 struct SfsFile *sfs_open(const char *path, int mode);
+
+// Create a new encrypted SFS file. `password` is a null-terminated UTF-8 string.
+// Returns NULL on error.
+//
+// # Safety
+// `path` and `password` must be valid, null-terminated UTF-8 strings.
+struct SfsFile *sfs_create_encrypted(const char *path,
+                                     uint8_t block_index_width,
+                                     uint8_t block_size_shift,
+                                     const char *password);
+
+// Open an existing encrypted SFS file. mode: 0=READ, 1=WRITE.
+// `password` is a null-terminated UTF-8 string.
+// Returns NULL on error (`sfs_last_error_message` will indicate wrong password
+// or missing password).
+//
+// # Safety
+// `path` and `password` must be valid, null-terminated UTF-8 strings.
+struct SfsFile *sfs_open_encrypted(const char *path, int mode, const char *password);
+
+// Check whether the SFS file has encryption enabled.
+// Returns 1 if encrypted, 0 if not.
+//
+// # Safety
+// `handle` must be a live `SfsFile` pointer.
+int sfs_is_encrypted(struct SfsFile *handle);
 
 // Close the SFS file, flushing any open stream handles.
 // Returns 0 on success, -1 on error. The handle is always consumed
@@ -47,6 +77,12 @@ struct SfsFile *sfs_open(const char *path, int mode);
 // `handle` must be a valid pointer returned by `sfs_create` or `sfs_open`,
 // and must not have been closed already.
 int sfs_close(struct SfsFile *handle);
+
+// Get the compressed block size shift. Returns 0 if compression is not configured.
+//
+// # Safety
+// `handle` must be a live `SfsFile` pointer.
+uint8_t sfs_compressed_block_size_shift(struct SfsFile *handle);
 
 // # Safety
 // `handle` must be a live `SfsFile` pointer. `path` must be a valid C string.
@@ -100,7 +136,7 @@ const char *sfs_verify_issue(struct SfsVerifyResult *result, int index);
 void sfs_verify_free(struct SfsVerifyResult *result);
 
 // Create a new stream and open it for writing. Returns handle ID or -1.
-// `compressed`: non-zero to create a compressed stream (requires vbss > 0).
+// `compressed`: non-zero to create a compressed stream (requires cbss > 0).
 //
 // # Safety
 // `handle` must be a live `SfsFile` pointer. `path` must be a valid C string.
@@ -179,5 +215,11 @@ int sfs_stream_reserve(struct SfsFile *handle, int64_t stream, uint64_t n_bytes)
 // # Safety
 // `handle` must be a live `SfsFile` pointer. `stream` must be an open stream handle ID.
 int64_t sfs_stream_reserved(struct SfsFile *handle, int64_t stream);
+
+// Check whether a stream is compressed. Returns 1 if compressed, 0 if not, -1 on error.
+//
+// # Safety
+// `handle` must be a live `SfsFile` pointer. `stream` must be an open stream handle ID.
+int sfs_stream_is_compressed(struct SfsFile *handle, int64_t stream);
 
 #endif  /* STREAM_FS_C_H */

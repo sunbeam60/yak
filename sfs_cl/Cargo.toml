@@ -13,3 +13,4 @@ path = "src/main.rs"
 
 [dependencies]
 stream_fs.workspace = true
+rpassword = "5"

@@ -66,29 +66,6 @@ fn cstr_to_str<'a>(ptr: *const c_char) -> Option<&'a str> {
 }
 
 // ---------------------------------------------------------------------------
-// Legacy hello
-// ---------------------------------------------------------------------------
-
-#[no_mangle]
-pub extern "C" fn sfs_hello() -> *mut c_char {
-    let greeting = stream_fs::hello();
-    CString::new(greeting)
-        .expect("greeting contained a null byte")
-        .into_raw()
-}
-
-/// # Safety
-/// `s` must have been returned by `sfs_hello` and not yet freed.
-#[no_mangle]
-pub unsafe extern "C" fn sfs_free_string(s: *mut c_char) {
-    if !s.is_null() {
-        unsafe {
-            drop(CString::from_raw(s));
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // SFS file lifecycle
 // ---------------------------------------------------------------------------
 
@@ -105,6 +82,36 @@ pub unsafe extern "C" fn sfs_create(
         None => return std::ptr::null_mut(),
     };
     match Sfs::create(path, block_index_width, block_size_shift) {
+        Ok(sfs) => Box::into_raw(Box::new(SfsFile(sfs))),
+        Err(e) => {
+            set_last_error(&e.to_string());
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Create a new SFS file with a custom compressed block size shift for compression.
+/// `compressed_block_size_shift` must be >= `block_size_shift`.
+///
+/// # Safety
+/// `path` must be a valid, null-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn sfs_create_with_cbss(
+    path: *const c_char,
+    block_index_width: u8,
+    block_size_shift: u8,
+    compressed_block_size_shift: u8,
+) -> *mut SfsFile {
+    let path = match cstr_to_str(path) {
+        Some(s) => s,
+        None => return std::ptr::null_mut(),
+    };
+    match Sfs::create_with_cbss(
+        path,
+        block_index_width,
+        block_size_shift,
+        compressed_block_size_shift,
+    ) {
         Ok(sfs) => Box::into_raw(Box::new(SfsFile(sfs))),
         Err(e) => {
             set_last_error(&e.to_string());
@@ -140,6 +147,93 @@ pub unsafe extern "C" fn sfs_open(path: *const c_char, mode: c_int) -> *mut SfsF
     }
 }
 
+/// Create a new encrypted SFS file. `password` is a null-terminated UTF-8 string.
+/// Returns NULL on error.
+///
+/// # Safety
+/// `path` and `password` must be valid, null-terminated UTF-8 strings.
+#[no_mangle]
+pub unsafe extern "C" fn sfs_create_encrypted(
+    path: *const c_char,
+    block_index_width: u8,
+    block_size_shift: u8,
+    password: *const c_char,
+) -> *mut SfsFile {
+    let path = match cstr_to_str(path) {
+        Some(s) => s,
+        None => return std::ptr::null_mut(),
+    };
+    let password = match cstr_to_str(password) {
+        Some(s) => s,
+        None => return std::ptr::null_mut(),
+    };
+    match Sfs::create_encrypted(
+        path,
+        block_index_width,
+        block_size_shift,
+        password.as_bytes(),
+    ) {
+        Ok(sfs) => Box::into_raw(Box::new(SfsFile(sfs))),
+        Err(e) => {
+            set_last_error(&e.to_string());
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Open an existing encrypted SFS file. mode: 0=READ, 1=WRITE.
+/// `password` is a null-terminated UTF-8 string.
+/// Returns NULL on error (`sfs_last_error_message` will indicate wrong password
+/// or missing password).
+///
+/// # Safety
+/// `path` and `password` must be valid, null-terminated UTF-8 strings.
+#[no_mangle]
+pub unsafe extern "C" fn sfs_open_encrypted(
+    path: *const c_char,
+    mode: c_int,
+    password: *const c_char,
+) -> *mut SfsFile {
+    let path = match cstr_to_str(path) {
+        Some(s) => s,
+        None => return std::ptr::null_mut(),
+    };
+    let password = match cstr_to_str(password) {
+        Some(s) => s,
+        None => return std::ptr::null_mut(),
+    };
+    let mode = match mode {
+        0 => OpenMode::Read,
+        1 => OpenMode::Write,
+        _ => {
+            set_last_error("invalid open mode");
+            return std::ptr::null_mut();
+        }
+    };
+    match Sfs::open_encrypted(path, mode, password.as_bytes()) {
+        Ok(sfs) => Box::into_raw(Box::new(SfsFile(sfs))),
+        Err(e) => {
+            set_last_error(&e.to_string());
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Check whether the SFS file has encryption enabled.
+/// Returns 1 if encrypted, 0 if not.
+///
+/// # Safety
+/// `handle` must be a live `SfsFile` pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sfs_is_encrypted(handle: *mut SfsFile) -> c_int {
+    let sfs = unsafe { &(*handle).0 };
+    if sfs.is_encrypted() {
+        1
+    } else {
+        0
+    }
+}
+
 /// Close the SFS file, flushing any open stream handles.
 /// Returns 0 on success, -1 on error. The handle is always consumed
 /// regardless of the return value — callers must not reuse it.
@@ -160,6 +254,20 @@ pub unsafe extern "C" fn sfs_close(handle: *mut SfsFile) -> c_int {
             -1
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// SFS file properties
+// ---------------------------------------------------------------------------
+
+/// Get the compressed block size shift. Returns 0 if compression is not configured.
+///
+/// # Safety
+/// `handle` must be a live `SfsFile` pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sfs_compressed_block_size_shift(handle: *mut SfsFile) -> u8 {
+    let sfs = unsafe { &(*handle).0 };
+    sfs.compressed_block_size_shift()
 }
 
 // ---------------------------------------------------------------------------
@@ -373,7 +481,7 @@ pub unsafe extern "C" fn sfs_verify_free(result: *mut SfsVerifyResult) {
 // ---------------------------------------------------------------------------
 
 /// Create a new stream and open it for writing. Returns handle ID or -1.
-/// `compressed`: non-zero to create a compressed stream (requires vbss > 0).
+/// `compressed`: non-zero to create a compressed stream (requires cbss > 0).
 ///
 /// # Safety
 /// `handle` must be a live `SfsFile` pointer. `path` must be a valid C string.
@@ -648,6 +756,24 @@ pub unsafe extern "C" fn sfs_stream_reserved(handle: *mut SfsFile, stream: i64) 
     let sh = StreamHandle::from_id(stream as u64);
     match sfs.stream_reserved(&sh) {
         Ok(r) => r as i64,
+        Err(e) => {
+            set_last_error(&e.to_string());
+            -1
+        }
+    }
+}
+
+/// Check whether a stream is compressed. Returns 1 if compressed, 0 if not, -1 on error.
+///
+/// # Safety
+/// `handle` must be a live `SfsFile` pointer. `stream` must be an open stream handle ID.
+#[no_mangle]
+pub unsafe extern "C" fn sfs_stream_is_compressed(handle: *mut SfsFile, stream: i64) -> c_int {
+    let sfs = unsafe { &(*handle).0 };
+    let sh = StreamHandle::from_id(stream as u64);
+    match sfs.is_stream_compressed(&sh) {
+        Ok(true) => 1,
+        Ok(false) => 0,
         Err(e) => {
             set_last_error(&e.to_string());
             -1

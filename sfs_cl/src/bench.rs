@@ -48,6 +48,7 @@ struct BenchArgs {
     biw: u8,
     cbss: u8,
     threads: usize,
+    cases: String,
 }
 
 fn parse_bench_args(args: &[String]) -> Result<BenchArgs, CliError> {
@@ -61,6 +62,7 @@ fn parse_bench_args(args: &[String]) -> Result<BenchArgs, CliError> {
     let mut biw = DEFAULT_BLOCK_INDEX_WIDTH;
     let mut cbss = DEFAULT_CBSS;
     let mut threads = DEFAULT_THREADS;
+    let mut cases = String::from("necb");
 
     let mut i = 1;
     while i < args.len() {
@@ -93,6 +95,24 @@ fn parse_bench_args(args: &[String]) -> Result<BenchArgs, CliError> {
                     .and_then(|s| s.parse().ok())
                     .ok_or_else(|| CliError::new("--threads requires a numeric argument"))?;
             }
+            "--case" => {
+                i += 1;
+                cases = args
+                    .get(i)
+                    .cloned()
+                    .ok_or_else(|| CliError::new("--case requires an argument (e.g. necb)"))?;
+                for ch in cases.chars() {
+                    if !"necb".contains(ch) {
+                        return Err(CliError::new(format!(
+                            "--case: unknown case '{}' (valid: n=normal, e=encrypted, c=compressed, b=both)",
+                            ch
+                        )));
+                    }
+                }
+                if cases.is_empty() {
+                    return Err(CliError::new("--case requires at least one case"));
+                }
+            }
             other => {
                 print_bench_usage();
                 return Err(CliError::new(format!("Unknown option: {}", other)));
@@ -107,17 +127,16 @@ fn parse_bench_args(args: &[String]) -> Result<BenchArgs, CliError> {
         biw,
         cbss,
         threads,
+        cases,
     })
 }
 
 fn print_bench_usage() {
     eprintln!(
-        "Usage: sfs bench <scenario> [--block-shift N] [--index-width N] [--cbss N] [--threads N]"
+        "Usage: sfs bench <scenario> [--block-shift N] [--index-width N] [--cbss N] [--threads N] [--case CASES]"
     );
     eprintln!();
-    eprintln!(
-        "Each scenario runs four times: normal, compressed, encrypted, and compressed+encrypted."
-    );
+    eprintln!("Each scenario runs once per selected case (default: all four).");
     eprintln!();
     eprintln!("Scenarios:");
     eprintln!("  large-write      Write 5 streams of 30MB each");
@@ -142,6 +161,10 @@ fn print_bench_usage() {
     eprintln!("  --cbss N         Virtual block size shift for compression (default: 15 = 32KB)");
     eprintln!("                   Examples: 13 = 8KB, 15 = 32KB, 17 = 128KB");
     eprintln!("  --threads N      Thread count for threaded scenarios (default: 4)");
+    eprintln!("  --case CASES     Which cases to run (default: necb = all four)");
+    eprintln!("                   n = normal, e = encrypted, c = compressed, b = both");
+    eprintln!("                   Examples: --case nc (normal + compressed)");
+    eprintln!("                             --case c  (compressed only)");
 }
 
 // ---------------------------------------------------------------------------
@@ -151,31 +174,40 @@ fn print_bench_usage() {
 pub fn cmd_bench(args: &[String]) -> CliResult {
     let a = parse_bench_args(args)?;
 
+    let c = &a.cases;
     match a.scenario.as_str() {
-        "large-write" => run_quad(a.cbss, |v, pw| run_large_write(a.bss, a.biw, v, pw)).map(|_| ()),
-        "small-write" => run_quad(a.cbss, |v, pw| run_small_write(a.bss, a.biw, v, pw)).map(|_| ()),
-        "large-read" => run_quad(a.cbss, |v, pw| run_large_read(a.bss, a.biw, v, pw)).map(|_| ()),
-        "small-read" => run_quad(a.cbss, |v, pw| run_small_read(a.bss, a.biw, v, pw)).map(|_| ()),
-        "threaded-write" => run_quad(a.cbss, |v, pw| {
+        "large-write" => {
+            run_quad(a.cbss, c, |v, pw| run_large_write(a.bss, a.biw, v, pw)).map(|_| ())
+        }
+        "small-write" => {
+            run_quad(a.cbss, c, |v, pw| run_small_write(a.bss, a.biw, v, pw)).map(|_| ())
+        }
+        "large-read" => {
+            run_quad(a.cbss, c, |v, pw| run_large_read(a.bss, a.biw, v, pw)).map(|_| ())
+        }
+        "small-read" => {
+            run_quad(a.cbss, c, |v, pw| run_small_read(a.bss, a.biw, v, pw)).map(|_| ())
+        }
+        "threaded-write" => run_quad(a.cbss, c, |v, pw| {
             run_threaded_write(a.bss, a.biw, v, pw, a.threads)
         })
         .map(|_| ()),
-        "threaded-read" => run_quad(a.cbss, |v, pw| {
+        "threaded-read" => run_quad(a.cbss, c, |v, pw| {
             run_threaded_read(a.bss, a.biw, v, pw, a.threads)
         })
         .map(|_| ()),
-        "threaded-mixed" => run_quad(a.cbss, |v, pw| {
+        "threaded-mixed" => run_quad(a.cbss, c, |v, pw| {
             run_threaded_mixed(a.bss, a.biw, v, pw, a.threads)
         })
         .map(|_| ()),
-        "churn" => run_quad(a.cbss, |v, pw| run_churn(a.bss, a.biw, v, pw)).map(|_| ()),
-        "reuse" => run_quad(a.cbss, |v, pw| run_reuse(a.bss, a.biw, v, pw)).map(|_| ()),
+        "churn" => run_quad(a.cbss, c, |v, pw| run_churn(a.bss, a.biw, v, pw)).map(|_| ()),
+        "reuse" => run_quad(a.cbss, c, |v, pw| run_reuse(a.bss, a.biw, v, pw)).map(|_| ()),
         "single-stream" => {
-            run_quad(a.cbss, |v, pw| run_single_stream(a.bss, a.biw, v, pw)).map(|_| ())
+            run_quad(a.cbss, c, |v, pw| run_single_stream(a.bss, a.biw, v, pw)).map(|_| ())
         }
-        "warm-read" => run_quad(a.cbss, |v, pw| run_warm_read(a.bss, a.biw, v, pw)).map(|_| ()),
-        "overwrite" => run_quad(a.cbss, |v, pw| run_overwrite(a.bss, a.biw, v, pw)).map(|_| ()),
-        "all" => run_all(a.bss, a.biw, a.cbss, a.threads),
+        "warm-read" => run_quad(a.cbss, c, |v, pw| run_warm_read(a.bss, a.biw, v, pw)).map(|_| ()),
+        "overwrite" => run_quad(a.cbss, c, |v, pw| run_overwrite(a.bss, a.biw, v, pw)).map(|_| ()),
+        "all" => run_all(a.bss, a.biw, a.cbss, a.threads, c),
         other => {
             print_bench_usage();
             Err(CliError::new(format!("Unknown bench scenario: {}", other)))
@@ -226,33 +258,48 @@ fn create_bench_stream(sfs: &Sfs, name: &str, cbss: u8) -> Result<StreamHandle, 
 /// Returns (normal_ms, compressed_ms, encrypted_ms, comp_enc_ms).
 fn run_quad(
     cbss: u8,
+    cases: &str,
     f: impl Fn(u8, Option<&[u8]>) -> Result<f64, CliError>,
 ) -> Result<(f64, f64, f64, f64), CliError> {
     // Remove any leftover file from a previous cancelled run
     let _ = std::fs::remove_file(BENCH_FILE);
 
-    eprintln!("  [normal]");
-    let normal = f(0, None)?;
+    let mut normal = 0.0;
+    let mut comp = 0.0;
+    let mut enc = 0.0;
+    let mut comp_enc = 0.0;
 
-    let _ = std::fs::remove_file(BENCH_FILE);
-    eprintln!(
-        "  [compressed]  (cbss={}, compressed block = {}KB)",
-        cbss,
-        1u64 << cbss.saturating_sub(10)
-    );
-    let comp = f(cbss, None)?;
+    if cases.contains('n') {
+        eprintln!("  [normal]");
+        normal = f(0, None)?;
+        let _ = std::fs::remove_file(BENCH_FILE);
+    }
 
-    let _ = std::fs::remove_file(BENCH_FILE);
-    eprintln!("  [encrypted]");
-    let enc = f(0, Some(BENCH_PASSWORD))?;
+    if cases.contains('c') {
+        eprintln!(
+            "  [compressed]  (cbss={}, compressed block = {}KB)",
+            cbss,
+            1u64 << cbss.saturating_sub(10)
+        );
+        comp = f(cbss, None)?;
+        let _ = std::fs::remove_file(BENCH_FILE);
+    }
 
-    let _ = std::fs::remove_file(BENCH_FILE);
-    eprintln!(
-        "  [compressed+encrypted]  (cbss={}, compressed block = {}KB)",
-        cbss,
-        1u64 << cbss.saturating_sub(10)
-    );
-    let comp_enc = f(cbss, Some(BENCH_PASSWORD))?;
+    if cases.contains('e') {
+        eprintln!("  [encrypted]");
+        enc = f(0, Some(BENCH_PASSWORD))?;
+        let _ = std::fs::remove_file(BENCH_FILE);
+    }
+
+    if cases.contains('b') {
+        eprintln!(
+            "  [compressed+encrypted]  (cbss={}, compressed block = {}KB)",
+            cbss,
+            1u64 << cbss.saturating_sub(10)
+        );
+        comp_enc = f(cbss, Some(BENCH_PASSWORD))?;
+        let _ = std::fs::remove_file(BENCH_FILE);
+    }
 
     Ok((normal, comp, enc, comp_enc))
 }
@@ -869,9 +916,9 @@ fn run_overwrite(bss: u8, biw: u8, cbss: u8, password: Option<&[u8]>) -> Result<
 
 /// Helper to run a named scenario via run_quad and accumulate timings.
 macro_rules! bench_scenario {
-    ($name:expr, $normal:ident, $comp:ident, $enc:ident, $comp_enc:ident, $cbss:expr, $body:expr) => {{
+    ($name:expr, $normal:ident, $comp:ident, $enc:ident, $comp_enc:ident, $cbss:expr, $cases:expr, $body:expr) => {{
         eprintln!("[{}]", $name);
-        let (n, c, e, ce) = run_quad($cbss, $body)?;
+        let (n, c, e, ce) = run_quad($cbss, $cases, $body)?;
         $normal += n;
         $comp += c;
         $enc += e;
@@ -880,7 +927,7 @@ macro_rules! bench_scenario {
 }
 
 /// Run all scenarios in sequence and print aggregate totals.
-fn run_all(bss: u8, biw: u8, cbss: u8, threads: usize) -> CliResult {
+fn run_all(bss: u8, biw: u8, cbss: u8, threads: usize, cases: &str) -> CliResult {
     let mut total_normal = 0.0f64;
     let mut total_comp = 0.0f64;
     let mut total_enc = 0.0f64;
@@ -893,6 +940,7 @@ fn run_all(bss: u8, biw: u8, cbss: u8, threads: usize) -> CliResult {
         total_enc,
         total_comp_enc,
         cbss,
+        cases,
         |v, pw| { run_large_write(bss, biw, v, pw) }
     );
     bench_scenario!(
@@ -902,6 +950,7 @@ fn run_all(bss: u8, biw: u8, cbss: u8, threads: usize) -> CliResult {
         total_enc,
         total_comp_enc,
         cbss,
+        cases,
         |v, pw| { run_small_write(bss, biw, v, pw) }
     );
     bench_scenario!(
@@ -911,6 +960,7 @@ fn run_all(bss: u8, biw: u8, cbss: u8, threads: usize) -> CliResult {
         total_enc,
         total_comp_enc,
         cbss,
+        cases,
         |v, pw| { run_large_read(bss, biw, v, pw) }
     );
     bench_scenario!(
@@ -920,6 +970,7 @@ fn run_all(bss: u8, biw: u8, cbss: u8, threads: usize) -> CliResult {
         total_enc,
         total_comp_enc,
         cbss,
+        cases,
         |v, pw| { run_small_read(bss, biw, v, pw) }
     );
     bench_scenario!(
@@ -929,6 +980,7 @@ fn run_all(bss: u8, biw: u8, cbss: u8, threads: usize) -> CliResult {
         total_enc,
         total_comp_enc,
         cbss,
+        cases,
         |v, pw| { run_threaded_write(bss, biw, v, pw, threads) }
     );
     bench_scenario!(
@@ -938,6 +990,7 @@ fn run_all(bss: u8, biw: u8, cbss: u8, threads: usize) -> CliResult {
         total_enc,
         total_comp_enc,
         cbss,
+        cases,
         |v, pw| { run_threaded_read(bss, biw, v, pw, threads) }
     );
     bench_scenario!(
@@ -947,6 +1000,7 @@ fn run_all(bss: u8, biw: u8, cbss: u8, threads: usize) -> CliResult {
         total_enc,
         total_comp_enc,
         cbss,
+        cases,
         |v, pw| { run_threaded_mixed(bss, biw, v, pw, threads) }
     );
     bench_scenario!(
@@ -956,6 +1010,7 @@ fn run_all(bss: u8, biw: u8, cbss: u8, threads: usize) -> CliResult {
         total_enc,
         total_comp_enc,
         cbss,
+        cases,
         |v, pw| { run_churn(bss, biw, v, pw) }
     );
     bench_scenario!(
@@ -965,6 +1020,7 @@ fn run_all(bss: u8, biw: u8, cbss: u8, threads: usize) -> CliResult {
         total_enc,
         total_comp_enc,
         cbss,
+        cases,
         |v, pw| { run_reuse(bss, biw, v, pw) }
     );
     bench_scenario!(
@@ -974,6 +1030,7 @@ fn run_all(bss: u8, biw: u8, cbss: u8, threads: usize) -> CliResult {
         total_enc,
         total_comp_enc,
         cbss,
+        cases,
         |v, pw| { run_single_stream(bss, biw, v, pw) }
     );
     bench_scenario!(
@@ -983,6 +1040,7 @@ fn run_all(bss: u8, biw: u8, cbss: u8, threads: usize) -> CliResult {
         total_enc,
         total_comp_enc,
         cbss,
+        cases,
         |v, pw| { run_warm_read(bss, biw, v, pw) }
     );
     bench_scenario!(
@@ -992,14 +1050,26 @@ fn run_all(bss: u8, biw: u8, cbss: u8, threads: usize) -> CliResult {
         total_enc,
         total_comp_enc,
         cbss,
+        cases,
         |v, pw| { run_overwrite(bss, biw, v, pw) }
     );
 
+    // Build summary line showing only the cases that were run
+    let mut parts = Vec::new();
+    if cases.contains('n') {
+        parts.push(format!("normal: {:.0} ms", total_normal));
+    }
+    if cases.contains('c') {
+        parts.push(format!("compressed: {:.0} ms", total_comp));
+    }
+    if cases.contains('e') {
+        parts.push(format!("encrypted: {:.0} ms", total_enc));
+    }
+    if cases.contains('b') {
+        parts.push(format!("comp+enc: {:.0} ms", total_comp_enc));
+    }
     eprintln!();
-    eprintln!(
-        "=== Total normal: {:.0} ms | compressed: {:.0} ms | encrypted: {:.0} ms | comp+enc: {:.0} ms ===",
-        total_normal, total_comp, total_enc, total_comp_enc
-    );
+    eprintln!("=== Total {} ===", parts.join(" | "));
 
     Ok(())
 }

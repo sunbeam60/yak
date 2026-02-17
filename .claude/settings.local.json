@@ -40,7 +40,13 @@
       "Bash(.venv/bin/python -m pytest:*)",
       "Bash(brew list:*)",
       "Bash(maturin develop:*)",
-      "Bash(git status:*)"
+      "Bash(git status:*)",
+      "Bash(git merge:*)",
+      "Bash(cargo search:*)",
+      "Bash(cargo doc:*)",
+      "Read(//Users/BMADSEN/.cargo/registry/src/**)",
+      "Bash(rustc:*)",
+      "Bash(git rm:*)"
     ]
   }
 }

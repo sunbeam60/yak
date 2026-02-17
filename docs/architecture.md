@@ -346,7 +346,7 @@ The "pyramid" block linking layout has a number of advantages:
 * The depth of the redirector blocks can be calculated directly from the size of the stream. In addition, there's no overhead to mark a block out as a particular type; since we can reason about the depth, we know how far down the hierarchy the data blocks lie and everything before that is a redirector block.
 * Even with relatively small block sizes a *large* data stream can be tracked with low depth of tracking blocks. For example, if blocks are 4 kb and uint32 indices, an SFS stream can can grow to 4+ GB before needing a third redirector level.
 
-#### Additional feature & complexity: Reserved length
+#### Additional feature & additional complexity: Reserved length
 For clarity of explanation, the pyramid data structure explanation above does not deal with reserved capacity of a stream. A stream can be extended into being longer than needed to store the data in the stream. So while the explanation above is correct, it leaves out the fact that a stream descriptor actually has 3 fields: Top block, size and reserved, and that the resulting pyramid can therefore be larger than it needs to be to strictly hold the user-written data.
 
 L3 separates between size (how much data the caller has written to the stream) and reserved (how much data the stream has space for). This is to create the capability to reserve space in the stream, which creates a couple of significant performance opportunities in the SFS library: 
@@ -357,7 +357,7 @@ L3 separates between size (how much data the caller has written to the stream) a
 
 When a stream is truncated, all blocks - including those in any extended reserve - are returned as free blocks, in effect making the stream's size and reserved size very near to each other (reserved will include the unwritten space in the last data block, so tends to be every so slightly larger).
 
-#### Additional feature & complexity: Compression
+#### Additional feature & additional complexity: Compression
 For additional clarity of explanation, the pyramid data structure above does not deal with compression. To achieve transparent compression/decompression of data streams, an additional layer of indirection can be found at L3.
 
 In an uncompressed data stream, the leaf nodes contain the data written by the caller. Observe Fig 1. below, with an uncompressed data stream, size 17, with a redirector block (15) pointing to two data blocks (4 and 10).
@@ -383,29 +383,27 @@ In an uncompressed data stream, the leaf nodes contain the data written by the c
                                 │       │....      │◄──┘                                      
                                 │       └──────────┘                                          
                                 └─10┌──────────┐                                              
-                                    │28|50|33|8│◄──────── Compressed block              
+                                    │28|21|90|8│◄──────── Compressed block              
                                     └─┬────────┘                                              
-                                      ├50┌──────────┐                                         
+                                      ├21┌──────────┐                                         
                                       │  │..........│◄──┐                                     
                                       │  └──────────┘   │                                     
-                                      ├33┌──────────┐   │                                     
+                                      ├90┌──────────┐   │                                     
                                       │  │..........│◄──┼ Compressed data           
                                       │  └──────────┘   │ (was size 35, compressed to size 28)
                                       └─8┌──────────┐   │                                     
                                          │........  │◄──┘                                     
                                          └──────────┘                                         
 ```
-In a compressed data stream however, a "compressed block" is used instead of a regular data block. Each compressed block holds the compressed length of the data, followed by a the necessary block indices where this compressed data is stored.
+In a compressed data stream however, "compressed blocks" are used instead of regular data blocks. In each compressed block is stored the compressed length of the data, followed by a set of block indices where this compressed data is stored.
 
-While a data block holds the data that can physically be held in the block (i.e. a data block of 4 kb can hold, well, yes, 4 kb) a compressed block is conceptually seen to hold more data, with the block indices in the compressed block pointing to the compressed data that could be held in a conceptually larger compressed block.
+Compressed blocks are, in effect, simply just another level of the pyramid data tree, treated slightly differently, but it is simpler to conceptually think of them as data blocks that can magically hold more data than could be stored in a physical block. And the way they achieve this magical feat is simply to compress the larger chunk of data they are magically defined to hold, reserve some more blocks to hold it, and then stores the compressed length of the data they're holding and the block indices where that compressed data is held.
 
-It follows from this layout that:
-* There are only space savings to be made if a larger block is compressed into one or more smaller blocks. If a data stream of 4 kb was compressed into 2 kb, but it still needed to be stored in a 4 kb block, no space saving would be achieved.
-* The difference between the size of the larger conceptual compressed blocks and the smaller real blocks defines the increments of savings. For example if an 8 kb block needs to be compressed into smaller 2 kb blocks, the space saving would happen in increments of 25% (2/8); either the compressed result of an 8 kb block fits into one 2 kb block (we saved 75%), two 2 kb blocks (we saved 50%), three 2 kb blocks (we saved 25%), four 2 kb blocks (we didn't save anything) or - dread! - five or more 2 kb blocks (we lost space from compression).
+When a SFS file is created, both the size of the physical block and the size of the compressed block is defined. It follows that a compressed block must be significantly larger than a physical block, or no compression savings could be achieved. For example, if a physical block was 4 kb and a compressed block was also 4 kb, then we might be able to compress this data down to 2 kb, but it would still need to be stored in a 4 kb block *and* we would now need a compressed block to point to the compressed data. By default SFS defines a compressed block size as 8 times larger than a physical block (i.e. a 4 KB physical block and a 32 KB compressed block).
 
-Throughout this explanation of how transparent compression/decompression is achieved in SFS, the astute reader will note that we're suddenly talking about "larger blocks" (containing the uncompressed data) and smaller blocks (containing the compressed output data). This is achieved by decoupling the concept of the size of a real SFS block from the size that a data-block is meant to represent. For uncompressed streams, the data block storage size is the same as the physical block size. When a stream is compressed, however, L3 considers the data storage per data block to be larger by a set factor (by default this factor is 3-doubles (3 shifts),i.e. 4 kb physical blocks operate with 32 kb compressed blocks (4 -> 8 -> 16 -> 32) and 16 kb blocks would operate with 128 kb compressed blocks (16 -> 32 -> 64 -> 128). This means that when SFS navigates around in the pyramid of redirector blocks in a compressed stream, it considers the compressed blocks 3 doublings larger (by default) than they actually are. The navigation logic is the same; it just works with the representative size of the block, not the physical block.
+On the other hand, if compressed blocks are defined to hold 32 kb, their data might be compressible to, say, 10 kb (if we're lucky), which could be stored in three 4 kb blocks. Then we'd need a compressed block to point to this compressed data, in effect cutting our real block usage from 8 blocks (32/4) down to 4 blocks (3 blocks for the compressed data + 1 block to point to this compressed data).
 
-This does, of course, introduce some slow downs in that every time a compressed block needs modification, it needs to be locate the compressed data, be decompressed, modified and then recompressed. SFS uses lz4, a very fast compression algorithm, to achieve this and, in some scenarios, operating with compression is faster because there is less IO (simply because more data can fit into the same IO). Having said all of that, compression is a penalty in many scenarios and callers must decide through testing whether compression is worthwhile for their scenario. It is given, but is nevertheless worth stating, that data that's already compressed before it is added to the SFS file will not compress further and will, in fact, end up larger if added to an SFS file as a compressed stream.
+This does, of course, introduce some slow downs in that every time a compressed block needs modification, we need to locate the compressed data, decompress the data, modify the data and then recompress the data. SFS uses LZ4 as the compression algorithm, broadly considered the fastest, "decent" compression algorithm. The gain, on the other hand, is that we often need less IO (because we need to write and read less from the disk due to the data being smaller). In some scenarios, using compression actually improves the read and writing speed of SFS, but broadly it is best to think that compression trades reading/writing time for storage space requirements. Callers must decide through testing whether compression is worthwhile for their scenario. It is given, but is nevertheless worth stating, that data that's already compressed before it is added to the SFS file will not compress further and will, in fact, end up larger if added to an SFS file as a compressed stream.
 
 ### Tracking streams in L3
 
@@ -457,7 +455,10 @@ When blocks are deallocated, L2 therefore first sorts the block indicies given t
 While this approach doesn't guarantee that all free blocks sit in run order in the free list, it does promote many contiguous runs of blocks for a small runtime penalty, which helps to speed up stream operations from blocks that have been re-used.
 
 ### Block caching
-L2 will often be requested to write and (especially) read the same block over and over again. This is most often the case when data is being written or read to a larger stream (i.e. a stream that must use redirector blocks) and the redirector blocks need constant access to locate the data in the stream. L2 therefore manages a write-through cache of blocks and it provides to L3 a way to use this write-through cache for some blocks, while not for others. As L3 writes or reads redirector blocks, it asks L2 to place and read these blocks in the write through cache. Then, when L3 comes to read the redirector blocks, it is instead served from the in-memory cache and placed in the write-through cache before being written to disk. The actual data written/read to a stream circumvents the write-through cache, under the assumption that callers know what data they've placed in the SFS file (and therefore won't be asking the SFS file to read that data again) and, when reading, receive a copy of the data stream into their memory bufffer and therefore won't asking to read the same data again.
+L2 will often be requested to write and (especially) read the same block over and over again. This is most often the case when data is being written or read to a larger stream (i.e. a stream that must use redirector blocks) and the redirector blocks need constant access to locate the data in the stream. L2 therefore manages a write-through cache of blocks and it provides to L3 a way to use this write-through cache for some blocks, while not for others. As L3 writes or reads redirector blocks, it asks L2 to place and read these commonly accessed blocks in the write-through cache. Then, when L3 comes to read the redirector blocks, it is instead served from the in-memory cache and placed in the write-through cache before being written to disk. The actual data written/read to a stream circumvents the write-through cache, under the assumption that callers know what data they've placed in the SFS file (and therefore won't be asking the SFS file to read that data again) and, when reading, receive a copy of the data stream into their memory bufffer and therefore won't asking to read the same data again.
+
+### Additional feature & additional complexity: Block encryption
+Occasionnally, the data stored in an SFS file will benefit from encryption. 
 
 ### Thread safety in L2
 

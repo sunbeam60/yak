@@ -262,6 +262,28 @@ fn navigate_to_leaf<L2: BlockLayer>(
     Ok(current_block)
 }
 
+/// Scan for a contiguous ascending run of block indices. `count` is the max
+/// number of indices to inspect and `get_index(i)` returns the i-th index.
+/// Returns the run length (always >= 1 when `count > 0`).
+///
+/// Using a closure allows the caller to lazily decode indices from a
+/// byte buffer without allocating an array of u64 indices first.
+#[inline]
+fn scan_contiguous_run<F: Fn(usize) -> u64>(count: usize, get_index: F) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    let first = get_index(0);
+    let mut run: usize = 1;
+    for i in 1..count {
+        if get_index(i) != first + run as u64 {
+            break;
+        }
+        run += 1;
+    }
+    run
+}
+
 /// Scan a pre-read leaf redirector buffer for a contiguous run of physical
 /// block indices starting at `start_slot`. Returns (first_physical_block, run_length).
 ///
@@ -275,12 +297,12 @@ fn scan_run_from_buffer(
     block_index_width: u8,
 ) -> Result<(u64, u64), SfsError> {
     let biw = block_index_width as usize;
-    let offset = start_slot as usize * biw;
+    let base_offset = start_slot as usize * biw;
     let sentinel = block_sentinel(block_index_width);
 
-    // Decode the first index
+    // Decode the first index and check for sentinel
     let mut idx_buf = [0u8; 8];
-    idx_buf[..biw].copy_from_slice(&leaf_buf[offset..offset + biw]);
+    idx_buf[..biw].copy_from_slice(&leaf_buf[base_offset..base_offset + biw]);
     let first_block = u64::from_le_bytes(idx_buf);
 
     if first_block == sentinel {
@@ -290,21 +312,15 @@ fn scan_run_from_buffer(
         )));
     }
 
-    // Scan forward for consecutive physical block indices
-    let mut run_length: u64 = 1;
-    let slots_to_scan = max_slots as usize;
-    for i in 1..slots_to_scan {
-        let pos = offset + i * biw;
-        idx_buf = [0u8; 8];
-        idx_buf[..biw].copy_from_slice(&leaf_buf[pos..pos + biw]);
-        let idx = u64::from_le_bytes(idx_buf);
-        if idx != first_block + run_length || idx == sentinel {
-            break;
-        }
-        run_length += 1;
-    }
+    // Delegate to shared contiguity scanner with lazy byte-buffer decode
+    let run_length = scan_contiguous_run(max_slots as usize, |i| {
+        let pos = base_offset + i * biw;
+        let mut buf = [0u8; 8];
+        buf[..biw].copy_from_slice(&leaf_buf[pos..pos + biw]);
+        u64::from_le_bytes(buf)
+    });
 
-    Ok((first_block, run_length))
+    Ok((first_block, run_length as u64))
 }
 
 /// Write data block indices into leaf redirectors in batches.
@@ -1056,22 +1072,25 @@ fn decompress_cblock<L2: BlockLayer>(
         return Ok(());
     }
 
-    // Read compressed data from physical blocks into reusable buffer
+    // Read compressed data from physical blocks, batching contiguous runs
     let total_compressed = redir.compressed_length as usize;
     compressed_buf.resize(total_compressed, 0);
     let mut bytes_remaining = total_compressed;
     let mut buf_offset = 0;
+    let blocks = &redir.data_blocks;
 
-    for &data_block in &redir.data_blocks {
-        let to_read = bytes_remaining.min(block_size);
-        layer2.read_block(
-            data_block,
+    let mut i = 0;
+    while i < blocks.len() {
+        let run_len = scan_contiguous_run(blocks.len() - i, |j| blocks[i + j]);
+        let run_bytes = (run_len * block_size).min(bytes_remaining);
+        layer2.read_contiguous_blocks(
+            blocks[i],
             0,
-            &mut compressed_buf[buf_offset..buf_offset + to_read],
-            true,
+            &mut compressed_buf[buf_offset..buf_offset + run_bytes],
         )?;
-        buf_offset += to_read;
-        bytes_remaining -= to_read;
+        buf_offset += run_bytes;
+        bytes_remaining -= run_bytes;
+        i += run_len;
     }
 
     // Decompress
@@ -1250,16 +1269,24 @@ fn pyramid_write_compressed<L2: BlockLayer>(
         if old_redir.compressed_length == 0 {
             cblock_buf.fill(0);
         } else {
-            // Read compressed data from physical blocks into reusable buffer
+            // Read compressed data from physical blocks, batching contiguous runs
             let total_compressed = old_redir.compressed_length as usize;
             compressed_read_buf.resize(total_compressed, 0);
             let mut remaining = total_compressed;
             let mut off = 0;
-            for &db in &old_redir.data_blocks {
-                let to_read = remaining.min(block_size);
-                layer2.read_block(db, 0, &mut compressed_read_buf[off..off + to_read], true)?;
-                off += to_read;
-                remaining -= to_read;
+            let old_blocks = &old_redir.data_blocks;
+            let mut ri = 0;
+            while ri < old_blocks.len() {
+                let run_len = scan_contiguous_run(old_blocks.len() - ri, |j| old_blocks[ri + j]);
+                let run_bytes = (run_len * block_size).min(remaining);
+                layer2.read_contiguous_blocks(
+                    old_blocks[ri],
+                    0,
+                    &mut compressed_read_buf[off..off + run_bytes],
+                )?;
+                off += run_bytes;
+                remaining -= run_bytes;
+                ri += run_len;
             }
             let dec = lz4_flex::decompress_size_prepended(&compressed_read_buf)
                 .map_err(|e| SfsError::IoError(format!("lz4 decompression failed: {}", e)))?;
@@ -1309,19 +1336,22 @@ fn pyramid_write_compressed<L2: BlockLayer>(
             layer2.deallocate_blocks(&mut excess_blocks)?;
         }
 
-        // Write compressed data to physical blocks
+        // Write compressed data to physical blocks, batching contiguous runs
         let mut comp_remaining = new_compressed_len;
         let mut comp_offset = 0;
-        for &db in &new_data_blocks {
-            let to_write = comp_remaining.min(block_size);
-            layer2.write_block(
-                db,
+        let mut wi = 0;
+        while wi < new_data_blocks.len() {
+            let run_len =
+                scan_contiguous_run(new_data_blocks.len() - wi, |j| new_data_blocks[wi + j]);
+            let run_bytes = (run_len * block_size).min(comp_remaining);
+            layer2.write_contiguous_blocks(
+                new_data_blocks[wi],
                 0,
-                &compressed[comp_offset..comp_offset + to_write],
-                true,
+                &compressed[comp_offset..comp_offset + run_bytes],
             )?;
-            comp_offset += to_write;
-            comp_remaining -= to_write;
+            comp_offset += run_bytes;
+            comp_remaining -= run_bytes;
+            wi += run_len;
         }
 
         // Update the compression redirector (build inline to avoid cloning

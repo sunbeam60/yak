@@ -11,6 +11,7 @@ __pycache__/
 # IDE
 .idea/
 *.swp
+*.af~lock~
 
 # macOS
 .DS_Store

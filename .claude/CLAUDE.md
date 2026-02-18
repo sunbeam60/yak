@@ -34,15 +34,6 @@ If we have to perform disk read/writing (i.e. if we have to ask L2 for a block o
 This is a low level library. Memory allocations should be minimized when possible. Performance matters.
 Samply is used for profiling release builds. Please see ./.vscode/tasks.json for how they are defined.
 
-## AES hardware acceleration
-Yak uses the `aes` crate (0.8+) for AES-XTS block encryption at L2. Hardware acceleration
-depends on platform-specific configuration in `.cargo/config.toml`:
-- **x86_64**: The `aes` crate auto-detects AES-NI at runtime. No build flags needed.
-- **aarch64 (ARM64)**: Requires `--cfg aes_armv8` in rustflags to enable runtime detection
-  of ARMv8 crypto extensions. Without this flag, ARM builds silently fall back to a pure
-  software AES implementation. All aarch64 targets must have this flag in `.cargo/config.toml`.
-- See https://docs.rs/aes/0.8.4/aes/ for the full list of configuration flags.
-
 ## Workspace harness
 Whenever you make changes, they must be in sync across the five key projects:
 ./../yak/               - the main project for the library
@@ -62,5 +53,18 @@ If there's a cleaner/neater way to do something, please suggest it.
 Don't use #[allow()] to get around warnings. Warnings from clippy shouldn't be worked around, they should be fixed.
 There's a git hook to run fmt and clippy before we push to remote master. Please finish off big tasks by running both and fixing any warnings.
 
+## Some files not to be modified
+Do not modify the following files without explicit permission:
+* ./docs/architecture.md
+* ./README.md
+
 ## Still in development
 Version changes to the underlying storage formats is not a large problem. We are still developing this and no existing files are in the wild, needing to be considered.
+
+## AES hardware acceleration
+Yak uses the `aes` crate (0.8+) for AES-XTS block encryption at L2. Hardware acceleration depends on platform-specific configuration in `.cargo/config.toml`:
+- **x86_64**: The `aes` crate auto-detects AES-NI at runtime. No build flags needed.
+- **aarch64 (ARM64)**: Requires `--cfg aes_armv8` in rustflags to enable runtime detection
+  of ARMv8 crypto extensions. Without this flag, ARM builds silently fall back to a pure
+  software AES implementation. All aarch64 targets must have this flag in `.cargo/config.toml`.
+- See https://docs.rs/aes/0.8.4/aes/ for the full list of configuration flags.

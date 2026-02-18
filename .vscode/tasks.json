@@ -8,7 +8,7 @@
             "args": [
                 "build",
                 "--package",
-                "sfs_cl"
+                "yak_cl"
             ],
             "options": {
                 "cwd": "${workspaceFolder}",
@@ -36,7 +36,7 @@
                 "build",
                 "--workspace",
                 "--exclude",
-                "stream_fs_python"
+                "yak_python"
             ],
             "options": {
                 "cwd": "${workspaceFolder}",
@@ -61,7 +61,7 @@
                 "test",
                 "--no-run",
                 "--package",
-                "stream_fs"
+                "yak"
             ],
             "options": {
                 "cwd": "${workspaceFolder}",
@@ -110,7 +110,7 @@
                 "--workspace",
                 "--all-targets",
                 "--exclude",
-                "stream_fs_python",
+                "yak_python",
                 "--",
                 "-D",
                 "warnings"
@@ -170,13 +170,13 @@
             "command": "bash",
             "args": [
                 "-c",
-                "cd '${workspaceFolder}/stream_fs_python' && VIRTUAL_ENV='${workspaceFolder}/sfs_pytest/.venv' ../sfs_pytest/.venv/bin/maturin develop --release"
+                "cd '${workspaceFolder}/yak_python' && VIRTUAL_ENV='${workspaceFolder}/yak_pytest/.venv' ../yak_pytest/.venv/bin/maturin develop --release"
             ],
             "windows": {
                 "command": "powershell",
                 "args": [
                     "-Command",
-                    "$env:VIRTUAL_ENV='${workspaceFolder}/sfs_pytest/.venv'; cd '${workspaceFolder}/stream_fs_python'; ../sfs_pytest/.venv/Scripts/maturin develop --release"
+                    "$env:VIRTUAL_ENV='${workspaceFolder}/yak_pytest/.venv'; cd '${workspaceFolder}/yak_python'; ../yak_pytest/.venv/Scripts/maturin develop --release"
                 ]
             },
             "problemMatcher": [
@@ -194,17 +194,17 @@
             "command": "bash",
             "args": [
                 "-c",
-                "'${workspaceFolder}/sfs_pytest/.venv/bin/python' -m pytest tests/ -v"
+                "'${workspaceFolder}/yak_pytest/.venv/bin/python' -m pytest tests/ -v"
             ],
             "windows": {
                 "command": "powershell",
                 "args": [
                     "-Command",
-                    "& '${workspaceFolder}/sfs_pytest/.venv/Scripts/python.exe' -m pytest tests/ -v"
+                    "& '${workspaceFolder}/yak_pytest/.venv/Scripts/python.exe' -m pytest tests/ -v"
                 ]
             },
             "options": {
-                "cwd": "${workspaceFolder}/sfs_pytest"
+                "cwd": "${workspaceFolder}/yak_pytest"
             },
             "dependsOn": [
                 "maturin-develop"
@@ -239,7 +239,7 @@
                 "build",
                 "--release",
                 "--package",
-                "sfs_cl"
+                "yak_cl"
             ],
             "options": {
                 "cwd": "${workspaceFolder}",
@@ -265,7 +265,7 @@
                 "--release",
                 "--workspace",
                 "--exclude",
-                "stream_fs_python"
+                "yak_python"
             ],
             "options": {
                 "cwd": "${workspaceFolder}",
@@ -290,21 +290,21 @@
                 "command": "powershell",
                 "args": [
                     "-Command",
-                    "$branch = (git -C '${workspaceFolder}' branch --show-current).Trim().Replace('/','-'); if ($branch -eq 'master') { $name = 'sfs.exe' } else { $name = 'sfs-' + $branch + '.exe' }; New-Item -ItemType Directory -Force -Path '${env:USERPROFILE}/bin'; Copy-Item '${workspaceFolder}/target/release/sfs.exe' ('${env:USERPROFILE}/bin/' + $name) -Force; Copy-Item '${workspaceFolder}/target/release/stream_fs_c.dll' '${env:USERPROFILE}/bin/stream_fs_c.dll' -Force; Write-Host ('Release binary copied to ~/bin/' + $name)"
+                    "$branch = (git -C '${workspaceFolder}' branch --show-current).Trim().Replace('/','-'); if ($branch -eq 'master') { $name = 'yak.exe' } else { $name = 'yak-' + $branch + '.exe' }; New-Item -ItemType Directory -Force -Path '${env:USERPROFILE}/bin'; Copy-Item '${workspaceFolder}/target/release/yak.exe' ('${env:USERPROFILE}/bin/' + $name) -Force; Copy-Item '${workspaceFolder}/target/release/yak_c.dll' '${env:USERPROFILE}/bin/yak_c.dll' -Force; Write-Host ('Release binary copied to ~/bin/' + $name)"
                 ]
             },
             "osx": {
                 "command": "bash",
                 "args": [
                     "-c",
-                    "branch=$(git -C '${workspaceFolder}' branch --show-current | tr '/' '-') && if [ \"$branch\" = \"master\" ]; then name=sfs; else name=sfs-$branch; fi && mkdir -p ~/.local/bin && cp '${workspaceFolder}/target/release/sfs' ~/.local/bin/$name && cp '${workspaceFolder}/target/release/libstream_fs_c.dylib' ~/.local/bin/libstream_fs_c.dylib && echo \"Release binary copied to ~/.local/bin/$name\""
+                    "branch=$(git -C '${workspaceFolder}' branch --show-current | tr '/' '-') && if [ \"$branch\" = \"master\" ]; then name=yak; else name=yak-$branch; fi && mkdir -p ~/.local/bin && cp '${workspaceFolder}/target/release/yak' ~/.local/bin/$name && cp '${workspaceFolder}/target/release/libyak_c.dylib' ~/.local/bin/libyak_c.dylib && echo \"Release binary copied to ~/.local/bin/$name\""
                 ]
             },
             "linux": {
                 "command": "bash",
                 "args": [
                     "-c",
-                    "branch=$(git -C '${workspaceFolder}' branch --show-current | tr '/' '-') && if [ \"$branch\" = \"master\" ]; then name=sfs; else name=sfs-$branch; fi && mkdir -p ~/.local/bin && cp '${workspaceFolder}/target/release/sfs' ~/.local/bin/$name && cp '${workspaceFolder}/target/release/libstream_fs_c.so' ~/.local/bin/libstream_fs_c.so && echo \"Release binary copied to ~/.local/bin/$name\""
+                    "branch=$(git -C '${workspaceFolder}' branch --show-current | tr '/' '-') && if [ \"$branch\" = \"master\" ]; then name=yak; else name=yak-$branch; fi && mkdir -p ~/.local/bin && cp '${workspaceFolder}/target/release/yak' ~/.local/bin/$name && cp '${workspaceFolder}/target/release/libyak_c.so' ~/.local/bin/libyak_c.so && echo \"Release binary copied to ~/.local/bin/$name\""
                 ]
             },
             "options": {
@@ -343,7 +343,7 @@
                 "--profile",
                 "profiling",
                 "--package",
-                "sfs_cl"
+                "yak_cl"
             ],
             "options": {
                 "cwd": "${workspaceFolder}",
@@ -367,14 +367,14 @@
             "osx": {
                 "args": [
                     "record",
-                    "${workspaceFolder}/target/profiling/sfs",
+                    "${workspaceFolder}/target/profiling/yak",
                     "bench",
                     "all"
                 ]
             },
             "args": [
                 "record",
-                "${workspaceFolder}/target/profiling/sfs.exe",
+                "${workspaceFolder}/target/profiling/yak.exe",
                 "bench",
                 "all"
             ],
@@ -401,14 +401,14 @@
             "osx": {
                 "args": [
                     "record",
-                    "${workspaceFolder}/target/profiling/sfs",
+                    "${workspaceFolder}/target/profiling/yak",
                     "bench",
                     "large-write"
                 ]
             },
             "args": [
                 "record",
-                "${workspaceFolder}/target/profiling/sfs.exe",
+                "${workspaceFolder}/target/profiling/yak.exe",
                 "bench",
                 "large-write"
             ],
@@ -435,14 +435,14 @@
             "osx": {
                 "args": [
                     "record",
-                    "${workspaceFolder}/target/profiling/sfs",
+                    "${workspaceFolder}/target/profiling/yak",
                     "bench",
                     "small-write"
                 ]
             },
             "args": [
                 "record",
-                "${workspaceFolder}/target/profiling/sfs.exe",
+                "${workspaceFolder}/target/profiling/yak.exe",
                 "bench",
                 "small-write"
             ],
@@ -469,14 +469,14 @@
             "osx": {
                 "args": [
                     "record",
-                    "${workspaceFolder}/target/profiling/sfs",
+                    "${workspaceFolder}/target/profiling/yak",
                     "bench",
                     "threaded-write"
                 ]
             },
             "args": [
                 "record",
-                "${workspaceFolder}/target/profiling/sfs.exe",
+                "${workspaceFolder}/target/profiling/yak.exe",
                 "bench",
                 "threaded-write"
             ],
@@ -503,14 +503,14 @@
             "osx": {
                 "args": [
                     "record",
-                    "${workspaceFolder}/target/profiling/sfs",
+                    "${workspaceFolder}/target/profiling/yak",
                     "bench",
                     "threaded-read"
                 ]
             },
             "args": [
                 "record",
-                "${workspaceFolder}/target/profiling/sfs.exe",
+                "${workspaceFolder}/target/profiling/yak.exe",
                 "bench",
                 "threaded-read"
             ],
@@ -537,14 +537,14 @@
             "osx": {
                 "args": [
                     "record",
-                    "${workspaceFolder}/target/profiling/sfs",
+                    "${workspaceFolder}/target/profiling/yak",
                     "bench",
                     "large-read"
                 ]
             },
             "args": [
                 "record",
-                "${workspaceFolder}/target/profiling/sfs.exe",
+                "${workspaceFolder}/target/profiling/yak.exe",
                 "bench",
                 "large-read"
             ],
@@ -571,14 +571,14 @@
             "osx": {
                 "args": [
                     "record",
-                    "${workspaceFolder}/target/profiling/sfs",
+                    "${workspaceFolder}/target/profiling/yak",
                     "bench",
                     "small-read"
                 ]
             },
             "args": [
                 "record",
-                "${workspaceFolder}/target/profiling/sfs.exe",
+                "${workspaceFolder}/target/profiling/yak.exe",
                 "bench",
                 "small-read"
             ],
@@ -605,14 +605,14 @@
             "osx": {
                 "args": [
                     "record",
-                    "${workspaceFolder}/target/profiling/sfs",
+                    "${workspaceFolder}/target/profiling/yak",
                     "bench",
                     "threaded-mixed"
                 ]
             },
             "args": [
                 "record",
-                "${workspaceFolder}/target/profiling/sfs.exe",
+                "${workspaceFolder}/target/profiling/yak.exe",
                 "bench",
                 "threaded-mixed"
             ],
@@ -639,14 +639,14 @@
             "osx": {
                 "args": [
                     "record",
-                    "${workspaceFolder}/target/profiling/sfs",
+                    "${workspaceFolder}/target/profiling/yak",
                     "bench",
                     "churn"
                 ]
             },
             "args": [
                 "record",
-                "${workspaceFolder}/target/profiling/sfs.exe",
+                "${workspaceFolder}/target/profiling/yak.exe",
                 "bench",
                 "churn"
             ],
@@ -673,14 +673,14 @@
             "osx": {
                 "args": [
                     "record",
-                    "${workspaceFolder}/target/profiling/sfs",
+                    "${workspaceFolder}/target/profiling/yak",
                     "bench",
                     "single-stream"
                 ]
             },
             "args": [
                 "record",
-                "${workspaceFolder}/target/profiling/sfs.exe",
+                "${workspaceFolder}/target/profiling/yak.exe",
                 "bench",
                 "single-stream"
             ],
@@ -707,14 +707,14 @@
             "osx": {
                 "args": [
                     "record",
-                    "${workspaceFolder}/target/profiling/sfs",
+                    "${workspaceFolder}/target/profiling/yak",
                     "bench",
                     "overwrite"
                 ]
             },
             "args": [
                 "record",
-                "${workspaceFolder}/target/profiling/sfs.exe",
+                "${workspaceFolder}/target/profiling/yak.exe",
                 "bench",
                 "overwrite"
             ],

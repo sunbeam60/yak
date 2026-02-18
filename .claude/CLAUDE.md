@@ -1,4 +1,4 @@
-# Stream File System (SFS)
+# Yak
 
 ## Conventions
 - L1                = Layer 1
@@ -11,24 +11,24 @@ Before committing, at all times present & allow edits to the commit message to t
 
 Humans will use the extension Todo Tree extension. It's good practice to use //TODO: and //FIXME: comments where appropriate, to give humans an overview over possible improvements or concerns in the code. Literal constants in code should be avoided. It's brittle and humans don't deal well with them. Minimize the use of defined constants to as few places as possible.
 
-Readability of the code for humans is important. If constants are being added, explain in a comment what the constant signifies. 
+Readability of the code for humans is important. If constants are being added, explain in a comment what the constant signifies.
 
 If a function gets above 100 lines, question whether some functionality can be extracted from this function and, if a similar function already exits that isn't quite right can be made generic to work for both places. This isn't a strict rule, but very long functions are mostly a sign that we're throwing too much code down - this may work for an AI but not for a human that wants to read and edit together with the AI.
 
-Use generics rather than dynamic dispatch when possible. 
+Use generics rather than dynamic dispatch when possible.
 
 If a function starts to acquire a lot of parameters and a lot of variables internally, usually the function is doing too many things at once. Can we extract and re-use functionality instead?
 
 When a human is making suggestions and something seems more trouble than it's worth, it's ok to question the human's intent, offering up pros and cons of the suggestions before asking for directions.
 
 ## Architecture
-Please read the [architecture](./../docs/architecture.md) for a comprehensive overview of SFS. This architecture must be respected - if it cannot, please stop, inform and ask for directions.
+Please read the [architecture](./../docs/architecture.md) for a comprehensive overview of Yak. This architecture must be respected - if it cannot, please stop, inform and ask for directions.
 
 Whenever you are updating .md files, do not ever change ./../docs/architecture.md withot asking the user and explaining why you wish to change this file, what is wrong with the architecture and what you propose to change. Keep track of divergences from the defined architecture in [differences](./../docs/differences.md).
 
 Duplication of code should be concerning when we write code. If duplicated code exists, and there's no performance penalty to extracting it into a function, we should consider doing so. In release mode, small functions are likely to be inlined by the compiler.
 
-If we have to perform disk read/writing (i.e. if we have to ask L2 for a blockor L1 to read/write), we must try to avoid doing that inside of a loop, unless absolutely required. Consider whether we can read the data once and then iterate through the data in the local loop, instead of continually asking for reading/writing at disk level inside of the loop. Even if we have a cache, touching the cache is not free.
+If we have to perform disk read/writing (i.e. if we have to ask L2 for a block or L1 to read/write), we must try to avoid doing that inside of a loop, unless absolutely required. Consider whether we can read the data once and then iterate through the data in the local loop, instead of continually asking for reading/writing at disk level inside of the loop. Even if we have a cache, touching the cache is not free.
 
 ## Performance and memory
 This is a low level library. Memory allocations should be minimized when possible. Performance matters.
@@ -36,17 +36,17 @@ Samply is used for profiling release builds. Please see ./.vscode/tasks.json for
 
 ## Workspace harness
 Whenever you make changes, they must be in sync across the five key projects:
-./../stream_fs/         - the main project for the library
-./../sfs_cl/            - the command line utility that enables command line manipulation of .stream_fs files
-./../stream_fs_c/       - the C FFI wrapper around the main stream_fs module
-./../stream_fs_python/  - the PyO3 Python bindings around the main stream_fs module (installed via `maturin develop`)
-./../sfs_pytest/        - the python testing harness that enables rapid testing of SFS files the stream_fs library
+./../yak/               - the main project for the library
+./../yak_cl/            - the command line utility that enables command line manipulation of .yak files
+./../yak_c/             - the C FFI wrapper around the main yak module
+./../yak_python/        - the PyO3 Python bindings around the main yak module (installed via `maturin develop`)
+./../yak_pytest/        - the python testing harness that enables rapid testing of .yak files the yak library
 
 ## Test Driven Development
-As far as possible, when planning features, help the author first plan out how this feature should be tested in the pytest library. Only after tests have been planned and written, and failed, should we move to implementation and satisfy the tests. This won't always be possible, but whenever it is, this is the preferred method for development. Whenever large changes have been achieved, the full test suite in sfs_pytest must pass too.
+As far as possible, when planning features, help the author first plan out how this feature should be tested in the pytest library. Only after tests have been planned and written, and failed, should we move to implementation and satisfy the tests. This won't always be possible, but whenever it is, this is the preferred method for development. Whenever large changes have been achieved, the full test suite in yak_pytest must pass too.
 
-## Layers in SFS must be respected
-It is critical that the four layers in SFS are kept as decoupled as possible: L4 should only know about L3, L3 should only know about L2, L2 should only know about L1. If you find yourself writing code that ignores this architectural decoupling, stop, inform and ask for directions.
+## Layers in Yak must be respected
+It is critical that the four layers in Yak are kept as decoupled as possible: L4 should only know about L3, L3 should only know about L2, L2 should only know about L1. If you find yourself writing code that ignores this architectural decoupling, stop, inform and ask for directions.
 
 ## Warnings are errors - keeping it clean
 If there's a cleaner/neater way to do something, please suggest it.

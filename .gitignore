@@ -20,7 +20,7 @@ __pycache__/
 
 # Temp/test directories
 /temp/
-*.sfs/
+*.yak/
 
 # Profiling output
 profile.json.gz

@@ -1,6 +1,6 @@
 # VSCode Debug Configuration Guide
 
-This workspace is now configured for debugging both Rust and Python code in the SFS project.
+This workspace is now configured for debugging both Rust and Python code in the Yak project.
 
 ## 🚀 Quick Start
 
@@ -14,8 +14,8 @@ This workspace is now configured for debugging both Rust and Python code in the 
 
 | Configuration | Description | Working Dir |
 |---------------|-------------|-------------|
-| **Debug CLI: create test.sfs** | Create a new SFS file | `./temp/` |
-| **Debug: Rust Tests (stream_fs)** | Debug Rust unit tests | Project root |
+| **Debug CLI: create test.yak** | Create a new Yak file | `./temp/` |
+| **Debug: Rust Tests (yak)** | Debug Rust unit tests | Project root |
 
 ### Python Test Debugging
 
@@ -60,14 +60,14 @@ Press `Ctrl+Shift+B` to see build tasks, or run them via `Terminal > Run Task`:
 
 ### Custom CLI Arguments
 
-To debug with custom arguments, copy the "Debug CLI: create test.sfs" configuration in `.vscode/launch.json` and modify the `args` array, e.g.:
+To debug with custom arguments, copy the "Debug CLI: create test.yak" configuration in `.vscode/launch.json` and modify the `args` array, e.g.:
    ```json
-   "args": ["put", "test.sfs", "myfile.txt", "stream.dat"]
+   "args": ["put", "test.yak", "myfile.txt", "stream.dat"]
    ```
 
 ## 📁 Directories
 
-- **temp/** - Sandbox directory for CLI debugging (create/test SFS files here)
+- **temp/** - Sandbox directory for CLI debugging (create/test Yak files here)
 - **.vscode/** - VSCode configuration files
 
 ## 🔧 Requirements

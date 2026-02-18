@@ -1,0 +1,16 @@
+[package]
+name = "yak_python"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Python bindings for the Yak library"
+
+[lib]
+name = "yak"
+crate-type = ["cdylib"]
+
+[dependencies]
+yak.workspace = true
+pyo3 = { version = "0.28", features = ["extension-module"] }

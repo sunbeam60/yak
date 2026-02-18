@@ -2,11 +2,11 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Debug CLI: create test.sfs",
+            "name": "Debug CLI: create test.yak",
             "type": "cppvsdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/target/debug/sfs.exe",
-            "args": ["create", "test.sfs"],
+            "program": "${workspaceFolder}/target/debug/yak.exe",
+            "args": ["create", "test.yak"],
             "cwd": "${workspaceFolder}/temp",
             "preLaunchTask": "cargo-build-cli",
             "sourceFileMap": {
@@ -14,10 +14,10 @@
             }
         },
         {
-            "name": "Debug: Rust Tests (stream_fs)",
+            "name": "Debug: Rust Tests (yak)",
             "type": "cppvsdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/target/debug/deps/stream_fs-*.exe",
+            "program": "${workspaceFolder}/target/debug/deps/yak-*.exe",
             "args": [],
             "cwd": "${workspaceFolder}",
             "preLaunchTask": "cargo-test-build",
@@ -34,11 +34,11 @@
                 "tests/",
                 "-v"
             ],
-            "cwd": "${workspaceFolder}/sfs_pytest",
+            "cwd": "${workspaceFolder}/yak_pytest",
             "console": "integratedTerminal",
             "justMyCode": false,
             "env": {
-                "PYTHONPATH": "${workspaceFolder}/sfs_pytest"
+                "PYTHONPATH": "${workspaceFolder}/yak_pytest"
             }
         }
     ]

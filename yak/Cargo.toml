@@ -1,0 +1,24 @@
+[package]
+name = "yak"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Yak - yet another kontainer"
+homepage = "https://github.com/sunbeam60/yak"
+keywords = ["filesystem", "embedded", "streams", "storage"]
+categories = ["filesystem", "data-structures"]
+
+[dependencies]
+fs2 = "0.4.3"
+thread_local = "1.1"
+lru = "0.12"
+lz4_flex = { version = "0.11", default-features = false }
+# Encryption support (L2 optional AES-XTS block encryption)
+aes = "0.8"
+xts-mode = "0.5"
+argon2 = "0.5"
+aes-kw = "0.2"
+sha2 = "0.10"
+rand = "0.8"

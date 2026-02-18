@@ -78,20 +78,20 @@ jobs:
       - name: Package (Unix)
         if: matrix.archive == 'tar.gz'
         run: |
-          STAGING="sfs-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          STAGING="yak-${GITHUB_REF_NAME}-${{ matrix.target }}"
           mkdir "$STAGING"
 
           # CLI binary
-          cp "target/${{ matrix.target }}/release/sfs" "$STAGING/"
+          cp "target/${{ matrix.target }}/release/yak" "$STAGING/"
 
           # C library
-          if [ -f "target/${{ matrix.target }}/release/libstream_fs_c.so" ]; then
-            cp "target/${{ matrix.target }}/release/libstream_fs_c.so" "$STAGING/"
+          if [ -f "target/${{ matrix.target }}/release/libyak_c.so" ]; then
+            cp "target/${{ matrix.target }}/release/libyak_c.so" "$STAGING/"
           fi
-          if [ -f "target/${{ matrix.target }}/release/libstream_fs_c.dylib" ]; then
-            cp "target/${{ matrix.target }}/release/libstream_fs_c.dylib" "$STAGING/"
+          if [ -f "target/${{ matrix.target }}/release/libyak_c.dylib" ]; then
+            cp "target/${{ matrix.target }}/release/libyak_c.dylib" "$STAGING/"
           fi
-          cp "target/${{ matrix.target }}/release/libstream_fs_c.a" "$STAGING/" 2>/dev/null || true
+          cp "target/${{ matrix.target }}/release/libyak_c.a" "$STAGING/" 2>/dev/null || true
 
           # Licenses
           cp LICENSE-MIT LICENSE-APACHE "$STAGING/"
@@ -103,21 +103,21 @@ jobs:
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
-          $staging = "sfs-$($env:GITHUB_REF_NAME)-${{ matrix.target }}"
+          $staging = "yak-$($env:GITHUB_REF_NAME)-${{ matrix.target }}"
           New-Item -ItemType Directory -Path $staging
 
           # CLI binary
-          Copy-Item "target/${{ matrix.target }}/release/sfs.exe" $staging/
+          Copy-Item "target/${{ matrix.target }}/release/yak.exe" $staging/
 
           # C library
-          if (Test-Path "target/${{ matrix.target }}/release/stream_fs_c.dll") {
-            Copy-Item "target/${{ matrix.target }}/release/stream_fs_c.dll" $staging/
+          if (Test-Path "target/${{ matrix.target }}/release/yak_c.dll") {
+            Copy-Item "target/${{ matrix.target }}/release/yak_c.dll" $staging/
           }
-          if (Test-Path "target/${{ matrix.target }}/release/stream_fs_c.dll.lib") {
-            Copy-Item "target/${{ matrix.target }}/release/stream_fs_c.dll.lib" $staging/
+          if (Test-Path "target/${{ matrix.target }}/release/yak_c.dll.lib") {
+            Copy-Item "target/${{ matrix.target }}/release/yak_c.dll.lib" $staging/
           }
-          if (Test-Path "target/${{ matrix.target }}/release/stream_fs_c.lib") {
-            Copy-Item "target/${{ matrix.target }}/release/stream_fs_c.lib" $staging/
+          if (Test-Path "target/${{ matrix.target }}/release/yak_c.lib") {
+            Copy-Item "target/${{ matrix.target }}/release/yak_c.lib" $staging/
           }
 
           # Licenses
@@ -130,7 +130,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
-          path: sfs-*.${{ matrix.archive }}
+          path: yak-*.${{ matrix.archive }}
 
   release:
     name: Create GitHub Release
@@ -163,5 +163,5 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo publish -p stream_fs --dry-run
-      - run: cargo publish -p sfs_cl --dry-run
+      - run: cargo publish -p yak --dry-run
+      - run: cargo publish -p yak_cl --dry-run

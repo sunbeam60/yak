@@ -1,4 +1,4 @@
-# SFS Build Configuration Summary
+# Yak Build Configuration Summary
 
 ## 🎯 Build Types
 
@@ -19,25 +19,25 @@
 ## 📦 Build Outputs
 
 ### CLI Tool
-- **Binary name**: `sfs.exe`
-- **Package**: `sfs_cl`
-- **Debug**: `target/debug/sfs.exe`
-- **Release**: `target/release/sfs.exe`
+- **Binary name**: `yak.exe`
+- **Package**: `yak_cl`
+- **Debug**: `target/debug/yak.exe`
+- **Release**: `target/release/yak.exe`
 
 ### Core Library
-- **Package**: `stream_fs`
-- **Output**: `libstream_fs.rlib` (Rust library)
+- **Package**: `yak`
+- **Output**: `libyak.rlib` (Rust library)
 
 ### C FFI Library
-- **Package**: `stream_fs_c`
-- **Output**: `stream_fs_c.dll` (Windows DLL)
-- **Location**: `target/{debug,release}/stream_fs_c.dll`
+- **Package**: `yak_c`
+- **Output**: `yak_c.dll` (Windows DLL)
+- **Location**: `target/{debug,release}/yak_c.dll`
 
 ## 🛠️ Quick Commands
 
 ### Build Release CLI
 ```bash
-cargo build --release --package sfs_cl
+cargo build --release --package yak_cl
 ```
 
 ### Build All Release
@@ -51,52 +51,52 @@ Via VSCode task: `Ctrl+Shift+P` → "Tasks: Run Task" → "copy-release-binaries
 Or manually:
 ```bash
 mkdir -p ~/bin
-cp target/release/sfs.exe ~/bin/
-cp target/release/stream_fs_c.dll ~/bin/
+cp target/release/yak.exe ~/bin/
+cp target/release/yak_c.dll ~/bin/
 ```
 
 ## 🚀 Running the CLI
 
 ### Debug Build
 ```bash
-./target/debug/sfs.exe --help
+./target/debug/yak.exe --help
 ```
 
 ### Release Build
 ```bash
-./target/release/sfs.exe --help
+./target/release/yak.exe --help
 ```
 
 ### Installed Version
 ```bash
-sfs --help  # From ~/.cargo/bin/
+yak --help  # From ~/.cargo/bin/
 ```
 
 ## 📁 Directory Structure
 
 ```
-SFS/
+Yak/
 ├── target/
 │   ├── debug/
-│   │   ├── sfs.exe                 (CLI - debug)
-│   │   ├── stream_fs_c.dll         (C FFI - debug)
-│   │   └── libstream_fs.rlib       (Core library - debug)
+│   │   ├── yak.exe                 (CLI - debug)
+│   │   ├── yak_c.dll         (C FFI - debug)
+│   │   └── libyak.rlib       (Core library - debug)
 │   └── release/
-│       ├── sfs.exe                 (CLI - optimized)
-│       ├── stream_fs_c.dll         (C FFI - optimized)
-│       └── libstream_fs.rlib       (Core library - optimized)
+│       ├── yak.exe                 (CLI - optimized)
+│       ├── yak_c.dll         (C FFI - optimized)
+│       └── libyak.rlib       (Core library - optimized)
 └── temp/                           (Test/debug sandbox)
 
 ~/bin/                              (Copied release binaries)
-├── sfs.exe
-└── stream_fs_c.dll
+├── yak.exe
+└── yak_c.dll
 ```
 
 ## ⚙️ VSCode Integration
 
 ### Launch Configurations
-- **Debug CLI: create test.sfs** — create a new SFS file in `./temp/`
-- **Debug: Rust Tests (stream_fs)** — debug cargo unit tests
+- **Debug CLI: create test.yak** -- create a new Yak file in `./temp/`
+- **Debug: Rust Tests (yak)** -- debug cargo unit tests
 - **Python: All Tests** — debug all pytest tests
 
 ### Tasks
@@ -120,11 +120,11 @@ All tests use the debug build by default for faster iteration:
 
 ```bash
 # Run Python tests (uses debug build via FFI)
-cd sfs_pytest && python -m pytest tests/ -v
+cd yak_pytest && python -m pytest tests/ -v
 
 # Build and test release (verify optimizations don't break functionality)
 cargo build --release --workspace
-cd sfs_pytest && python -m pytest tests/ -v
+cd yak_pytest && python -m pytest tests/ -v
 ```
 
 ## 📝 Notes

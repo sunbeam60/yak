@@ -1,0 +1,11 @@
+[project]
+name = "yak_pytest"
+version = "0.1.0"
+description = "Test harness for Yak"
+requires-python = ">=3.10"
+dependencies = [
+    "pytest",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

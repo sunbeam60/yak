@@ -5,17 +5,17 @@
     "rust-analyzer.cargo.allTargets": true,
 
     // Python settings
-    "python.defaultInterpreterPath": "./sfs_pytest/.venv/bin/python",
+    "python.defaultInterpreterPath": "./yak_pytest/.venv/bin/python",
     "python.testing.pytestEnabled": true,
     "python.testing.pytestArgs": [
         "tests",
         "-v"
     ],
-    "python.testing.cwd": "${workspaceFolder}/sfs_pytest",
+    "python.testing.cwd": "${workspaceFolder}/yak_pytest",
 
     // File associations
     "files.associations": {
-        "*.sfs": "plaintext"
+        "*.yak": "plaintext"
     },
 
     // File exclusions (keep workspace clean)

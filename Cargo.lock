@@ -651,14 +651,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sfs_cl"
-version = "0.1.0"
-dependencies = [
- "rpassword",
- "stream_fs",
-]
-
-[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -667,38 +659,6 @@ dependencies = [
  "cfg-if",
  "cpufeatures",
  "digest",
-]
-
-[[package]]
-name = "stream_fs"
-version = "0.1.0"
-dependencies = [
- "aes",
- "aes-kw",
- "argon2",
- "fs2",
- "lru",
- "lz4_flex",
- "rand",
- "sha2",
- "thread_local",
- "xts-mode",
-]
-
-[[package]]
-name = "stream_fs_c"
-version = "0.1.0"
-dependencies = [
- "cbindgen",
- "stream_fs",
-]
-
-[[package]]
-name = "stream_fs_python"
-version = "0.1.0"
-dependencies = [
- "pyo3",
- "stream_fs",
 ]
 
 [[package]]
@@ -1018,6 +978,46 @@ checksum = "09cbddb7545ca0b9ffa7bdc653e8743303e1712687a6918ced25f2cdbed42520"
 dependencies = [
  "byteorder",
  "cipher",
+]
+
+[[package]]
+name = "yak"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "aes-kw",
+ "argon2",
+ "fs2",
+ "lru",
+ "lz4_flex",
+ "rand",
+ "sha2",
+ "thread_local",
+ "xts-mode",
+]
+
+[[package]]
+name = "yak_c"
+version = "0.1.0"
+dependencies = [
+ "cbindgen",
+ "yak",
+]
+
+[[package]]
+name = "yak_cl"
+version = "0.1.0"
+dependencies = [
+ "rpassword",
+ "yak",
+]
+
+[[package]]
+name = "yak_python"
+version = "0.1.0"
+dependencies = [
+ "pyo3",
+ "yak",
 ]
 
 [[package]]

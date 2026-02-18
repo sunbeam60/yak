@@ -35,7 +35,7 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
-      - run: cargo clippy --workspace --all-targets --exclude stream_fs_python -- -D warnings
+      - run: cargo clippy --workspace --all-targets --exclude yak_python -- -D warnings
 
   test:
     name: Test (${{ matrix.os }})
@@ -54,8 +54,8 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
-      - run: cargo build --workspace --exclude stream_fs_python
-      - run: cargo test --workspace --exclude stream_fs_python
+      - run: cargo build --workspace --exclude yak_python
+      - run: cargo test --workspace --exclude yak_python
 
   python-tests:
     name: Python integration tests
@@ -77,6 +77,6 @@ jobs:
       - name: Create virtualenv and install tools
         run: python -m venv .venv && .venv/bin/pip install maturin pytest
       - name: Build and install Python bindings
-        run: cd stream_fs_python && ../.venv/bin/maturin develop --release
+        run: cd yak_python && ../.venv/bin/maturin develop --release
       - name: Run Python tests
-        run: .venv/bin/pytest sfs_pytest/ -v --burn-seconds=3
+        run: .venv/bin/pytest yak_pytest/ -v --burn-seconds=3

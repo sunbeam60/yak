@@ -110,7 +110,7 @@ fn cipher_from_master_key(master_key: &[u8; MASTER_KEY_LEN]) -> BlockCipher {
 pub(crate) fn create_encryption(
     password: &[u8],
 ) -> Result<(EncryptionConfig, BlockCipher), SfsError> {
-    // Generate random salt
+    // Generate random salt (rand 0.8+ is cryptographically secure - uses ChaCha12Rng seeded with OsRng)
     let mut salt = [0u8; SALT_LEN];
     rand::thread_rng().fill_bytes(&mut salt);
 

@@ -8,6 +8,14 @@ This file tracks divergences between the implementation and the architecture doc
 
 The project table previously listed the Python wrapper path as `sfs_python/`. The architecture now correctly says `stream_fs_python/`.
 
+### Terminology: "virtual block" → "compressed block" (fixed)
+
+The architecture previously used "compressed virtual blocks" in diagrams and "virtual block" in prose. The codebase uses "compressed block" exclusively. The architecture now matches: all references to "virtual block" have been replaced with "compressed block".
+
+### L2 encryption now documented (fixed)
+
+The architecture previously said nothing about encryption at the block layer. It now documents L2's optional AES-XTS block-level encryption, including a full L2 header table with all encryption fields (salt, Argon2id parameters, verification hash, wrapped key).
+
 ## Active divergences
 
 ### Publication status claims are premature
@@ -51,18 +59,6 @@ The architecture discusses reserved capacity conceptually in the stream descript
 - `verify()` — integrity checking
 
 The architecture mentions reserve as a utility function but doesn't list it in the API. `tell()` is a natural complement to seek but isn't mentioned.
-
-### Terminology: "virtual block" → "compressed block"
-
-**Architecture says:** The compression section uses the term "compressed virtual blocks" in diagrams and occasionally "virtual block" when describing the larger conceptual blocks that compressed streams operate with.
-
-**Reality:** The codebase uses "compressed block" exclusively. All variable names, function names, and comments refer to `compressed_block_size_shift` / `cbss` / `cbs` / `cblock_*` etc. The old `virtual_block_*` / `vbss` / `vbs` / `vblock_*` naming has been fully replaced. The rationale: in a compressed stream, what was called a "virtual block" is simply a "compressed block" — a leaf-level block containing a compression redirector with the compressed length and pointers to the physical data blocks. In an uncompressed stream, the equivalent is a "data block." The term "virtual" added confusion without adding clarity.
-
-### L2 encryption not yet documented
-
-**Architecture says:** Nothing about encryption at the block layer.
-
-**Reality:** L2 now supports optional AES-XTS block-level encryption. When a password is provided at create/open time, all block data is encrypted transparently. The encryption state is stored in the L2 header, and a key-check mechanism validates passwords on open. The `BlockLayer` trait exposes `is_encrypted()` and the encryption/decryption is handled internally by L2.
 
 ### Verification chain not documented in API sections
 

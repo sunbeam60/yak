@@ -166,7 +166,7 @@ When the four layers instantiate for creation, they request through L1 a "header
 ```
 Magic: File magic header | header layout version | total layer header length
 L1: length | L1 identifier | L1 version
-L2: length | L2 identifier | L2 version | block size shift | block index size shift | free list head
+L2: length | L2 identifier | L2 version | block size shift | block index size shift | free list head | encryption flag | [additional encryption parameters]
 L3: length | L3 identifier | L3 version | Streams stream descriptor
 L4: length | L4 identifier | L4 version | root directory stream index
 ```
@@ -458,7 +458,43 @@ While this approach doesn't guarantee that all free blocks sit in run order in t
 L2 will often be requested to write and (especially) read the same block over and over again. This is most often the case when data is being written or read to a larger stream (i.e. a stream that must use redirector blocks) and the redirector blocks need constant access to locate the data in the stream. L2 therefore manages a write-through cache of blocks and it provides to L3 a way to use this write-through cache for some blocks, while not for others. As L3 writes or reads redirector blocks, it asks L2 to place and read these commonly accessed blocks in the write-through cache. Then, when L3 comes to read the redirector blocks, it is instead served from the in-memory cache and placed in the write-through cache before being written to disk. The actual data written/read to a stream circumvents the write-through cache, under the assumption that callers know what data they've placed in the SFS file (and therefore won't be asking the SFS file to read that data again) and, when reading, receive a copy of the data stream into their memory bufffer and therefore won't asking to read the same data again.
 
 ### Additional feature & additional complexity: Block encryption
-Occasionnally, the data stored in an SFS file will benefit from encryption. 
+Occasionnally, a caller may desire data stored in an SFS file to be encrypted. The default L2 implementation in SFS offers optional whole-file encryption for all data streams in an SFS file. 
+
+SFS intentionally takes a standard, industry-accepted approach towards encryption, but no one should trust their secrets to SFS’s implementation or hope that there no vulnerabilities; undoubtedly there are many. 
+
+When a block is requested by L3, L2 loads the block, decrypts it and returns it. When L2 is requested to store a block, L2 encrypts it and stores it back to disk. 
+
+L2 uses a block cache to return often used blocks quickly, which is typically used to store hot redirector paths. Blocks in this write-through cache are stored unencrypted in memory; only when they are written to the SFS file are they encrypted.
+
+Blocks are encrypted with a key that is then encrypted/decrypted with the caller’s key (AKA "wrapping") and the stored in the L2 header. This allows a password change in the SFS file without having to reencrypt all blocks. 
+
+The caller key is derived from the user’s password using Argon2id. The parameters for this derivation are also stored in the L2 header. SFS uses AES-XTS to encrypt each block, using the block number as the “tweak”. 
+
+To increase the computational cost for an attacker, all encryption is salted with a 16 byte salt, which is also stored in the header.
+
+When encryption is enabled in an SFS file, L2's header is extended to store all these parameters so that the full L2 header looks like this:
+
+| Field             | Size (bytes) | Notes                                                                                                           |
+| ----------------- | ------------ | --------------------------------------------------------------------------------------------------------------- |
+| Identifier        | 6            | ASCII "blocks" — identifies this as an L2 header                                                                |
+| Version           | 1            | Header layout version (currently 1)                                                                             |
+| Block size shift  | 1            | Block size = 2^shift bytes (e.g. 12 = 4 KiB)                                                                    |
+| Block index width | 1            | Bytes per block index (e.g. 4 = 32-bit indices)                                                                 |
+| Free list head    | 8            | Little-endian u64; index of first free block (sentinel = no free blocks)                                        |
+| Encryption flag   | 1            | 1 = encrypted, therefore L2's header is extended with fields below.                                             |
+| Salt              | 16           | Random salt for Argon2id key derivation                                                                         |
+| m_cost            | 4            | Argon2id memory cost parameter (little-endian u32)                                                              |
+| t_cost            | 4            | Argon2id time/iteration cost parameter (little-endian u32)                                                      |
+| p_cost            | 1            | Argon2id parallelism parameter (single byte; values above 255 are impractical)                                  |
+| Verification hash | 32           | SHA-256 hash of extra Argon2id-derived bytes; used for fast password verification without attempting key unwrap |
+| Wrapped key       | 72           | 64-byte AES-256-XTS master key wrapped with AES-256-KW (adds 8-byte integrity overhead)                         |
+| **Total**         | **18 / 147** | 18 bytes without encryption, 147 bytes with encryption                                                          |
+
+It is important to know that the entire header of an SFS file is not encrypted.
+
+Encryption and decryption is sped up using hardware instructions, where applicable. This often achieves a 20x speed up, although even with that, encrypted SFS files suffer a performance penalty (unencrypted SFS files tend to be around 3x faster than encrypted ones). 
+
+If encryption is enabled together with compression the runtime penalty is less than the penalty for encryption and the penalty for compression added together. This is because compression ensures there is less data to encrypt/decrypt.
 
 ### Thread safety in L2
 

@@ -394,79 +394,139 @@ fn batch_fill_leaf_redirectors<L2: BlockLayer>(
     Ok(())
 }
 
-/// Ensure the pyramid has enough blocks allocated to cover `target_data_blocks`.
-/// Grows the pyramid as needed (increasing depth, allocating redirectors and data blocks).
-/// Returns the (possibly updated) descriptor.
-fn ensure_capacity<L2: BlockLayer>(
-    layer2: &L2,
-    descriptor: &mut StreamDescriptor,
-    target_data_blocks: u64,
+// ---------------------------------------------------------------------------
+// PyramidOps trait — abstracts leaf-level differences between uncompressed
+// and compressed streams so structural operations (reserve, truncate,
+// ensure_capacity, tree deallocation) can be shared.
+// ---------------------------------------------------------------------------
+
+trait PyramidOps<L2: BlockLayer> {
+    /// Logical block size in bytes (block_size for uncompressed,
+    /// compressed_block_size for compressed).
+    fn logical_block_size(&self) -> usize;
+
+    /// How many logical blocks are needed for `size` bytes.
+    fn blocks_needed(&self, size: u64) -> u64;
+
+    /// Initialize a newly allocated block for use as a leaf-level entry.
+    fn init_leaf_block(&self, layer2: &L2, block: u64) -> Result<(), SfsError>;
+
+    /// Collect all physical blocks owned by a leaf slot value, for deallocation.
+    fn collect_leaf_blocks_for_dealloc(
+        &self,
+        layer2: &L2,
+        leaf_value: u64,
+        blocks: &mut Vec<u64>,
+    ) -> Result<(), SfsError>;
+
+    /// Collect all physical blocks owned by a leaf slot value, for verification.
+    /// Same as dealloc variant but reports errors via TreeCollector instead of
+    /// returning Result.
+    fn collect_leaf_blocks_verify(
+        &self,
+        layer2: &L2,
+        leaf_value: u64,
+        collector: &mut TreeCollector<'_>,
+    );
+}
+
+/// Uncompressed streams: leaf slots point directly to data blocks.
+struct UncompressedOps {
     block_size: usize,
-    fan_out: u64,
-    block_index_width: u8,
-) -> Result<(), SfsError> {
-    if target_data_blocks == 0 {
-        return Ok(());
+}
+
+impl<L2: BlockLayer> PyramidOps<L2> for UncompressedOps {
+    fn logical_block_size(&self) -> usize {
+        self.block_size
     }
 
-    let current_data_blocks = data_blocks_needed(descriptor.reserved, block_size);
-    let current_depth = pyramid_depth(current_data_blocks, fan_out);
-    let target_depth = pyramid_depth(target_data_blocks, fan_out);
+    fn blocks_needed(&self, size: u64) -> u64 {
+        size.div_ceil(self.block_size as u64)
+    }
 
-    // Handle empty stream: allocate first block
-    if descriptor.reserved == 0 && descriptor.top_block == 0 {
-        if target_depth == 0 {
-            // Just need a single data block
-            let block = layer2.allocate_block()?;
-            descriptor.top_block = block;
-            return Ok(());
-        } else {
-            // Need a redirector tree; start with one data block, then grow depth
-            let block = layer2.allocate_block()?;
-            descriptor.top_block = block;
-            // current state: depth 0, 1 data block. Grow depth below.
+    fn init_leaf_block(&self, _layer2: &L2, _block: u64) -> Result<(), SfsError> {
+        Ok(()) // Data blocks need no initialization
+    }
+
+    fn collect_leaf_blocks_for_dealloc(
+        &self,
+        _layer2: &L2,
+        leaf_value: u64,
+        blocks: &mut Vec<u64>,
+    ) -> Result<(), SfsError> {
+        blocks.push(leaf_value);
+        Ok(())
+    }
+
+    fn collect_leaf_blocks_verify(
+        &self,
+        _layer2: &L2,
+        leaf_value: u64,
+        collector: &mut TreeCollector<'_>,
+    ) {
+        collector.blocks.push(leaf_value);
+    }
+}
+
+/// Compressed streams: leaf slots point to compression redirector blocks,
+/// each of which references physical data blocks holding compressed data.
+struct CompressedOps {
+    block_size: usize,
+    compressed_block_size: usize,
+    block_index_width: u8,
+}
+
+impl<L2: BlockLayer> PyramidOps<L2> for CompressedOps {
+    fn logical_block_size(&self) -> usize {
+        self.compressed_block_size
+    }
+
+    fn blocks_needed(&self, size: u64) -> u64 {
+        size.div_ceil(self.compressed_block_size as u64)
+    }
+
+    fn init_leaf_block(&self, layer2: &L2, block: u64) -> Result<(), SfsError> {
+        // Initialize compression redirector with compressed_length=0
+        let zero_buf = [0u8; 4];
+        layer2.write_block(block, 0, &zero_buf, true)?;
+        Ok(())
+    }
+
+    fn collect_leaf_blocks_for_dealloc(
+        &self,
+        layer2: &L2,
+        leaf_value: u64,
+        blocks: &mut Vec<u64>,
+    ) -> Result<(), SfsError> {
+        let redir = read_comp_redir(layer2, leaf_value, self.block_size, self.block_index_width)?;
+        for &db in &redir.data_blocks {
+            blocks.push(db);
+        }
+        blocks.push(leaf_value);
+        Ok(())
+    }
+
+    fn collect_leaf_blocks_verify(
+        &self,
+        layer2: &L2,
+        leaf_value: u64,
+        collector: &mut TreeCollector<'_>,
+    ) {
+        collector.blocks.push(leaf_value);
+        match read_comp_redir(layer2, leaf_value, self.block_size, self.block_index_width) {
+            Ok(redir) => {
+                for &db in &redir.data_blocks {
+                    collector.blocks.push(db);
+                }
+            }
+            Err(e) => {
+                collector.issues.push(format!(
+                    "L3: stream {}: error reading comp redirector block {}: {}",
+                    collector.label, leaf_value, e
+                ));
+            }
         }
     }
-
-    // Grow depth if needed: wrap current top in new redirector layers
-    let effective_current_depth = if descriptor.reserved == 0 && current_data_blocks == 0 {
-        // We just allocated a top block above, so we're at depth 0
-        0
-    } else {
-        current_depth
-    };
-
-    let mut current_top = descriptor.top_block;
-    for _ in effective_current_depth..target_depth {
-        let new_redirector = layer2.allocate_block()?;
-        // Fill entire redirector with sentinels, then set slot 0 to old top
-        fill_sentinel(layer2, new_redirector, block_size, block_index_width)?;
-        write_block_index(layer2, new_redirector, 0, current_top, block_index_width)?;
-        current_top = new_redirector;
-    }
-    descriptor.top_block = current_top;
-
-    // Allocate missing data blocks (fill pyramid slots)
-    let effective_current = if current_data_blocks == 0 {
-        1
-    } else {
-        current_data_blocks
-    };
-    let blocks_needed = target_data_blocks - effective_current;
-    if blocks_needed > 0 {
-        let new_blocks = layer2.allocate_blocks(blocks_needed)?;
-        batch_fill_leaf_redirectors(
-            layer2,
-            descriptor,
-            &new_blocks,
-            effective_current,
-            fan_out,
-            block_index_width,
-            target_depth,
-        )?;
-    }
-
-    Ok(())
 }
 
 /// Read bytes from a stream described by `descriptor`, starting at `pos`.
@@ -581,6 +641,7 @@ fn pyramid_write<L2: BlockLayer>(
     let end_pos = pos + buf.len() as u64;
 
     // Ensure we have enough blocks for the write endpoint (or current size, whichever is larger)
+    let ops = UncompressedOps { block_size };
     pyramid_reserve(
         layer2,
         descriptor,
@@ -588,6 +649,7 @@ fn pyramid_write<L2: BlockLayer>(
         block_size,
         fan_out,
         block_index_width,
+        &ops,
     )?;
 
     let old_size = descriptor.size;
@@ -662,299 +724,11 @@ fn pyramid_write<L2: BlockLayer>(
     Ok(bytes_written)
 }
 
-/// Truncate a stream to `new_len` bytes. Deallocates unneeded blocks.
-fn pyramid_truncate<L2: BlockLayer>(
-    layer2: &L2,
-    descriptor: &mut StreamDescriptor,
-    new_len: u64,
-    block_size: usize,
-    fan_out: u64,
-    block_index_width: u8,
-) -> Result<(), SfsError> {
-    if new_len >= descriptor.size {
-        return Ok(());
-    }
-
-    if new_len == 0 {
-        // Deallocate everything
-        let capacity = descriptor.reserved.max(descriptor.size);
-        if capacity > 0 && descriptor.top_block != 0 {
-            let old_blocks = data_blocks_needed(capacity, block_size);
-            let old_depth = pyramid_depth(old_blocks, fan_out);
-            deallocate_tree(
-                layer2,
-                descriptor.top_block,
-                old_depth,
-                fan_out,
-                block_index_width,
-            )?;
-        }
-        descriptor.size = 0;
-        descriptor.top_block = 0;
-        descriptor.reserved = 0;
-        return Ok(());
-    }
-
-    let capacity = descriptor.reserved.max(descriptor.size);
-    let old_blocks = data_blocks_needed(capacity, block_size);
-    let new_blocks = data_blocks_needed(new_len, block_size);
-    let old_depth = pyramid_depth(old_blocks, fan_out);
-    let new_depth = pyramid_depth(new_blocks, fan_out);
-
-    // Deallocate excess data blocks (and their parent redirectors if empty)
-    if new_blocks < old_blocks {
-        deallocate_excess_blocks(
-            layer2,
-            descriptor.top_block,
-            old_depth,
-            new_blocks,
-            old_blocks,
-            fan_out,
-            block_index_width,
-        )?;
-    }
-
-    // Collapse depth if needed
-    let mut current_top = descriptor.top_block;
-    for _ in new_depth..old_depth {
-        // The current top is a redirector with only one used child (slot 0)
-        let child = read_block_index(layer2, current_top, 0, block_index_width)?;
-        layer2.deallocate_block(current_top)?;
-        current_top = child;
-    }
-    descriptor.top_block = current_top;
-    descriptor.size = new_len;
-    descriptor.reserved = new_blocks * block_size as u64;
-
-    Ok(())
-}
-
-/// Pre-allocate blocks so the stream can hold at least `n_bytes` without further allocation.
-/// Does not change the stream's logical size. Errors if `n_bytes < descriptor.size`.
-fn pyramid_reserve<L2: BlockLayer>(
-    layer2: &L2,
-    descriptor: &mut StreamDescriptor,
-    n_bytes: u64,
-    block_size: usize,
-    fan_out: u64,
-    block_index_width: u8,
-) -> Result<(), SfsError> {
-    if n_bytes < descriptor.size {
-        return Err(SfsError::IoError(format!(
-            "cannot reserve {} bytes: stream size is already {}",
-            n_bytes, descriptor.size
-        )));
-    }
-    if n_bytes <= descriptor.reserved {
-        return Ok(()); // Already have enough capacity
-    }
-    let target_blocks = data_blocks_needed(n_bytes, block_size);
-    ensure_capacity(
-        layer2,
-        descriptor,
-        target_blocks,
-        block_size,
-        fan_out,
-        block_index_width,
-    )?;
-    descriptor.reserved = target_blocks * block_size as u64;
-    Ok(())
-}
-
-/// Recursively collect all block IDs (data + redirector) in a pyramid tree.
-/// Used by `deallocate_tree` to batch-free all blocks in one call.
-fn collect_tree_blocks_for_dealloc<L2: BlockLayer>(
-    layer2: &L2,
-    block: u64,
-    depth: u32,
-    fan_out: u64,
-    block_index_width: u8,
-    blocks: &mut Vec<u64>,
-) -> Result<(), SfsError> {
-    blocks.push(block);
-    if depth == 0 {
-        return Ok(());
-    }
-    let sentinel = block_sentinel(block_index_width);
-    for slot in 0..fan_out {
-        let child = read_block_index(layer2, block, slot, block_index_width)?;
-        if child != sentinel {
-            collect_tree_blocks_for_dealloc(
-                layer2,
-                child,
-                depth - 1,
-                fan_out,
-                block_index_width,
-                blocks,
-            )?;
-        }
-    }
-    Ok(())
-}
-
-/// Deallocate all blocks in a tree rooted at `block` with given `depth`.
-/// Collects all block IDs first, then batch-deallocates them so the free list
-/// is written in sorted block order (maximising contiguous runs on re-allocation)
-/// with a single header persist.
-fn deallocate_tree<L2: BlockLayer>(
-    layer2: &L2,
-    block: u64,
-    depth: u32,
-    fan_out: u64,
-    block_index_width: u8,
-) -> Result<(), SfsError> {
-    let mut blocks = Vec::new();
-    collect_tree_blocks_for_dealloc(
-        layer2,
-        block,
-        depth,
-        fan_out,
-        block_index_width,
-        &mut blocks,
-    )?;
-    layer2.deallocate_blocks(&mut blocks)?;
-    Ok(())
-}
-
 /// Accumulator for collecting block IDs and issues during pyramid tree walks.
 struct TreeCollector<'a> {
     blocks: &'a mut Vec<u64>,
     issues: &'a mut Vec<String>,
     label: &'a str,
-}
-
-/// Recursively collect all block IDs in a pyramid tree (data + redirector blocks).
-/// Used by `verify` to enumerate all blocks belonging to a stream.
-fn collect_tree_blocks<L2: BlockLayer>(
-    layer2: &L2,
-    block: u64,
-    depth: u32,
-    fan_out: u64,
-    block_index_width: u8,
-    collector: &mut TreeCollector<'_>,
-) {
-    collector.blocks.push(block);
-
-    if depth == 0 {
-        return; // Data block, already collected
-    }
-
-    // Redirector block: recurse into children
-    for slot in 0..fan_out {
-        match read_block_index(layer2, block, slot, block_index_width) {
-            Ok(child) => {
-                if child != block_sentinel(block_index_width) {
-                    collect_tree_blocks(
-                        layer2,
-                        child,
-                        depth - 1,
-                        fan_out,
-                        block_index_width,
-                        collector,
-                    );
-                }
-            }
-            Err(e) => {
-                collector.issues.push(format!(
-                    "L3: stream {}: error reading redirector block {} slot {}: {}",
-                    collector.label, block, slot, e
-                ));
-            }
-        }
-    }
-}
-
-/// Deallocate data blocks from `keep_blocks` to `total_blocks - 1`,
-/// and any redirector blocks that become empty.
-fn deallocate_excess_blocks<L2: BlockLayer>(
-    layer2: &L2,
-    top_block: u64,
-    depth: u32,
-    keep_blocks: u64,
-    total_blocks: u64,
-    fan_out: u64,
-    block_index_width: u8,
-) -> Result<(), SfsError> {
-    for block_idx in keep_blocks..total_blocks {
-        // Navigate to the block and deallocate it
-        deallocate_data_block_at(
-            layer2,
-            top_block,
-            block_idx,
-            depth,
-            fan_out,
-            block_index_width,
-        )?;
-    }
-    Ok(())
-}
-
-/// Deallocate the data block at `data_block_idx` and mark its slot as INVALID.
-/// Also deallocates empty redirector blocks on the way back up.
-fn deallocate_data_block_at<L2: BlockLayer>(
-    layer2: &L2,
-    top_block: u64,
-    data_block_idx: u64,
-    depth: u32,
-    fan_out: u64,
-    block_index_width: u8,
-) -> Result<(), SfsError> {
-    if depth == 0 {
-        // Top is the data block itself - don't deallocate here, caller handles
-        return Ok(());
-    }
-
-    // Navigate to find the data block
-    let mut path: Vec<(u64, u64)> = Vec::new(); // (block, slot)
-    let mut current_block = top_block;
-    let mut remaining_idx = data_block_idx;
-
-    for level in (1..depth).rev() {
-        let span = fan_out.pow(level);
-        let slot = remaining_idx / span;
-        remaining_idx %= span;
-        path.push((current_block, slot));
-
-        let child = read_block_index(layer2, current_block, slot, block_index_width)?;
-        if child == block_sentinel(block_index_width) {
-            return Ok(()); // Already deallocated
-        }
-        current_block = child;
-    }
-
-    // current_block is the bottom redirector, remaining_idx is the slot
-    let slot = remaining_idx;
-    let data_block = read_block_index(layer2, current_block, slot, block_index_width)?;
-    if data_block == block_sentinel(block_index_width) {
-        return Ok(());
-    }
-
-    // Deallocate data block and mark slot
-    layer2.deallocate_block(data_block)?;
-    write_block_index(
-        layer2,
-        current_block,
-        slot,
-        block_sentinel(block_index_width),
-        block_index_width,
-    )?;
-
-    // Check if bottom redirector is now empty; if so, deallocate it and mark in parent
-    // We check all slots
-    if is_redirector_empty(layer2, current_block, fan_out, block_index_width)? {
-        layer2.deallocate_block(current_block)?;
-        if let Some(&(parent_block, parent_slot)) = path.last() {
-            write_block_index(
-                layer2,
-                parent_block,
-                parent_slot,
-                block_sentinel(block_index_width),
-                block_index_width,
-            )?;
-        }
-    }
-
-    Ok(())
 }
 
 /// Check if all slots in a redirector block are block_sentinel(block_index_width).
@@ -974,13 +748,375 @@ fn is_redirector_empty<L2: BlockLayer>(
 }
 
 // ---------------------------------------------------------------------------
+// Pyramid structural operations (parameterized by PyramidOps)
+// ---------------------------------------------------------------------------
+
+/// Recursively collect all block IDs in a pyramid tree for deallocation.
+/// At depth 0, delegates to `ops.collect_leaf_blocks_for_dealloc` to handle
+/// the leaf-level resource (data block or compression redirector + data blocks).
+fn collect_tree_blocks_for_dealloc<L2: BlockLayer, P: PyramidOps<L2>>(
+    layer2: &L2,
+    block: u64,
+    depth: u32,
+    fan_out: u64,
+    block_index_width: u8,
+    blocks: &mut Vec<u64>,
+    ops: &P,
+) -> Result<(), SfsError> {
+    if depth == 0 {
+        return ops.collect_leaf_blocks_for_dealloc(layer2, block, blocks);
+    }
+
+    // Pyramid redirector: recurse into children, then collect self
+    let sentinel = block_sentinel(block_index_width);
+    for slot in 0..fan_out {
+        let child = read_block_index(layer2, block, slot, block_index_width)?;
+        if child != sentinel {
+            collect_tree_blocks_for_dealloc(
+                layer2,
+                child,
+                depth - 1,
+                fan_out,
+                block_index_width,
+                blocks,
+                ops,
+            )?;
+        }
+    }
+    blocks.push(block);
+    Ok(())
+}
+
+/// Deallocate all blocks in a pyramid tree rooted at `block`.
+/// Collects all block IDs first, then batch-deallocates them so the free list
+/// is written in sorted order with a single header persist.
+fn deallocate_tree<L2: BlockLayer, P: PyramidOps<L2>>(
+    layer2: &L2,
+    block: u64,
+    depth: u32,
+    fan_out: u64,
+    block_index_width: u8,
+    ops: &P,
+) -> Result<(), SfsError> {
+    let mut blocks = Vec::new();
+    collect_tree_blocks_for_dealloc(
+        layer2,
+        block,
+        depth,
+        fan_out,
+        block_index_width,
+        &mut blocks,
+        ops,
+    )?;
+    layer2.deallocate_blocks(&mut blocks)?;
+    Ok(())
+}
+
+/// Recursively collect all block IDs in a pyramid tree for verification.
+/// At depth 0, delegates to `ops.collect_leaf_blocks_verify` to handle the
+/// leaf-level resource (data block or compression redirector + data blocks).
+fn collect_tree_blocks<L2: BlockLayer, P: PyramidOps<L2>>(
+    layer2: &L2,
+    block: u64,
+    depth: u32,
+    fan_out: u64,
+    block_index_width: u8,
+    collector: &mut TreeCollector<'_>,
+    ops: &P,
+) {
+    if depth == 0 {
+        ops.collect_leaf_blocks_verify(layer2, block, collector);
+        return;
+    }
+
+    // Pyramid redirector: collect self, then recurse into children
+    collector.blocks.push(block);
+    let sentinel = block_sentinel(block_index_width);
+    for slot in 0..fan_out {
+        match read_block_index(layer2, block, slot, block_index_width) {
+            Ok(child) => {
+                if child != sentinel {
+                    collect_tree_blocks(
+                        layer2,
+                        child,
+                        depth - 1,
+                        fan_out,
+                        block_index_width,
+                        collector,
+                        ops,
+                    );
+                }
+            }
+            Err(e) => {
+                collector.issues.push(format!(
+                    "L3: stream {}: error reading redirector block {} slot {}: {}",
+                    collector.label, block, slot, e
+                ));
+            }
+        }
+    }
+}
+
+/// Deallocate the leaf-level entry at `block_idx` and mark its leaf slot as
+/// sentinel. Also deallocates empty parent redirectors on the way back up.
+fn deallocate_slot_at<L2: BlockLayer, P: PyramidOps<L2>>(
+    layer2: &L2,
+    top_block: u64,
+    block_idx: u64,
+    depth: u32,
+    fan_out: u64,
+    block_index_width: u8,
+    ops: &P,
+) -> Result<(), SfsError> {
+    let sentinel = block_sentinel(block_index_width);
+
+    if depth == 0 {
+        // Top is the leaf entry itself — don't deallocate here, caller handles
+        return Ok(());
+    }
+
+    // Navigate to find the leaf entry
+    let mut path: Vec<(u64, u64)> = Vec::new(); // (block, slot)
+    let mut current_block = top_block;
+    let mut remaining_idx = block_idx;
+
+    for level in (1..depth).rev() {
+        let span = fan_out.pow(level);
+        let slot = remaining_idx / span;
+        remaining_idx %= span;
+        path.push((current_block, slot));
+
+        let child = read_block_index(layer2, current_block, slot, block_index_width)?;
+        if child == sentinel {
+            return Ok(()); // Already deallocated
+        }
+        current_block = child;
+    }
+
+    // current_block is the bottom (leaf) redirector, remaining_idx is the slot
+    let slot = remaining_idx;
+    let leaf_value = read_block_index(layer2, current_block, slot, block_index_width)?;
+    if leaf_value == sentinel {
+        return Ok(());
+    }
+
+    // Collect and deallocate all physical blocks owned by this leaf entry
+    let mut to_dealloc = Vec::new();
+    ops.collect_leaf_blocks_for_dealloc(layer2, leaf_value, &mut to_dealloc)?;
+    layer2.deallocate_blocks(&mut to_dealloc)?;
+
+    // Mark the leaf slot as sentinel
+    write_block_index(layer2, current_block, slot, sentinel, block_index_width)?;
+
+    // Check if leaf redirector is now empty; if so, deallocate it and mark in parent
+    if is_redirector_empty(layer2, current_block, fan_out, block_index_width)? {
+        layer2.deallocate_block(current_block)?;
+        if let Some(&(parent_block, parent_slot)) = path.last() {
+            write_block_index(
+                layer2,
+                parent_block,
+                parent_slot,
+                sentinel,
+                block_index_width,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Ensure the pyramid has enough slots for `target_blocks` leaf-level entries.
+/// Grows the pyramid as needed (increasing depth, allocating redirectors and
+/// leaf entries). Uses `ops.init_leaf_block` to initialize new leaf entries.
+fn ensure_capacity<L2: BlockLayer, P: PyramidOps<L2>>(
+    layer2: &L2,
+    descriptor: &mut StreamDescriptor,
+    target_blocks: u64,
+    block_size: usize,
+    fan_out: u64,
+    block_index_width: u8,
+    ops: &P,
+) -> Result<(), SfsError> {
+    if target_blocks == 0 {
+        return Ok(());
+    }
+
+    let current_blocks = ops.blocks_needed(descriptor.reserved);
+    let current_depth = pyramid_depth(current_blocks, fan_out);
+    let target_depth = pyramid_depth(target_blocks, fan_out);
+
+    // Handle empty stream: allocate first leaf entry
+    if descriptor.reserved == 0 && descriptor.top_block == 0 {
+        let block = layer2.allocate_block()?;
+        ops.init_leaf_block(layer2, block)?;
+        descriptor.top_block = block;
+
+        if target_blocks <= 1 {
+            return Ok(());
+        }
+    }
+
+    // Grow depth if needed: wrap current top in new redirector layers
+    let effective_current_depth = if descriptor.reserved == 0 && current_blocks == 0 {
+        0
+    } else {
+        current_depth
+    };
+
+    let mut current_top = descriptor.top_block;
+    for _ in effective_current_depth..target_depth {
+        let new_redirector = layer2.allocate_block()?;
+        fill_sentinel(layer2, new_redirector, block_size, block_index_width)?;
+        write_block_index(layer2, new_redirector, 0, current_top, block_index_width)?;
+        current_top = new_redirector;
+    }
+    descriptor.top_block = current_top;
+
+    // Allocate and initialize missing leaf entries
+    let effective_current = if current_blocks == 0 {
+        1
+    } else {
+        current_blocks
+    };
+    let blocks_needed = target_blocks - effective_current;
+    if blocks_needed > 0 {
+        let new_blocks = layer2.allocate_blocks(blocks_needed)?;
+
+        // Initialize each new leaf entry
+        for &block in &new_blocks {
+            ops.init_leaf_block(layer2, block)?;
+        }
+
+        // Fill leaf slots in the pyramid tree
+        batch_fill_leaf_redirectors(
+            layer2,
+            descriptor,
+            &new_blocks,
+            effective_current,
+            fan_out,
+            block_index_width,
+            target_depth,
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Pre-allocate capacity so the stream can hold at least `n_bytes`.
+/// Does not change the stream's logical size. Errors if `n_bytes < descriptor.size`.
+fn pyramid_reserve<L2: BlockLayer, P: PyramidOps<L2>>(
+    layer2: &L2,
+    descriptor: &mut StreamDescriptor,
+    n_bytes: u64,
+    block_size: usize,
+    fan_out: u64,
+    block_index_width: u8,
+    ops: &P,
+) -> Result<(), SfsError> {
+    if n_bytes < descriptor.size {
+        return Err(SfsError::IoError(format!(
+            "cannot reserve {} bytes: stream size is already {}",
+            n_bytes, descriptor.size
+        )));
+    }
+    if n_bytes <= descriptor.reserved {
+        return Ok(());
+    }
+
+    let lbs = ops.logical_block_size() as u64;
+    let target_blocks = ops.blocks_needed(n_bytes);
+
+    ensure_capacity(
+        layer2,
+        descriptor,
+        target_blocks,
+        block_size,
+        fan_out,
+        block_index_width,
+        ops,
+    )?;
+    descriptor.reserved = target_blocks * lbs;
+    Ok(())
+}
+
+/// Truncate stream to `new_len` bytes, deallocating excess leaf entries.
+fn pyramid_truncate<L2: BlockLayer, P: PyramidOps<L2>>(
+    layer2: &L2,
+    descriptor: &mut StreamDescriptor,
+    new_len: u64,
+    fan_out: u64,
+    block_index_width: u8,
+    ops: &P,
+) -> Result<(), SfsError> {
+    if new_len >= descriptor.size {
+        return Ok(());
+    }
+
+    let lbs = ops.logical_block_size() as u64;
+
+    if new_len == 0 {
+        let capacity = descriptor.reserved.max(descriptor.size);
+        if capacity > 0 && descriptor.top_block != 0 {
+            let old_blocks = ops.blocks_needed(capacity);
+            let old_depth = pyramid_depth(old_blocks, fan_out);
+            deallocate_tree(
+                layer2,
+                descriptor.top_block,
+                old_depth,
+                fan_out,
+                block_index_width,
+                ops,
+            )?;
+        }
+        descriptor.size = 0;
+        descriptor.top_block = 0;
+        descriptor.reserved = 0;
+        return Ok(());
+    }
+
+    let capacity = descriptor.reserved.max(descriptor.size);
+    let old_blocks = ops.blocks_needed(capacity);
+    let new_blocks = ops.blocks_needed(new_len);
+    let old_depth = pyramid_depth(old_blocks, fan_out);
+    let new_depth = pyramid_depth(new_blocks, fan_out);
+
+    // Deallocate excess leaf entries
+    if new_blocks < old_blocks {
+        for block_idx in new_blocks..old_blocks {
+            deallocate_slot_at(
+                layer2,
+                descriptor.top_block,
+                block_idx,
+                old_depth,
+                fan_out,
+                block_index_width,
+                ops,
+            )?;
+        }
+    }
+
+    // Collapse depth if needed
+    let mut current_top = descriptor.top_block;
+    for _ in new_depth..old_depth {
+        let child = read_block_index(layer2, current_top, 0, block_index_width)?;
+        layer2.deallocate_block(current_top)?;
+        current_top = child;
+    }
+    descriptor.top_block = current_top;
+    descriptor.size = new_len;
+    descriptor.reserved = new_blocks * lbs;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Compressed pyramid leaf cache
 // ---------------------------------------------------------------------------
 
 /// Reusable leaf-block cache for compressed pyramid traversal. Holds the
 /// cached leaf buffer and the leaf-start index so that consecutive lookups
 /// within the same leaf avoid re-navigating and re-reading the block.
-struct LeafCache {
+struct LeafCache  {
     cached_start: u64,
     buf: Vec<u8>,
 }
@@ -1047,8 +1183,7 @@ struct CompRedir {
 }
 
 /// Read a compression redirector from the given block.
-/// Reads the entire redirector in a single `read_block` call, mirroring
-/// `write_comp_redir` which writes the whole redirector in one call.
+/// Reads the entire redirector in a single `read_block` call.
 fn read_comp_redir<L2: BlockLayer>(
     layer2: &L2,
     redir_block: u64,
@@ -1084,29 +1219,6 @@ fn read_comp_redir<L2: BlockLayer>(
         compressed_length,
         data_blocks,
     })
-}
-
-/// Write a compression redirector to the given block.
-fn write_comp_redir<L2: BlockLayer>(
-    layer2: &L2,
-    redir_block: u64,
-    redir: &CompRedir,
-    block_index_width: u8,
-) -> Result<(), SfsError> {
-    let biw = block_index_width as usize;
-
-    // Build the redirector content in a single buffer for one write
-    let buf_size = 4 + redir.data_blocks.len() * biw;
-    let mut buf = vec![0u8; buf_size];
-    buf[0..4].copy_from_slice(&redir.compressed_length.to_le_bytes());
-    for (i, &block_ptr) in redir.data_blocks.iter().enumerate() {
-        let offset = 4 + i * biw;
-        let bytes = block_ptr.to_le_bytes();
-        buf[offset..offset + biw].copy_from_slice(&bytes[..biw]);
-    }
-
-    layer2.write_block(redir_block, 0, &buf, true)?;
-    Ok(())
 }
 
 /// Decompress the data described by a compression redirector into `out_buf`.
@@ -1310,6 +1422,7 @@ fn pyramid_read_compressed<L2: BlockLayer>(
         let cblock_idx = current_pos / compressed_block_size as u64;
         let offset_in_cblock = (current_pos % compressed_block_size as u64) as usize;
 
+        // find the physical redirector block for this compressed block index
         let redir_block = resolve_redir_block(
             layer2,
             descriptor,
@@ -1370,14 +1483,19 @@ fn pyramid_write_compressed<L2: BlockLayer>(
     let end_pos = pos + buf.len() as u64;
 
     // Ensure tree has enough capacity for the write endpoint
-    pyramid_reserve_compressed(
+    let comp_ops = CompressedOps {
+        block_size,
+        compressed_block_size,
+        block_index_width,
+    };
+    pyramid_reserve(
         layer2,
         descriptor,
         end_pos.max(descriptor.size),
         block_size,
-        compressed_block_size,
         fan_out,
         block_index_width,
+        &comp_ops,
     )?;
 
     let old_size = descriptor.size;
@@ -1463,413 +1581,6 @@ fn pyramid_write_compressed<L2: BlockLayer>(
     descriptor.size = actual_end.max(old_size);
 
     Ok(bytes_written)
-}
-
-/// Pre-allocate compressed stream capacity. Grows the tree and allocates
-/// compression redirector blocks (initialized with compressed_length=0).
-fn pyramid_reserve_compressed<L2: BlockLayer>(
-    layer2: &L2,
-    descriptor: &mut StreamDescriptor,
-    n_bytes: u64,
-    block_size: usize,
-    compressed_block_size: usize,
-    fan_out: u64,
-    block_index_width: u8,
-) -> Result<(), SfsError> {
-    if n_bytes < descriptor.size {
-        return Err(SfsError::IoError(format!(
-            "cannot reserve {} bytes: stream size is already {}",
-            n_bytes, descriptor.size
-        )));
-    }
-    if n_bytes <= descriptor.reserved {
-        return Ok(());
-    }
-
-    let target_cblocks = compressed_blocks_needed(n_bytes, compressed_block_size);
-
-    ensure_capacity_compressed(
-        layer2,
-        descriptor,
-        target_cblocks,
-        block_size,
-        compressed_block_size,
-        fan_out,
-        block_index_width,
-    )?;
-    descriptor.reserved = target_cblocks * compressed_block_size as u64;
-    Ok(())
-}
-
-/// Grow the compressed pyramid to support `target_cblocks` compressed blocks.
-/// Allocates compression redirector blocks (one per new compressed block),
-/// each initialized with compressed_length=0.
-fn ensure_capacity_compressed<L2: BlockLayer>(
-    layer2: &L2,
-    descriptor: &mut StreamDescriptor,
-    target_cblocks: u64,
-    block_size: usize,
-    compressed_block_size: usize,
-    fan_out: u64,
-    block_index_width: u8,
-) -> Result<(), SfsError> {
-    if target_cblocks == 0 {
-        return Ok(());
-    }
-
-    let current_cblocks = compressed_blocks_needed(descriptor.reserved, compressed_block_size);
-    let current_depth = pyramid_depth(current_cblocks, fan_out);
-    let target_depth = pyramid_depth(target_cblocks, fan_out);
-
-    // Handle empty stream: allocate first compression redirector block
-    if descriptor.reserved == 0 && descriptor.top_block == 0 {
-        let redir_block = layer2.allocate_block()?;
-        // Initialize with compressed_length=0
-        let zero_redir = CompRedir {
-            compressed_length: 0,
-            data_blocks: Vec::new(),
-        };
-        write_comp_redir(layer2, redir_block, &zero_redir, block_index_width)?;
-        descriptor.top_block = redir_block;
-
-        if target_cblocks <= 1 {
-            return Ok(());
-        }
-    }
-
-    // Grow depth if needed: wrap current top in new redirector layers
-    let effective_current_depth = if descriptor.reserved == 0 && current_cblocks == 0 {
-        0
-    } else {
-        current_depth
-    };
-
-    let mut current_top = descriptor.top_block;
-    for _ in effective_current_depth..target_depth {
-        let new_redirector = layer2.allocate_block()?;
-        fill_sentinel(layer2, new_redirector, block_size, block_index_width)?;
-        write_block_index(layer2, new_redirector, 0, current_top, block_index_width)?;
-        current_top = new_redirector;
-    }
-    descriptor.top_block = current_top;
-
-    // Allocate missing compression redirector blocks
-    let effective_current = if current_cblocks == 0 {
-        1
-    } else {
-        current_cblocks
-    };
-    let redirs_needed = target_cblocks - effective_current;
-    if redirs_needed > 0 {
-        let new_redir_blocks = layer2.allocate_blocks(redirs_needed)?;
-
-        // Initialize each compression redirector with compressed_length=0
-        // (4 zero bytes at offset 0 is sufficient)
-        let zero_buf = [0u8; 4];
-        for &rb in &new_redir_blocks {
-            layer2.write_block(rb, 0, &zero_buf, true)?;
-        }
-
-        // Fill leaf slots in the pyramid tree
-        batch_fill_leaf_redirectors(
-            layer2,
-            descriptor,
-            &new_redir_blocks,
-            effective_current,
-            fan_out,
-            block_index_width,
-            target_depth,
-        )?;
-    }
-
-    Ok(())
-}
-
-/// Truncate a compressed stream. Deallocates compressed blocks beyond `new_len`,
-/// including their compression redirectors and physical data blocks.
-fn pyramid_truncate_compressed<L2: BlockLayer>(
-    layer2: &L2,
-    descriptor: &mut StreamDescriptor,
-    new_len: u64,
-    block_size: usize,
-    compressed_block_size: usize,
-    fan_out: u64,
-    block_index_width: u8,
-) -> Result<(), SfsError> {
-    if new_len >= descriptor.size {
-        return Ok(());
-    }
-
-    if new_len == 0 {
-        // Deallocate the entire compressed tree
-        let capacity = descriptor.reserved.max(descriptor.size);
-        if capacity > 0 && descriptor.top_block != 0 {
-            let old_cblocks = compressed_blocks_needed(capacity, compressed_block_size);
-            let old_depth = pyramid_depth(old_cblocks, fan_out);
-            deallocate_compressed_tree(
-                layer2,
-                descriptor.top_block,
-                old_depth,
-                block_size,
-                fan_out,
-                block_index_width,
-            )?;
-        }
-        descriptor.size = 0;
-        descriptor.top_block = 0;
-        descriptor.reserved = 0;
-        return Ok(());
-    }
-
-    let capacity = descriptor.reserved.max(descriptor.size);
-    let old_cblocks = compressed_blocks_needed(capacity, compressed_block_size);
-    let new_cblocks = compressed_blocks_needed(new_len, compressed_block_size);
-    let old_depth = pyramid_depth(old_cblocks, fan_out);
-    let new_depth = pyramid_depth(new_cblocks, fan_out);
-
-    // Deallocate excess compressed blocks (their redirectors + data blocks)
-    if new_cblocks < old_cblocks {
-        deallocate_excess_compressed_blocks(
-            layer2,
-            descriptor.top_block,
-            old_depth,
-            new_cblocks,
-            old_cblocks,
-            fan_out,
-            block_index_width,
-        )?;
-    }
-
-    // Collapse depth if needed
-    let mut current_top = descriptor.top_block;
-    for _ in new_depth..old_depth {
-        let child = read_block_index(layer2, current_top, 0, block_index_width)?;
-        layer2.deallocate_block(current_top)?;
-        current_top = child;
-    }
-    descriptor.top_block = current_top;
-    descriptor.size = new_len;
-    descriptor.reserved = new_cblocks * compressed_block_size as u64;
-
-    Ok(())
-}
-
-/// Deallocate all blocks in a compressed tree (redirectors + their physical data blocks).
-fn deallocate_compressed_tree<L2: BlockLayer>(
-    layer2: &L2,
-    block: u64,
-    depth: u32,
-    block_size: usize,
-    fan_out: u64,
-    block_index_width: u8,
-) -> Result<(), SfsError> {
-    let mut blocks = Vec::new();
-    collect_compressed_tree_blocks_for_dealloc(
-        layer2,
-        block,
-        depth,
-        block_size,
-        fan_out,
-        block_index_width,
-        &mut blocks,
-    )?;
-    layer2.deallocate_blocks(&mut blocks)?;
-    Ok(())
-}
-
-/// Recursively collect all block IDs in a compressed pyramid tree:
-/// redirector blocks, compression redirector blocks, and their physical data blocks.
-fn collect_compressed_tree_blocks_for_dealloc<L2: BlockLayer>(
-    layer2: &L2,
-    block: u64,
-    depth: u32,
-    block_size: usize,
-    fan_out: u64,
-    block_index_width: u8,
-    blocks: &mut Vec<u64>,
-) -> Result<(), SfsError> {
-    if depth == 0 {
-        // This is a compression redirector block at the leaf level.
-        // Collect its data blocks, then the redirector itself.
-        let redir = read_comp_redir(layer2, block, block_size, block_index_width)?;
-        for &db in &redir.data_blocks {
-            blocks.push(db);
-        }
-        blocks.push(block);
-        return Ok(());
-    }
-
-    // Pyramid redirector: recurse into children
-    let sentinel = block_sentinel(block_index_width);
-    for slot in 0..fan_out {
-        let child = read_block_index(layer2, block, slot, block_index_width)?;
-        if child != sentinel {
-            collect_compressed_tree_blocks_for_dealloc(
-                layer2,
-                child,
-                depth - 1,
-                block_size,
-                fan_out,
-                block_index_width,
-                blocks,
-            )?;
-        }
-    }
-    blocks.push(block);
-    Ok(())
-}
-
-/// Collect all block IDs in a compressed tree for verification purposes.
-fn collect_compressed_tree_blocks<L2: BlockLayer>(
-    layer2: &L2,
-    block: u64,
-    depth: u32,
-    block_size: usize,
-    fan_out: u64,
-    block_index_width: u8,
-    collector: &mut TreeCollector<'_>,
-) {
-    if depth == 0 {
-        // Compression redirector block
-        collector.blocks.push(block);
-        match read_comp_redir(layer2, block, block_size, block_index_width) {
-            Ok(redir) => {
-                for &db in &redir.data_blocks {
-                    collector.blocks.push(db);
-                }
-            }
-            Err(e) => {
-                collector.issues.push(format!(
-                    "L3: stream {}: error reading comp redirector block {}: {}",
-                    collector.label, block, e
-                ));
-            }
-        }
-        return;
-    }
-
-    // Pyramid redirector: recurse into children
-    collector.blocks.push(block);
-    let sentinel = block_sentinel(block_index_width);
-    for slot in 0..fan_out {
-        match read_block_index(layer2, block, slot, block_index_width) {
-            Ok(child) => {
-                if child != sentinel {
-                    collect_compressed_tree_blocks(
-                        layer2,
-                        child,
-                        depth - 1,
-                        block_size,
-                        fan_out,
-                        block_index_width,
-                        collector,
-                    );
-                }
-            }
-            Err(e) => {
-                collector.issues.push(format!(
-                    "L3: stream {}: error reading redirector block {} slot {}: {}",
-                    collector.label, block, slot, e
-                ));
-            }
-        }
-    }
-}
-
-/// Deallocate excess compressed compressed blocks from `keep_cblocks` to `total_cblocks - 1`.
-fn deallocate_excess_compressed_blocks<L2: BlockLayer>(
-    layer2: &L2,
-    top_block: u64,
-    depth: u32,
-    keep_cblocks: u64,
-    total_cblocks: u64,
-    fan_out: u64,
-    block_index_width: u8,
-) -> Result<(), SfsError> {
-    let block_size = layer2.block_size();
-    for cblock_idx in keep_cblocks..total_cblocks {
-        deallocate_cblock_at(
-            layer2,
-            top_block,
-            cblock_idx,
-            depth,
-            block_size,
-            fan_out,
-            block_index_width,
-        )?;
-    }
-    Ok(())
-}
-
-/// Deallocate a single compressed compressed block: free its physical data blocks,
-/// free the compression redirector block, and sentinel the leaf slot.
-fn deallocate_cblock_at<L2: BlockLayer>(
-    layer2: &L2,
-    top_block: u64,
-    cblock_idx: u64,
-    depth: u32,
-    block_size: usize,
-    fan_out: u64,
-    block_index_width: u8,
-) -> Result<(), SfsError> {
-    let sentinel = block_sentinel(block_index_width);
-
-    if depth == 0 {
-        // top_block IS the comp redirector — don't deallocate here, caller handles
-        return Ok(());
-    }
-
-    // Navigate to find the compression redirector block
-    let mut path: Vec<(u64, u64)> = Vec::new(); // (block, slot)
-    let mut current_block = top_block;
-    let mut remaining_idx = cblock_idx;
-
-    for level in (1..depth).rev() {
-        let span = fan_out.pow(level);
-        let slot = remaining_idx / span;
-        remaining_idx %= span;
-        path.push((current_block, slot));
-
-        let child = read_block_index(layer2, current_block, slot, block_index_width)?;
-        if child == sentinel {
-            return Ok(()); // Already deallocated
-        }
-        current_block = child;
-    }
-
-    // current_block is the bottom (leaf) redirector, remaining_idx is the slot
-    let slot = remaining_idx;
-    let redir_block = read_block_index(layer2, current_block, slot, block_index_width)?;
-    if redir_block == sentinel {
-        return Ok(());
-    }
-
-    // Read the compression redirector to find its physical data blocks
-    let redir = read_comp_redir(layer2, redir_block, block_size, block_index_width)?;
-
-    // Collect all blocks to deallocate: data blocks + the redirector itself
-    let mut to_dealloc = redir.data_blocks;
-    to_dealloc.push(redir_block);
-    layer2.deallocate_blocks(&mut to_dealloc)?;
-
-    // Mark the leaf slot as sentinel
-    write_block_index(layer2, current_block, slot, sentinel, block_index_width)?;
-
-    // Check if leaf redirector is now empty
-    if is_redirector_empty(layer2, current_block, fan_out, block_index_width)? {
-        layer2.deallocate_block(current_block)?;
-        if let Some(&(parent_block, parent_slot)) = path.last() {
-            write_block_index(
-                layer2,
-                parent_block,
-                parent_slot,
-                sentinel,
-                block_index_width,
-            )?;
-        }
-    }
-
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2414,13 +2125,19 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
                 let biw = self.block_index_width_val();
                 if desc.is_compressed() {
                     let cbs = 1usize << self.compressed_block_size_shift;
+                    let ops = CompressedOps {
+                        block_size: bs,
+                        compressed_block_size: cbs,
+                        block_index_width: biw,
+                    };
                     let num_cblocks = compressed_blocks_needed(capacity, cbs);
                     let depth = pyramid_depth(num_cblocks, fo);
-                    deallocate_compressed_tree(&self.layer2, desc.top_block, depth, bs, fo, biw)?;
+                    deallocate_tree(&self.layer2, desc.top_block, depth, fo, biw, &ops)?;
                 } else {
+                    let ops = UncompressedOps { block_size: bs };
                     let num_blocks = data_blocks_needed(capacity, bs);
                     let depth = pyramid_depth(num_blocks, fo);
-                    deallocate_tree(&self.layer2, desc.top_block, depth, fo, biw)?;
+                    deallocate_tree(&self.layer2, desc.top_block, depth, fo, biw, &ops)?;
                 }
             }
 
@@ -2529,9 +2246,15 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
         let biw = self.block_index_width_val();
         if desc.is_compressed() {
             let cbs = 1usize << self.compressed_block_size_shift;
-            pyramid_truncate_compressed(&self.layer2, &mut desc, new_len, bs, cbs, fo, biw)?;
+            let ops = CompressedOps {
+                block_size: bs,
+                compressed_block_size: cbs,
+                block_index_width: biw,
+            };
+            pyramid_truncate(&self.layer2, &mut desc, new_len, fo, biw, &ops)?;
         } else {
-            pyramid_truncate(&self.layer2, &mut desc, new_len, bs, fo, biw)?;
+            let ops = UncompressedOps { block_size: bs };
+            pyramid_truncate(&self.layer2, &mut desc, new_len, fo, biw, &ops)?;
         }
 
         // Update cached descriptor
@@ -2564,9 +2287,15 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
         let biw = self.block_index_width_val();
         if desc.is_compressed() {
             let cbs = 1usize << self.compressed_block_size_shift;
-            pyramid_reserve_compressed(&self.layer2, &mut desc, n_bytes, bs, cbs, fo, biw)?;
+            let ops = CompressedOps {
+                block_size: bs,
+                compressed_block_size: cbs,
+                block_index_width: biw,
+            };
+            pyramid_reserve(&self.layer2, &mut desc, n_bytes, bs, fo, biw, &ops)?;
         } else {
-            pyramid_reserve(&self.layer2, &mut desc, n_bytes, bs, fo, biw)?;
+            let ops = UncompressedOps { block_size: bs };
+            pyramid_reserve(&self.layer2, &mut desc, n_bytes, bs, fo, biw, &ops)?;
         }
 
         // Update cached descriptor
@@ -2623,6 +2352,7 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
 
         // 2. Collect blocks belonging to the Streams stream itself
         if streams_desc.size > 0 {
+            let uc_ops = UncompressedOps { block_size: bs };
             let num_blocks = data_blocks_needed(streams_desc.size, bs);
             let depth = pyramid_depth(num_blocks, fo);
             let mut collector = TreeCollector {
@@ -2637,6 +2367,7 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
                 fo,
                 biw,
                 &mut collector,
+                &uc_ops,
             );
         }
 
@@ -2676,18 +2407,24 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
                             };
                             if desc.is_compressed() {
                                 let cbs = 1usize << self.compressed_block_size_shift;
+                                let ops = CompressedOps {
+                                    block_size: bs,
+                                    compressed_block_size: cbs,
+                                    block_index_width: biw,
+                                };
                                 let num_cblocks = compressed_blocks_needed(capacity, cbs);
                                 let depth = pyramid_depth(num_cblocks, fo);
-                                collect_compressed_tree_blocks(
+                                collect_tree_blocks(
                                     &self.layer2,
                                     desc.top_block,
                                     depth,
-                                    bs,
                                     fo,
                                     biw,
                                     &mut collector,
+                                    &ops,
                                 );
                             } else {
+                                let uc_ops = UncompressedOps { block_size: bs };
                                 let num_blocks = data_blocks_needed(capacity, bs);
                                 let depth = pyramid_depth(num_blocks, fo);
                                 collect_tree_blocks(
@@ -2697,6 +2434,7 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
                                     fo,
                                     biw,
                                     &mut collector,
+                                    &uc_ops,
                                 );
                             }
                         }

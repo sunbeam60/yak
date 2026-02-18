@@ -1,8 +1,8 @@
-use pyo3::prelude::*;
 use ::yak::{
     EntryType as RustEntryType, OpenMode as RustOpenMode, StreamHandle, YakDefault,
     YakError as RustYakError,
 };
+use pyo3::prelude::*;
 
 // ---------------------------------------------------------------------------
 // Error handling

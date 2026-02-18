@@ -93,6 +93,9 @@ jobs:
           fi
           cp "target/${{ matrix.target }}/release/libyak_c.a" "$STAGING/" 2>/dev/null || true
 
+          # C header
+          cp yak_c/include/yak_c.h "$STAGING/"
+
           # Licenses
           cp LICENSE-MIT LICENSE-APACHE "$STAGING/"
 
@@ -119,6 +122,9 @@ jobs:
           if (Test-Path "target/${{ matrix.target }}/release/yak_c.lib") {
             Copy-Item "target/${{ matrix.target }}/release/yak_c.lib" $staging/
           }
+
+          # C header
+          Copy-Item "yak_c/include/yak_c.h" $staging/
 
           # Licenses
           Copy-Item LICENSE-MIT, LICENSE-APACHE $staging/

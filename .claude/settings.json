@@ -1,7 +1,7 @@
 {
   "permissions": {
     "allow": [
-      "Read(//Users/BMADSEN/.local/bin/**)"
+      "Read(~/.local/bin/**)"
     ]
   }
 }

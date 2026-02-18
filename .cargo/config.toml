@@ -1,2 +1,15 @@
+# Enable ARMv8 AES crypto intrinsics on all aarch64 targets.
+# The `aes` crate (0.8+) requires `--cfg aes_armv8` to enable runtime detection
+# of hardware AES on ARM. Without this flag, ARM builds fall back to a pure
+# software implementation. See: https://docs.rs/aes/0.8.4/aes/
+#
+# On x86_64 the `aes` crate auto-detects AES-NI at runtime — no flags needed.
+
 [target.aarch64-apple-darwin]
 rustflags = ["-C", "target-cpu=native", "--cfg", "aes_armv8"]
+
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["--cfg", "aes_armv8"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["--cfg", "aes_armv8"]

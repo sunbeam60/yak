@@ -15,8 +15,9 @@ __pycache__/
 # macOS
 .DS_Store
 
-# Local VSCode settings (keep shared configs in repo)
+# Local settings (keep shared configs in repo)
 .vscode/settings.local.json
+.claude/settings.local.json
 
 # Temp/test directories
 /temp/

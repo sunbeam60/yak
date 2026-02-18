@@ -3,7 +3,7 @@ use aes::cipher::KeyInit;
 use aes::Aes256;
 use aes_kw::Kek;
 use argon2::Argon2;
-use rand::RngCore;
+use rand::RngExt;
 use sha2::{Digest, Sha256};
 use xts_mode::{get_tweak_default, Xts128};
 
@@ -112,11 +112,11 @@ pub(crate) fn create_encryption(
 ) -> Result<(EncryptionConfig, BlockCipher), YakError> {
     // Generate random salt (rand 0.8+ is cryptographically secure - uses ChaCha12Rng seeded with OsRng)
     let mut salt = [0u8; SALT_LEN];
-    rand::thread_rng().fill_bytes(&mut salt);
+    rand::rng().fill(&mut salt);
 
     // Generate random master key
     let mut master_key = [0u8; MASTER_KEY_LEN];
-    rand::thread_rng().fill_bytes(&mut master_key);
+    rand::rng().fill(&mut master_key);
 
     // Derive KEK + verification material
     let derived = derive_key_material(
@@ -320,10 +320,10 @@ mod tests {
         password: &[u8],
     ) -> Result<(EncryptionConfig, BlockCipher), YakError> {
         let mut salt = [0u8; SALT_LEN];
-        rand::thread_rng().fill_bytes(&mut salt);
+        rand::rng().fill(&mut salt);
 
         let mut master_key = [0u8; MASTER_KEY_LEN];
-        rand::thread_rng().fill_bytes(&mut master_key);
+        rand::rng().fill(&mut master_key);
 
         // Fast params for testing
         let m_cost = 256; // 256 KiB — minimal for Argon2id

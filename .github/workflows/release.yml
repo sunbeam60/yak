@@ -76,7 +76,7 @@ jobs:
           sudo apt-get install -y gcc-aarch64-linux-gnu
 
       - name: Build release binaries
-        run: cargo build --release --workspace --target ${{ matrix.target }}
+        run: cargo build --release --workspace --exclude yak_python --target ${{ matrix.target }}
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
 

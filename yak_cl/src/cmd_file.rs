@@ -1,10 +1,7 @@
-use yak::{OpenMode, YakDefault as Yak};
+use yak::{CreateOptions, OpenMode, YakDefault as Yak, YakError};
 
 use crate::error::{CliError, CliResult};
-use crate::helpers::{
-    close_yak, expect_args, open_yak, resolve_password_create, DEFAULT_BLOCK_INDEX_WIDTH,
-    DEFAULT_BLOCK_SIZE_SHIFT,
-};
+use crate::helpers::{close_yak, expect_args, open_yak, resolve_password, resolve_password_create};
 
 pub fn cmd_create(args: &[String]) -> CliResult {
     if args.is_empty() {
@@ -41,33 +38,20 @@ pub fn cmd_create(args: &[String]) -> CliResult {
         i += 1;
     }
 
-    let yak = if encrypted {
-        let password = resolve_password_create()?;
-        let pw = password.as_bytes();
-        match cbss {
-            Some(v) => Yak::create_encrypted_with_cbss(
-                path,
-                DEFAULT_BLOCK_INDEX_WIDTH,
-                DEFAULT_BLOCK_SIZE_SHIFT,
-                v,
-                pw,
-            ),
-            None => Yak::create_encrypted(
-                path,
-                DEFAULT_BLOCK_INDEX_WIDTH,
-                DEFAULT_BLOCK_SIZE_SHIFT,
-                pw,
-            ),
-        }
+    let password_string = if encrypted {
+        Some(resolve_password_create()?)
     } else {
-        match cbss {
-            Some(v) => {
-                Yak::create_with_cbss(path, DEFAULT_BLOCK_INDEX_WIDTH, DEFAULT_BLOCK_SIZE_SHIFT, v)
-            }
-            None => Yak::create(path, DEFAULT_BLOCK_INDEX_WIDTH, DEFAULT_BLOCK_SIZE_SHIFT),
-        }
+        None
+    };
+
+    let mut opts = CreateOptions::default();
+    if let Some(v) = cbss {
+        opts.compressed_block_size_shift = v;
     }
-    .map_err(|e| CliError::new(format!("Error creating Yak file: {}", e)))?;
+    opts.password = password_string.as_deref().map(str::as_bytes);
+
+    let yak = Yak::create(path, opts)
+        .map_err(|e| CliError::new(format!("Error creating Yak file: {}", e)))?;
 
     close_yak(yak)?;
     let enc_label = if encrypted { " (encrypted)" } else { "" };
@@ -144,4 +128,58 @@ pub fn cmd_info(args: &[String]) -> CliResult {
 
     let _ = sfs.close_stream(handle);
     close_yak(sfs)
+}
+
+pub fn cmd_optimize(args: &[String]) -> CliResult {
+    if args.is_empty() {
+        return Err(CliError::new(
+            "Usage: yak optimize <yak-file> [--encrypted]",
+        ));
+    }
+
+    let path = &args[0];
+    let mut encrypted = false;
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--encrypted" => encrypted = true,
+            other => {
+                return Err(CliError::new(format!(
+                    "Unknown option: {}. Usage: yak optimize <yak-file> [--encrypted]",
+                    other
+                )));
+            }
+        }
+        i += 1;
+    }
+
+    // Resolve password: auto-detect encryption if --encrypted not given
+    let password_string = if encrypted {
+        Some(resolve_password()?)
+    } else {
+        // Try without password first; if the file is encrypted, prompt
+        match Yak::optimize(path, None) {
+            Ok(saved) => {
+                print_optimize_result(path, saved);
+                return Ok(());
+            }
+            Err(YakError::EncryptionRequired(_)) => Some(resolve_password()?),
+            Err(e) => return Err(CliError::new(format!("Error optimizing Yak file: {}", e))),
+        }
+    };
+
+    let saved = Yak::optimize(path, password_string.as_deref().map(str::as_bytes))
+        .map_err(|e| CliError::new(format!("Error optimizing Yak file: {}", e)))?;
+
+    print_optimize_result(path, saved);
+    Ok(())
+}
+
+fn print_optimize_result(path: &str, saved: u64) {
+    if saved > 0 {
+        println!("Optimized {}: saved {} bytes", path, saved);
+    } else {
+        println!("Optimized {}: file was already compact", path);
+    }
 }

@@ -1,5 +1,5 @@
 use ::yak::{
-    EntryType as RustEntryType, OpenMode as RustOpenMode, StreamHandle, YakDefault,
+    CreateOptions, EntryType as RustEntryType, OpenMode as RustOpenMode, StreamHandle, YakDefault,
     YakError as RustYakError,
 };
 use pyo3::prelude::*;
@@ -105,8 +105,7 @@ impl Yak {
     // -- Lifecycle -----------------------------------------------------------
 
     /// Create a new Yak file. Compression support is always enabled.
-    /// If `compressed_block_size_shift` is None, defaults to block_size_shift + 3
-    /// (8x the physical block size).
+    /// If `compressed_block_size_shift` is None, uses the default (15 = 32 KB).
     /// If `password` is provided, the file is encrypted with AES-XTS.
     #[staticmethod]
     #[pyo3(signature = (path, block_index_width=4, block_size_shift=12, compressed_block_size_shift=None, password=None))]
@@ -120,22 +119,19 @@ impl Yak {
     ) -> PyResult<Self> {
         let path = path.to_owned();
         let pw: Option<Vec<u8>> = password.map(|p| p.to_vec());
+        let defaults = CreateOptions::default();
+        let cbss = compressed_block_size_shift.unwrap_or(defaults.compressed_block_size_shift);
         let inner = py
-            .detach(move || match (compressed_block_size_shift, pw.as_deref()) {
-                (Some(cbss), Some(pw)) => YakDefault::create_encrypted_with_cbss(
+            .detach(move || {
+                YakDefault::create(
                     &path,
-                    block_index_width,
-                    block_size_shift,
-                    cbss,
-                    pw,
-                ),
-                (Some(cbss), None) => {
-                    YakDefault::create_with_cbss(&path, block_index_width, block_size_shift, cbss)
-                }
-                (None, Some(pw)) => {
-                    YakDefault::create_encrypted(&path, block_index_width, block_size_shift, pw)
-                }
-                (None, None) => YakDefault::create(&path, block_index_width, block_size_shift),
+                    CreateOptions {
+                        block_index_width,
+                        block_size_shift,
+                        compressed_block_size_shift: cbss,
+                        password: pw.as_deref(),
+                    },
+                )
             })
             .map_err(to_py_err)?;
         Ok(Yak { inner: Some(inner) })
@@ -316,6 +312,21 @@ impl Yak {
     fn verify(&self, py: Python<'_>) -> PyResult<Vec<String>> {
         let inner = self.get()?;
         py.detach(|| inner.verify()).map_err(to_py_err)
+    }
+
+    // -- Compaction ----------------------------------------------------------
+
+    /// Optimize a Yak file by rewriting it without free blocks.
+    /// Removes free blocks and rewrites streams contiguously for maximum locality.
+    /// Returns the number of bytes reclaimed.
+    /// For encrypted files, the password must be provided.
+    #[staticmethod]
+    #[pyo3(signature = (path, password=None))]
+    fn optimize(py: Python<'_>, path: &str, password: Option<&[u8]>) -> PyResult<u64> {
+        let path = path.to_owned();
+        let pw: Option<Vec<u8>> = password.map(|p| p.to_vec());
+        py.detach(move || YakDefault::optimize(&path, pw.as_deref()))
+            .map_err(to_py_err)
     }
 }
 

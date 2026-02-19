@@ -282,56 +282,57 @@ pub struct Yak<L3: StreamLayer> {
     state: Mutex<YakState<L3::Handle>>,
 }
 
+/// Options for creating a new Yak file.
+///
+/// Defaults: 4-byte block indices, 4 KB blocks (shift 12),
+/// 32 KB compressed blocks (shift 15), no encryption.
+pub struct CreateOptions<'a> {
+    /// Number of bytes used for block indices on disk (e.g. 2, 4, or 8).
+    pub block_index_width: u8,
+    /// Power-of-2 exponent for block size (e.g. 12 → 4096 bytes).
+    pub block_size_shift: u8,
+    /// Power-of-2 exponent for compressed block size (e.g. 15 → 32768 bytes).
+    /// Must be >= `block_size_shift` and should be 3 exponents higher for
+    /// good compression efficiency.
+    pub compressed_block_size_shift: u8,
+    /// Optional password for AES-XTS encryption. `None` = no encryption.
+    pub password: Option<&'a [u8]>,
+}
+
+impl Default for CreateOptions<'_> {
+    fn default() -> Self {
+        Self {
+            block_index_width: 4,
+            block_size_shift: 12,
+            compressed_block_size_shift: 15,
+            password: None,
+        }
+    }
+}
+
 impl<L3: StreamLayer> Yak<L3> {
     // -------------------------------------------------------------------
     // Yak file lifecycle
     // -------------------------------------------------------------------
 
-    /// Default offset from block_size_shift to compressed_block_size_shift.
-    /// cbss = bss + 3 gives compressed blocks that are 8x the physical block size
-    /// (e.g. bss=12 → 4KB blocks, cbss=15 → 32KB compressed blocks).
-    const DEFAULT_CBSS_OFFSET: u8 = 3;
-
-    /// Create a new Yak file. Compression support is always enabled.
+    /// Create a new Yak file.
     ///
-    /// `block_index_width` is the number of bytes used for block indices
-    /// on disk (e.g. 2, 4, or 8).
-    /// `block_size_shift` is the power-of-2 exponent for block size
-    /// (e.g. 12 → 4096 bytes).
-    /// The compressed block size defaults to 8x the physical block size
-    /// (bss + 3). Use `create_with_cbss` to override.
-    pub fn create(
-        path: &str,
-        block_index_width: u8,
-        block_size_shift: u8,
-    ) -> Result<Self, YakError> {
-        let cbss = block_size_shift.saturating_add(Self::DEFAULT_CBSS_OFFSET);
-        Self::create_inner(path, block_index_width, block_size_shift, cbss, None)
-    }
-
-    /// Create a new Yak file with a specific compressed block size shift.
-    ///
-    /// `compressed_block_size_shift` is the power-of-2 exponent for the
-    /// compressed block size used by compressed streams (e.g. 15 → 32768 bytes).
-    /// Must be >= `block_size_shift`.
-    pub fn create_with_cbss(
-        path: &str,
-        block_index_width: u8,
-        block_size_shift: u8,
-        compressed_block_size_shift: u8,
-    ) -> Result<Self, YakError> {
-        if compressed_block_size_shift < block_size_shift {
+    /// See [`CreateOptions`] for available configuration. Use
+    /// `CreateOptions::default()` for 4-byte indices, 4 KB blocks,
+    /// 32 KB compressed blocks, no encryption.
+    pub fn create(path: &str, opts: CreateOptions) -> Result<Self, YakError> {
+        if opts.compressed_block_size_shift < opts.block_size_shift {
             return Err(YakError::IoError(format!(
                 "compressed_block_size_shift ({}) must be >= block_size_shift ({})",
-                compressed_block_size_shift, block_size_shift
+                opts.compressed_block_size_shift, opts.block_size_shift
             )));
         }
         Self::create_inner(
             path,
-            block_index_width,
-            block_size_shift,
-            compressed_block_size_shift,
-            None,
+            opts.block_index_width,
+            opts.block_size_shift,
+            opts.compressed_block_size_shift,
+            opts.password,
         )
     }
 
@@ -550,57 +551,117 @@ impl<L3: StreamLayer> Yak<L3> {
         self.layer3.is_encrypted()
     }
 
-    /// Create a new encrypted Yak file. Compression support is always enabled.
-    ///
-    /// Same as `create`, but all block data is AES-XTS encrypted with a
-    /// password-derived key. The password is required for all subsequent opens.
-    pub fn create_encrypted(
-        path: &str,
-        block_index_width: u8,
-        block_size_shift: u8,
-        password: &[u8],
-    ) -> Result<Self, YakError> {
-        let cbss = block_size_shift.saturating_add(Self::DEFAULT_CBSS_OFFSET);
-        Self::create_inner(
-            path,
-            block_index_width,
-            block_size_shift,
-            cbss,
-            Some(password),
-        )
-    }
-
-    /// Create a new encrypted Yak file with a specific compressed block size shift.
-    ///
-    /// Same as `create_with_cbss`, but with AES-XTS block encryption.
-    pub fn create_encrypted_with_cbss(
-        path: &str,
-        block_index_width: u8,
-        block_size_shift: u8,
-        compressed_block_size_shift: u8,
-        password: &[u8],
-    ) -> Result<Self, YakError> {
-        if compressed_block_size_shift < block_size_shift {
-            return Err(YakError::IoError(format!(
-                "compressed_block_size_shift ({}) must be >= block_size_shift ({})",
-                compressed_block_size_shift, block_size_shift
-            )));
-        }
-        Self::create_inner(
-            path,
-            block_index_width,
-            block_size_shift,
-            compressed_block_size_shift,
-            Some(password),
-        )
-    }
-
     /// Open an existing encrypted Yak file.
     ///
     /// Returns `EncryptionRequired` if the file is encrypted but no password
     /// is provided. Returns `WrongPassword` if the password is incorrect.
     pub fn open_encrypted(path: &str, mode: OpenMode, password: &[u8]) -> Result<Self, YakError> {
         Self::open_inner(path, mode, Some(password))
+    }
+
+    // -------------------------------------------------------------------
+    // Optimize (compaction + defragmentation)
+    // -------------------------------------------------------------------
+
+    /// Size of the buffer used when copying stream data during optimize.
+    const OPTIMIZE_COPY_BUF_SIZE: usize = 256 * 1024;
+
+    /// Optimize a Yak file by rewriting it without free blocks.
+    ///
+    /// Creates a new file containing only the active directory structure and
+    /// stream data, then atomically replaces the original. All excess reserved
+    /// capacity is stripped; stream data is written contiguously for maximum
+    /// locality.
+    ///
+    /// For encrypted files, the password must be provided so the new file can
+    /// be re-encrypted. Returns the number of bytes reclaimed.
+    ///
+    /// The file must not be open elsewhere (an exclusive lock is acquired).
+    pub fn optimize(path: &str, password: Option<&[u8]>) -> Result<u64, YakError> {
+        let source = Self::open_inner(path, OpenMode::Write, password)?;
+
+        let opts = CreateOptions {
+            block_index_width: source.block_index_width(),
+            block_size_shift: source.block_size_shift(),
+            compressed_block_size_shift: source.compressed_block_size_shift(),
+            password,
+        };
+
+        let tmp_path = format!("{}.optimize.tmp", path);
+        let dest = match Self::create(&tmp_path, opts) {
+            Ok(d) => d,
+            Err(e) => {
+                let _ = source.close();
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(e);
+            }
+        };
+
+        if let Err(e) = Self::copy_tree_recursive(&source, &dest, "") {
+            let _ = source.close();
+            let _ = dest.close();
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e);
+        }
+
+        let old_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+
+        source.close()?;
+        dest.close()?;
+
+        let new_size = std::fs::metadata(&tmp_path).map(|m| m.len()).unwrap_or(0);
+
+        std::fs::rename(&tmp_path, path)
+            .map_err(|e| YakError::IoError(format!("failed to rename optimized file: {}", e)))?;
+
+        Ok(old_size.saturating_sub(new_size))
+    }
+
+    /// Recursively copy the directory tree from `source` to `dest`.
+    fn copy_tree_recursive(source: &Self, dest: &Self, dir_path: &str) -> Result<(), YakError> {
+        let entries = source.list(dir_path)?;
+        for entry in entries {
+            let full_path = if dir_path.is_empty() {
+                entry.name.clone()
+            } else {
+                format!("{}/{}", dir_path, entry.name)
+            };
+            match entry.entry_type {
+                EntryType::Directory => {
+                    dest.mkdir(&full_path)?;
+                    Self::copy_tree_recursive(source, dest, &full_path)?;
+                }
+                EntryType::Stream => {
+                    Self::copy_stream(source, dest, &full_path)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Copy a single stream's data from `source` to `dest`.
+    fn copy_stream(source: &Self, dest: &Self, stream_path: &str) -> Result<(), YakError> {
+        let src_h = source.open_stream(stream_path, OpenMode::Read)?;
+        let compressed = source.is_stream_compressed(&src_h)?;
+        let length = source.stream_length(&src_h)?;
+
+        let dst_h = dest.create_stream(stream_path, compressed)?;
+
+        let mut buf = vec![0u8; Self::OPTIMIZE_COPY_BUF_SIZE];
+        let mut remaining = length;
+        while remaining > 0 {
+            let to_read = std::cmp::min(remaining as usize, Self::OPTIMIZE_COPY_BUF_SIZE);
+            let n = source.read(&src_h, &mut buf[..to_read])?;
+            if n == 0 {
+                break;
+            }
+            dest.write(&dst_h, &buf[..n])?;
+            remaining -= n as u64;
+        }
+
+        source.close_stream(src_h)?;
+        dest.close_stream(dst_h)?;
+        Ok(())
     }
 
     // -------------------------------------------------------------------

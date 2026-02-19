@@ -17,7 +17,7 @@ pub use file_on_disk::FileOnDisk;
 pub use stream_layer::StreamLayer;
 pub use streams_from_blocks::StreamsFromBlocks;
 pub use streams_from_files::StreamsFromFiles;
-pub use yak::{DirEntry, EntryType, OpenMode, StreamHandle, Yak, YakError};
+pub use yak::{CreateOptions, DirEntry, EntryType, OpenMode, StreamHandle, Yak, YakError};
 
 /// Opaque token identifying a header section slot.
 ///
@@ -48,7 +48,7 @@ mod tests {
 
         // Create and write
         {
-            let yk = YakDefault::create(path_str, 4, 12).unwrap();
+            let yk = YakDefault::create(path_str, CreateOptions::default()).unwrap();
             let sh = yk.create_stream("hello.txt", false).unwrap();
             yk.write(&sh, b"Hello, World!").unwrap();
             yk.close_stream(sh).unwrap();
@@ -115,7 +115,15 @@ mod tests {
         let path_str = path.to_str().unwrap();
 
         // block_size=64, block_index_width=4, fan_out=16
-        let yk = YakDefault::create(path_str, 4, 6).unwrap();
+        let yk = YakDefault::create(
+            path_str,
+            CreateOptions {
+                block_size_shift: 6,
+                compressed_block_size_shift: 9,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let sh = yk.create_stream("big.bin", false).unwrap();
 
         // 1025 bytes requires 17 data blocks -> depth 2
@@ -142,7 +150,7 @@ mod tests {
 
         // Create with dirs, streams, and data
         {
-            let yk = YakDefault::create(path_str, 4, 12).unwrap();
+            let yk = YakDefault::create(path_str, CreateOptions::default()).unwrap();
             yk.mkdir("docs").unwrap();
 
             let sh = yk.create_stream("hello.txt", false).unwrap();
@@ -179,7 +187,7 @@ mod tests {
 
         // Create, write, read back, verify — all without block cache
         {
-            let yk = YakNoCache::create(path_str, 4, 12).unwrap();
+            let yk = YakNoCache::create(path_str, CreateOptions::default()).unwrap();
             yk.mkdir("docs").unwrap();
 
             let sh = yk.create_stream("hello.txt", false).unwrap();
@@ -225,7 +233,7 @@ mod tests {
         let path_str = path.to_str().unwrap();
 
         {
-            let yk = YakDefault::create(path_str, 4, 12).unwrap();
+            let yk = YakDefault::create(path_str, CreateOptions::default()).unwrap();
             let sh = yk.create_stream("data.bin", false).unwrap();
 
             // Empty stream: reserved = 0

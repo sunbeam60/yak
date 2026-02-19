@@ -135,6 +135,17 @@ const char *yak_verify_issue(struct YakVerifyResult *result, int index);
 // `result` must be a valid pointer returned by `yak_verify` and not yet freed.
 void yak_verify_free(struct YakVerifyResult *result);
 
+// Optimize a Yak file by rewriting it without free blocks.
+// Removes free blocks and rewrites streams contiguously for maximum locality.
+// Returns the number of bytes saved, or -1 on error.
+// For unencrypted files, pass NULL for `password`.
+// For encrypted files, `password` must be a valid null-terminated UTF-8 string.
+//
+// # Safety
+// `path` must be a valid, null-terminated UTF-8 string.
+// `password`, if non-null, must be a valid, null-terminated UTF-8 string.
+int64_t yak_optimize(const char *path, const char *password);
+
 // Create a new stream and open it for writing. Returns handle ID or -1.
 // `compressed`: non-zero to create a compressed stream (requires cbss > 0).
 //

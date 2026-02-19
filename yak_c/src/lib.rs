@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::ffi::{c_char, c_int, CStr, CString};
 
-use yak::{EntryType, OpenMode, StreamHandle, YakDefault as YakInner};
+use yak::{CreateOptions, EntryType, OpenMode, StreamHandle, YakDefault as YakInner};
 
 // ---------------------------------------------------------------------------
 // Opaque handle types
@@ -81,7 +81,14 @@ pub unsafe extern "C" fn yak_create(
         Some(s) => s,
         None => return std::ptr::null_mut(),
     };
-    match YakInner::create(path, block_index_width, block_size_shift) {
+    match YakInner::create(
+        path,
+        CreateOptions {
+            block_index_width,
+            block_size_shift,
+            ..Default::default()
+        },
+    ) {
         Ok(inner) => Box::into_raw(Box::new(YakFile(inner))),
         Err(e) => {
             set_last_error(&e.to_string());
@@ -106,11 +113,14 @@ pub unsafe extern "C" fn yak_create_with_cbss(
         Some(s) => s,
         None => return std::ptr::null_mut(),
     };
-    match YakInner::create_with_cbss(
+    match YakInner::create(
         path,
-        block_index_width,
-        block_size_shift,
-        compressed_block_size_shift,
+        CreateOptions {
+            block_index_width,
+            block_size_shift,
+            compressed_block_size_shift,
+            ..Default::default()
+        },
     ) {
         Ok(inner) => Box::into_raw(Box::new(YakFile(inner))),
         Err(e) => {
@@ -167,11 +177,14 @@ pub unsafe extern "C" fn yak_create_encrypted(
         Some(s) => s,
         None => return std::ptr::null_mut(),
     };
-    match YakInner::create_encrypted(
+    match YakInner::create(
         path,
-        block_index_width,
-        block_size_shift,
-        password.as_bytes(),
+        CreateOptions {
+            block_index_width,
+            block_size_shift,
+            password: Some(password.as_bytes()),
+            ..Default::default()
+        },
     ) {
         Ok(inner) => Box::into_raw(Box::new(YakFile(inner))),
         Err(e) => {
@@ -472,6 +485,42 @@ pub unsafe extern "C" fn yak_verify_free(result: *mut YakVerifyResult) {
     if !result.is_null() {
         unsafe {
             drop(Box::from_raw(result));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Compaction
+// ---------------------------------------------------------------------------
+
+/// Optimize a Yak file by rewriting it without free blocks.
+/// Removes free blocks and rewrites streams contiguously for maximum locality.
+/// Returns the number of bytes saved, or -1 on error.
+/// For unencrypted files, pass NULL for `password`.
+/// For encrypted files, `password` must be a valid null-terminated UTF-8 string.
+///
+/// # Safety
+/// `path` must be a valid, null-terminated UTF-8 string.
+/// `password`, if non-null, must be a valid, null-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn yak_optimize(path: *const c_char, password: *const c_char) -> i64 {
+    let path = match cstr_to_str(path) {
+        Some(s) => s,
+        None => return -1,
+    };
+    let pw = if password.is_null() {
+        None
+    } else {
+        match cstr_to_str(password) {
+            Some(s) => Some(s.as_bytes()),
+            None => return -1,
+        }
+    };
+    match YakInner::optimize(path, pw) {
+        Ok(saved) => saved as i64,
+        Err(e) => {
+            set_last_error(&e.to_string());
+            -1
         }
     }
 }

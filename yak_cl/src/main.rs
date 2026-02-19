@@ -101,6 +101,12 @@ const COMMANDS: &[CommandEntry] = &[
         run: cmd_file::cmd_verify,
     },
     CommandEntry {
+        name: "optimize",
+        usage: "yak optimize <yak-file> [--encrypted]",
+        description: "Compact and defragment by rewriting without free blocks",
+        run: cmd_file::cmd_optimize,
+    },
+    CommandEntry {
         name: "bench",
         usage: "yak bench <scenario> [options]",
         description: "Run benchmark scenario",

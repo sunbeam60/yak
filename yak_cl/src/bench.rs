@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
-use yak::{OpenMode, StreamHandle, YakDefault as Yak};
+use yak::{CreateOptions, OpenMode, StreamHandle, YakDefault as Yak};
 
 use crate::error::{CliError, CliResult};
 use crate::helpers::{DEFAULT_BLOCK_INDEX_WIDTH, DEFAULT_BLOCK_SIZE_SHIFT};
@@ -226,6 +226,10 @@ fn err(e: impl std::fmt::Display) -> CliError {
 
 /// Create a Yak file. When `cbss > 0` compression support is enabled.
 /// When `password` is `Some`, the file is encrypted.
+///
+/// `cbss = 0` signals "no compression" for benchmark cases — the file is still
+/// created with a valid `compressed_block_size_shift` (= `bss`) so file
+/// creation succeeds, but `create_bench_stream` won't create compressed streams.
 fn create_bench_yak(
     path: &str,
     biw: u8,
@@ -233,12 +237,17 @@ fn create_bench_yak(
     cbss: u8,
     password: Option<&[u8]>,
 ) -> Result<Yak, CliError> {
-    match (cbss > 0, password) {
-        (true, Some(pw)) => Yak::create_encrypted_with_cbss(path, biw, bss, cbss, pw).map_err(err),
-        (true, None) => Yak::create_with_cbss(path, biw, bss, cbss).map_err(err),
-        (false, Some(pw)) => Yak::create_encrypted(path, biw, bss, pw).map_err(err),
-        (false, None) => Yak::create(path, biw, bss).map_err(err),
-    }
+    let effective_cbss = if cbss == 0 { bss } else { cbss };
+    Yak::create(
+        path,
+        CreateOptions {
+            block_index_width: biw,
+            block_size_shift: bss,
+            compressed_block_size_shift: effective_cbss,
+            password,
+        },
+    )
+    .map_err(err)
 }
 
 /// Open an existing Yak file, with optional encryption password.

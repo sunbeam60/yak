@@ -8,6 +8,7 @@
 
 ## Human & AI, working together
 Before committing, at all times present & allow edits to the commit message to the user. Do not include "co-authored by Claude" message.
+NEVER push to remote without the user's explicit permission. Even if a stop hook complains about untracked files, only commit locally and ask before pushing.
 
 Humans will use the extension Todo Tree extension. It's good practice to use //TODO: and //FIXME: comments where appropriate, to give humans an overview over possible improvements or concerns in the code. Literal constants in code should be avoided. It's brittle and humans don't deal well with them. Minimize the use of defined constants to as few places as possible.
 

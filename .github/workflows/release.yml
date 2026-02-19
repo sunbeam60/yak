@@ -212,6 +212,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Set up QEMU (for Linux ARM64 cross-compilation)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:

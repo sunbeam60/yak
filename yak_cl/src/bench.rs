@@ -158,7 +158,9 @@ fn print_bench_usage() {
     eprintln!("                   Examples: 10 = 1KB, 12 = 4KB, 16 = 64KB");
     eprintln!("  --index-width N  Block index size (default: 4 = 4B index / 32 bits)");
     eprintln!("                   Examples: 2 = 2B index, 4 = 4B index, 8 = 8B index");
-    eprintln!("  --cbss N         Virtual block size shift for compression (default: 15 = 32KB)");
+    eprintln!(
+        "  --cbss N         Compressed block size shift for compression (default: 15 = 32KB)"
+    );
     eprintln!("                   Examples: 13 = 8KB, 15 = 32KB, 17 = 128KB");
     eprintln!("  --threads N      Thread count for threaded scenarios (default: 4)");
     eprintln!("  --case CASES     Which cases to run (default: necb = all four)");

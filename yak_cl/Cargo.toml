@@ -4,8 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-publish.workspace = true
+publish = true
 description = "Command line tool for Yak"
+homepage = "https://github.com/sunbeam60/yak"
+keywords = ["filesystem", "cli", "storage", "container"]
+categories = ["command-line-utilities", "filesystem"]
+readme = "../README.md"
 
 [[bin]]
 name = "yak"

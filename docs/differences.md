@@ -4,6 +4,10 @@ This file tracks divergences between the implementation and the architecture doc
 
 ## Resolved
 
+### Publication status (fixed)
+
+The workspace `Cargo.toml` previously set `publish = false`. As of v0.9.0, `yak` and `yak_cl` are published to crates.io, and Python bindings are published to PyPI as `libyak` (the `yak` name was taken on PyPI). The architecture says `pip install yak` but the actual command is `pip install libyak`; the import name remains `import yak`.
+
 ### Python wrapper path (fixed)
 
 The project table previously listed the Python wrapper path as `yak_python/`. The architecture now correctly says `yak_python/`.
@@ -17,12 +21,6 @@ The architecture previously used "compressed virtual blocks" in diagrams and "vi
 The architecture previously said nothing about encryption at the block layer. It now documents L2's optional AES-XTS block-level encryption, including a full L2 header table with all encryption fields (salt, Argon2id parameters, verification hash, wrapped key).
 
 ## Active divergences
-
-### Publication status claims are premature
-
-**Architecture says:** "The Yak library is published as a crate on crates.io" and "The Python Yak wrapper is published as a PyPI wheel."
-
-**Reality:** The workspace `Cargo.toml` sets `publish = false`. Neither the Rust crate nor the Python wheel are published yet.
 
 ### L2 API is broader than documented
 

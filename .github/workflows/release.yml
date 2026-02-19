@@ -6,26 +6,32 @@ on:
 
 permissions:
   contents: write
+  id-token: write
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Validate that the tag version matches Cargo.toml before building
+  # Validate that the tag version matches Cargo.toml and pyproject.toml
   validate:
     name: Validate version
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Check tag matches Cargo.toml version
+      - name: Check tag matches Cargo.toml and pyproject.toml versions
         run: |
           TAG_VERSION="${GITHUB_REF_NAME#v}"
           CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          PYPI_VERSION=$(grep '^version' yak_python/pyproject.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
           if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
             echo "ERROR: Tag version ($TAG_VERSION) does not match Cargo.toml version ($CARGO_VERSION)"
             exit 1
           fi
-          echo "Version $TAG_VERSION validated"
+          if [ "$TAG_VERSION" != "$PYPI_VERSION" ]; then
+            echo "ERROR: Tag version ($TAG_VERSION) does not match pyproject.toml version ($PYPI_VERSION)"
+            exit 1
+          fi
+          echo "Version $TAG_VERSION validated across Cargo.toml and pyproject.toml"
 
   build:
     name: Build ${{ matrix.target }}
@@ -161,13 +167,102 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  # Dry-run publish to validate crates.io readiness (does not actually publish)
-  publish-dry-run:
-    name: Publish dry run
-    needs: validate
+  # Publish Rust crates to crates.io
+  publish-cargo:
+    name: Publish to crates.io
+    needs: [validate, build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo publish -p yak --dry-run
-      - run: cargo publish -p yak_cl --dry-run
+
+      - name: Publish yak (core library)
+        run: cargo publish -p yak
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      # Wait for crates.io to index the yak crate before publishing dependents
+      - name: Wait for crates.io indexing
+        run: sleep 30
+
+      - name: Publish yak_cl (CLI tool)
+        run: cargo publish -p yak_cl
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  # Build and publish Python wheels to PyPI
+  build-pypi:
+    name: Build Python wheels (${{ matrix.target }})
+    needs: validate
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist --manifest-path yak_python/Cargo.toml
+          manylinux: auto
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.target }}
+          path: dist
+
+  # Build source distribution
+  build-sdist:
+    name: Build source distribution
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist --manifest-path yak_python/Cargo.toml
+
+      - name: Upload sdist
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-sdist
+          path: dist
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: [build-pypi, build-sdist]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+    steps:
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+
+      - name: List wheels
+        run: ls -la dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}

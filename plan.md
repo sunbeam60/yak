@@ -19,6 +19,49 @@ writes immediately. `invalidate_block_cache()` is no longer needed and can be re
 
 ---
 
+## Step 0: Add a targeted benchmark (on master, before cache changes)
+
+None of the existing benchmarks stress the pattern where this optimisation helps:
+a thread doing repeated random I/O on a long-lived stream while Streams stream
+operations (open/close/create by other threads) force cache invalidation.
+
+**Add a `cache-pressure` benchmark** to `yak_cl/src/bench.rs` that captures this:
+
+1. **Setup (not timed):** Create N large streams (e.g. 10 × 2MB) so each has a
+   deep-ish pyramid with many redirector blocks worth caching.
+2. **Timed phase:** Launch T threads concurrently:
+   - **I/O threads** (T/2): Each opens one of the pre-populated streams and performs
+     many small random reads (e.g. 500 × 4KB at random offsets). This repeatedly
+     navigates the pyramid, benefiting from cached redirector blocks.
+   - **Churn threads** (T/2): Each loops creating and immediately deleting small
+     throwaway streams. This forces Streams stream lock acquisitions, which today
+     call `invalidate_block_cache()` on the churn thread — but critically, the I/O
+     threads *also* invalidate whenever they eventually close/reopen (or do any
+     Streams operation).
+
+   To make the I/O threads hit invalidation mid-flight, have them periodically call
+   `stream_exists()` or `open_stream()` for a different stream (a lightweight Streams
+   operation) between batches of reads. This triggers `invalidate_block_cache()` on
+   the I/O thread, wiping its warm user-stream redirector cache.
+
+3. **Metric:** Wall-clock time for the I/O threads to complete all reads.
+
+This benchmark should be committed to master first so we have a baseline, then
+cherry-picked or rebased onto the working branch. After the cache changes, rerunning
+the same benchmark shows the improvement.
+
+### Why this benchmark works
+
+- The I/O threads build up a warm thread-local cache of user stream redirectors
+  during random reads.
+- The periodic `stream_exists()` call acquires the Streams lock and calls
+  `invalidate_block_cache()`, flushing that warm cache.
+- After the dual-cache change, `invalidate_block_cache()` is gone. The I/O thread's
+  thread-local cache survives the Streams lock acquisition, so subsequent reads hit
+  cached redirectors instead of going to L1.
+
+---
+
 ## Step 1: Define `CacheMode` enum
 
 **File:** `yak/src/block_layer.rs`

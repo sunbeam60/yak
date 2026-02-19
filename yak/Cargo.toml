@@ -8,7 +8,7 @@ publish = true
 description = "Yak - yet another kontainer"
 readme = "../README.md"
 homepage = "https://github.com/sunbeam60/yak"
-keywords = ["filesystem", "embedded", "streams", "storage"]
+keywords = ["filesystem", "embedded", "streams", "storage", "container-files", "file-formats"]
 categories = ["filesystem", "data-structures"]
 
 [dependencies]

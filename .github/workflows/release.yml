@@ -222,7 +222,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist --manifest-path yak_python/Cargo.toml
+          args: --release --out dist --find-interpreter --manifest-path yak_python/Cargo.toml
           manylinux: auto
 
       - name: Upload wheels

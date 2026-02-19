@@ -130,7 +130,7 @@ Options:
 
 ## Yak is not ...
 * A database - Yak thinks in binary only and doesn't care or know what you write to your streams.
-* ACID compliant - but then neither is your homegrown file format (most likely). If you need Atomic, Consistent, Isolated and Durable writes to your file, you should choose a different format. Yak does include functionality to verify the integrity of a Yak file.
+* ACID compliant - but then neither is your homegrown file format (most likely). If you need Atomic, Consistent, Isolated and Durable writes to your file, you should choose a [different format](https://sqlite.org). Yak does include functionality to verify the integrity of a Yak file.
 * An archive format - To optimize for speed, random seeks within streams and mutability of streams, Yak will not achieve the same compression ratio as a modern archive.
 
 ## ... but Yak could be
@@ -140,6 +140,7 @@ Options:
 * How you rewire that other library's file-spew into a single location
 * How you get started writing data to a file, until you've got that perfect, custom solution
 * How you handle a number of threads writing to the same file, at the same time
+* An alternative to [rust-cfb](https://github.com/mdsteele/rust-cfb)
 
 ## Want to know more about how Yak works?
 Read the [Architecture Overview](docs/architecture.md)

@@ -4,7 +4,7 @@
 Yak is a library to help you build your own binary file formats. It's a file system, inside a file:
 
 * A Yak file can have many streams.
-* Organise streams into Yak file directories - stream names cannot clash inside the same directory.
+* Organise streams into Yak directories - stream names cannot clash inside the same directory.
 * Treat streams like you would files - write to them, read from them, truncate them, delete them, move them (inside the Yak file).
 * Streams can grow or shrink inside the Yak file - Yak will figure out how to organise it efficiently.
 * Seek in streams with O(log n) efficiency due to Yak's pyramid storage structure.
@@ -57,6 +57,7 @@ Yak is reasonably well optimized and pulls a number of tricks to balance these d
 * Fast seeking within streams, without holding lots of extra data - the underlying pyramid data structure wastes very little space and is still very efficient.
 * Minimal disk IO - Yak will optimize for long, contiguous segments of data to get near-raw-buffer reading & writing speed and use a configurable write-through cache to avoid disk IO altogether for hotspots in the file.
 * Thread safety - multiple threads can write to multiple streams at the same time.
+* Endian aware - if you need a Yak file to move between little endian and big endian systems, it can.
 * Transparent, fast compression - using LZ4, any data written to a stream gets automatically compressed and any data read gets automatically decompressed.
 * Transparent, fast encryption - using AES-XTS with hardware based encryption/decryption (where hardware is available).
 

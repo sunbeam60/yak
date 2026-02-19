@@ -49,9 +49,9 @@ fn main() {
     yk.close().unwrap();
 }
 ```
-Yak is implemented in Rust and published on crates.io, but can be used in many languages:
+Yak is implemented in Rust and [published on crates.io](https://crates.io/crates/yak) but can be used in many languages:
 * C/C++ via the included yak_c library, which builds to a static lib and a .h file using CBindGen.
-* Python via yak_python library, which is published as a PyPI wheel, using PyO3 to create native Python bindings.
+* Python via yak_python library, which is [published as a PyPI wheel](https://pypi.org/project/libyak/), using PyO3 to create native Python bindings.
 * Any language that can use C libraries (dynamic or static), such as Objective-C, Zig, D, Lua & LuaJIT, C#, Haskell, Node.js etc.
 
 ## Ready to go

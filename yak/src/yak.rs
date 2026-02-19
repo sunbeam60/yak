@@ -7,11 +7,18 @@ use crate::stream_layer::StreamLayer;
 /// L4 payload size: "filing"(6) + version(1) + root_dir_stream_id(8) = 15 bytes.
 const L4_PAYLOAD_SIZE: u16 = 15;
 
-/// Size in bytes of the FNV-1a name hash stored in each directory entry.
-const ENTRY_HASH_SIZE: usize = 4;
-
 /// Current L4 format version. Bumped when the on-disk directory entry format changes.
-const L4_FORMAT_VERSION: u8 = 1;
+/// Version 2: sorted name table with O(log n) binary search lookup.
+const L4_FORMAT_VERSION: u8 = 2;
+
+/// Size of one name table slot: hash (u32) + offset (u32) = 8 bytes.
+const NAME_TABLE_SLOT_SIZE: usize = 8;
+
+/// Size of the directory stream footer: entry_count (u32) + name_table_offset (u32) = 8 bytes.
+const FOOTER_SIZE: usize = 8;
+
+/// Size of the copy buffer used when compacting entry data on delete.
+const COMPACT_COPY_BUF_SIZE: usize = 64 * 1024;
 
 /// FNV-1a hash of a byte slice, producing a 32-bit hash.
 /// Used to accelerate directory entry lookups by comparing a cheap integer
@@ -102,120 +109,204 @@ struct StreamEntry {
     name: String,
 }
 
-/// Serialize a single stream entry to bytes.
-/// Format: | length: u16 | identifier: [u8; biw] | name_hash: u32 | name: [u8] |
-fn serialize_entry(entry: &StreamEntry, block_index_width: u8) -> Vec<u8> {
+/// Serialize a single entry's data region bytes (no name table or footer).
+/// Format: | id: biw bytes | name_len: u16 | name: [u8] |
+fn serialize_entry_data(entry: &StreamEntry, block_index_width: u8) -> Vec<u8> {
     let biw = block_index_width as usize;
     let name_bytes = entry.name.as_bytes();
-    let length: u16 = (2 + biw + ENTRY_HASH_SIZE + name_bytes.len()) as u16;
-    let mut buf = Vec::with_capacity(length as usize);
-    buf.extend_from_slice(&length.to_le_bytes());
+    let name_len = name_bytes.len() as u16;
+    let total = biw + 2 + name_bytes.len();
+    let mut buf = Vec::with_capacity(total);
     let id_bytes = entry.id.to_le_bytes();
     buf.extend_from_slice(&id_bytes[..biw]);
-    buf.extend_from_slice(&fnv1a_hash(name_bytes).to_le_bytes());
+    buf.extend_from_slice(&name_len.to_le_bytes());
     buf.extend_from_slice(name_bytes);
     buf
 }
 
-/// Serialize a list of stream entries to bytes.
-fn serialize_entries(entries: &[StreamEntry], block_index_width: u8) -> Vec<u8> {
-    let mut buf = Vec::new();
-    for entry in entries {
-        buf.extend_from_slice(&serialize_entry(entry, block_index_width));
+/// Build a complete directory stream (entry data + name table + footer).
+/// Returns empty Vec for an empty entry list (empty directory = zero-length stream).
+fn build_directory_stream(entries: &[StreamEntry], block_index_width: u8) -> Vec<u8> {
+    if entries.is_empty() {
+        return Vec::new();
     }
+
+    // Write entry data region, recording each entry's offset and hash
+    let mut entry_data = Vec::new();
+    let mut slots: Vec<(u32, u32)> = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let offset = entry_data.len() as u32;
+        let hash = fnv1a_hash(entry.name.as_bytes());
+        entry_data.extend_from_slice(&serialize_entry_data(entry, block_index_width));
+        slots.push((hash, offset));
+    }
+
+    // Sort name table slots by hash for binary search
+    slots.sort_by_key(|&(hash, _)| hash);
+
+    let name_table_offset = entry_data.len() as u32;
+    let entry_count = entries.len() as u32;
+
+    // Assemble: entry_data + name_table + footer
+    let total = entry_data.len() + slots.len() * NAME_TABLE_SLOT_SIZE + FOOTER_SIZE;
+    let mut buf = Vec::with_capacity(total);
+    buf.extend_from_slice(&entry_data);
+    for &(hash, offset) in &slots {
+        buf.extend_from_slice(&hash.to_le_bytes());
+        buf.extend_from_slice(&offset.to_le_bytes());
+    }
+    buf.extend_from_slice(&entry_count.to_le_bytes());
+    buf.extend_from_slice(&name_table_offset.to_le_bytes());
     buf
 }
 
-/// Parse stream entries from a byte buffer.
-/// Format: | length: u16 | identifier: [u8; biw] | name_hash: u32 | name: [u8] |
+/// Parse the footer from the last FOOTER_SIZE bytes of a directory stream buffer.
+/// Returns (entry_count, name_table_offset).
+fn parse_footer(data: &[u8]) -> Result<(u32, u32), YakError> {
+    if data.len() < FOOTER_SIZE {
+        return Err(YakError::IoError(
+            "directory stream too short for footer".to_string(),
+        ));
+    }
+    let footer_start = data.len() - FOOTER_SIZE;
+    let entry_count = u32::from_le_bytes(data[footer_start..footer_start + 4].try_into().unwrap());
+    let name_table_offset =
+        u32::from_le_bytes(data[footer_start + 4..footer_start + 8].try_into().unwrap());
+    Ok((entry_count, name_table_offset))
+}
+
+/// Parse all entries from a complete directory stream buffer.
+/// Reads the footer to find name_table_offset, then scans the entry data region.
 fn parse_entries(data: &[u8], block_index_width: u8) -> Result<Vec<StreamEntry>, YakError> {
+    if data.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (entry_count, name_table_offset) = parse_footer(data)?;
+    let nto = name_table_offset as usize;
     let biw = block_index_width as usize;
-    let min_entry_len = 2 + biw + ENTRY_HASH_SIZE;
-    let mut entries = Vec::new();
+    // Minimum entry size: biw (id) + 2 (name_len) + 0 (empty name not valid, but parsing allows it)
+    let min_entry_size = biw + 2;
+
+    let mut entries = Vec::with_capacity(entry_count as usize);
     let mut pos = 0;
-    while pos < data.len() {
-        if pos + 2 > data.len() {
-            return Err(YakError::IoError(
-                "truncated entry length in directory stream".to_string(),
-            ));
-        }
-        let length = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
-        if length < min_entry_len {
-            return Err(YakError::IoError(
-                "invalid entry length in directory stream".to_string(),
-            ));
-        }
-        if pos + length > data.len() {
+    while pos < nto {
+        if pos + min_entry_size > nto {
             return Err(YakError::IoError(
                 "truncated entry in directory stream".to_string(),
             ));
         }
-        // Read identifier as u64, zero-extending from block_index_width bytes
         let mut id_bytes = [0u8; 8];
-        id_bytes[..biw].copy_from_slice(&data[pos + 2..pos + 2 + biw]);
+        id_bytes[..biw].copy_from_slice(&data[pos..pos + biw]);
         let id = u64::from_le_bytes(id_bytes);
-        // Skip over the name hash (ENTRY_HASH_SIZE bytes) to reach the name
-        let name_start = pos + 2 + biw + ENTRY_HASH_SIZE;
-        let name = std::str::from_utf8(&data[name_start..pos + length])
+
+        let name_len = u16::from_le_bytes([data[pos + biw], data[pos + biw + 1]]) as usize;
+        let name_end = pos + biw + 2 + name_len;
+        if name_end > nto {
+            return Err(YakError::IoError(
+                "truncated entry name in directory stream".to_string(),
+            ));
+        }
+        let name = std::str::from_utf8(&data[pos + biw + 2..name_end])
             .map_err(|e| YakError::IoError(format!("invalid UTF-8 in entry name: {}", e)))?
             .to_string();
         entries.push(StreamEntry { id, name });
-        pos += length;
+        pos = name_end;
+    }
+
+    if entries.len() != entry_count as usize {
+        return Err(YakError::IoError(format!(
+            "entry count mismatch: footer says {} but parsed {}",
+            entry_count,
+            entries.len()
+        )));
     }
     Ok(entries)
 }
 
-/// Scan a raw directory buffer for an entry matching `name`.
-/// Compares the pre-computed FNV-1a hash first; only does a byte-level
-/// name comparison when hashes match. Returns the stream ID if found.
-/// Zero heap allocations on the scan path.
-fn find_entry_by_name(
-    data: &[u8],
-    name: &str,
-    block_index_width: u8,
-) -> Result<Option<u64>, YakError> {
-    let biw = block_index_width as usize;
-    let min_entry_len = 2 + biw + ENTRY_HASH_SIZE;
-    let name_bytes = name.as_bytes();
-    let target_hash = fnv1a_hash(name_bytes);
-    let mut pos = 0;
-    while pos < data.len() {
-        if pos + 2 > data.len() {
-            return Err(YakError::IoError(
-                "truncated entry length in directory stream".to_string(),
-            ));
-        }
-        let length = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
-        if length < min_entry_len {
-            return Err(YakError::IoError(
-                "invalid entry length in directory stream".to_string(),
-            ));
-        }
-        if pos + length > data.len() {
-            return Err(YakError::IoError(
-                "truncated entry in directory stream".to_string(),
-            ));
-        }
-        // Read stored hash
-        let hash_start = pos + 2 + biw;
-        let stored_hash = u32::from_le_bytes([
-            data[hash_start],
-            data[hash_start + 1],
-            data[hash_start + 2],
-            data[hash_start + 3],
-        ]);
-        // Fast path: only compare name bytes when hashes match
-        if stored_hash == target_hash {
-            let name_start = hash_start + ENTRY_HASH_SIZE;
-            if &data[name_start..pos + length] == name_bytes {
-                let mut id_bytes = [0u8; 8];
-                id_bytes[..biw].copy_from_slice(&data[pos + 2..pos + 2 + biw]);
-                return Ok(Some(u64::from_le_bytes(id_bytes)));
-            }
-        }
-        pos += length;
+/// Binary search the name table for slots matching `target_hash`.
+/// The name table is a sorted array of (hash: u32, offset: u32) pairs.
+/// Returns the range of matching slot indices, or an empty range if not found.
+fn find_hash_range(
+    name_table: &[u8],
+    entry_count: u32,
+    target_hash: u32,
+) -> std::ops::Range<usize> {
+    let count = entry_count as usize;
+    if count == 0 {
+        return 0..0;
     }
-    Ok(None)
+
+    // Read hash from slot index
+    let hash_at = |i: usize| -> u32 {
+        let base = i * NAME_TABLE_SLOT_SIZE;
+        u32::from_le_bytes([
+            name_table[base],
+            name_table[base + 1],
+            name_table[base + 2],
+            name_table[base + 3],
+        ])
+    };
+
+    // Binary search for any occurrence of target_hash
+    let mut lo = 0usize;
+    let mut hi = count;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if hash_at(mid) < target_hash {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    // lo is the first slot >= target_hash
+    if lo >= count || hash_at(lo) != target_hash {
+        return lo..lo; // not found
+    }
+    let start = lo;
+    // Find the end of the run of matching hashes
+    let mut end = start + 1;
+    while end < count && hash_at(end) == target_hash {
+        end += 1;
+    }
+    start..end
+}
+
+/// Read offset from a name table slot.
+fn slot_offset(name_table: &[u8], slot_index: usize) -> u32 {
+    let base = slot_index * NAME_TABLE_SLOT_SIZE + 4;
+    u32::from_le_bytes([
+        name_table[base],
+        name_table[base + 1],
+        name_table[base + 2],
+        name_table[base + 3],
+    ])
+}
+
+/// Parse the name table bytes into a Vec of (hash, offset) pairs.
+fn parse_name_table_slots(name_table: &[u8], entry_count: u32) -> Vec<(u32, u32)> {
+    let count = entry_count as usize;
+    let mut slots = Vec::with_capacity(count);
+    for i in 0..count {
+        let base = i * NAME_TABLE_SLOT_SIZE;
+        let hash = u32::from_le_bytes(name_table[base..base + 4].try_into().unwrap());
+        let offset = u32::from_le_bytes(name_table[base + 4..base + 8].try_into().unwrap());
+        slots.push((hash, offset));
+    }
+    slots
+}
+
+/// Serialize name table slots and footer into a contiguous byte buffer.
+fn serialize_table_and_footer(slots: &[(u32, u32)], name_table_offset: u32) -> Vec<u8> {
+    let entry_count = slots.len() as u32;
+    let total = slots.len() * NAME_TABLE_SLOT_SIZE + FOOTER_SIZE;
+    let mut buf = Vec::with_capacity(total);
+    for &(hash, offset) in slots {
+        buf.extend_from_slice(&hash.to_le_bytes());
+        buf.extend_from_slice(&offset.to_le_bytes());
+    }
+    buf.extend_from_slice(&entry_count.to_le_bytes());
+    buf.extend_from_slice(&name_table_offset.to_le_bytes());
+    buf
 }
 
 // ---------------------------------------------------------------------------
@@ -678,38 +769,26 @@ impl<L3: StreamLayer> Yak<L3> {
         }
         validate_path(path)?;
 
-        let biw = self.layer3.block_index_width();
         let (parent_path, leaf) = split_parent_leaf(path);
         let parent_id = self.resolve_dir_stream_id(parent_path)?;
         let dir_entry_name = format!("{}/", leaf);
+
+        // Create new empty directory stream
+        let new_dir_id = self.layer3.create_stream(false)?;
 
         // Open parent dir stream for writing (blocking — waits for contention)
         let parent_handle = self
             .layer3
             .open_stream_blocking(parent_id, OpenMode::Write)?;
 
-        // Read existing entries and check for duplicates
-        let entries = self.read_entries_from_handle(&parent_handle)?;
-        if entries
-            .iter()
-            .any(|e| e.name == dir_entry_name || e.name == leaf)
-        {
+        let result =
+            self.add_entry_to_dir_handle(&parent_handle, &dir_entry_name, new_dir_id, path);
+        if result.is_err() {
             self.layer3.close_stream(parent_handle)?;
-            return Err(YakError::AlreadyExists(path.to_string()));
+            // Clean up the stream we just created
+            let _ = self.layer3.delete_stream(new_dir_id);
+            return result;
         }
-
-        // Create new empty directory stream
-        let new_dir_id = self.layer3.create_stream(false)?;
-
-        // Append entry to parent
-        let entry = StreamEntry {
-            id: new_dir_id,
-            name: dir_entry_name,
-        };
-        let entry_buf = serialize_entry(&entry, biw);
-        let len = self.layer3.stream_length(&parent_handle)?;
-        self.layer3.write(&parent_handle, len, &entry_buf)?;
-
         self.layer3.close_stream(parent_handle)?;
         Ok(())
     }
@@ -724,7 +803,6 @@ impl<L3: StreamLayer> Yak<L3> {
         }
         validate_path(path)?;
 
-        let biw = self.layer3.block_index_width();
         let (parent_path, leaf) = split_parent_leaf(path);
         let parent_id = self.resolve_dir_stream_id(parent_path)?;
         let dir_entry_name = format!("{}/", leaf);
@@ -733,14 +811,18 @@ impl<L3: StreamLayer> Yak<L3> {
         let parent_handle = self
             .layer3
             .open_stream_blocking(parent_id, OpenMode::Write)?;
-        let entries = self.read_entries_from_handle(&parent_handle)?;
 
-        let entry = entries.iter().find(|e| e.name == dir_entry_name);
-        if entry.is_none() {
-            self.layer3.close_stream(parent_handle)?;
-            return Err(YakError::NotFound(path.to_string()));
-        }
-        let dir_stream_id = entry.unwrap().id;
+        // Find the directory entry to get its stream ID
+        let len = self.layer3.stream_length(&parent_handle)?;
+        let biw = self.layer3.block_index_width() as usize;
+        let dir_stream_id =
+            match self.find_name_in_handle(&parent_handle, len, &dir_entry_name, biw)? {
+                Some(id) => id,
+                None => {
+                    self.layer3.close_stream(parent_handle)?;
+                    return Err(YakError::NotFound(path.to_string()));
+                }
+            };
 
         // Check that directory is empty (blocking)
         let child_handle = self
@@ -754,16 +836,8 @@ impl<L3: StreamLayer> Yak<L3> {
             return Err(YakError::NotEmpty(path.to_string()));
         }
 
-        // Remove entry from parent
-        let remaining: Vec<StreamEntry> = entries
-            .into_iter()
-            .filter(|e| e.name != dir_entry_name)
-            .collect();
-        let new_buf = serialize_entries(&remaining, biw);
-        self.layer3.truncate(&parent_handle, 0)?;
-        if !new_buf.is_empty() {
-            self.layer3.write(&parent_handle, 0, &new_buf)?;
-        }
+        // Remove entry from parent using in-place compaction
+        self.remove_entry_from_dir_handle(&parent_handle, &dir_entry_name, path)?;
         self.layer3.close_stream(parent_handle)?;
 
         // Delete the directory stream
@@ -816,7 +890,6 @@ impl<L3: StreamLayer> Yak<L3> {
         validate_path(old_path)?;
         validate_path(new_path)?;
 
-        let biw = self.layer3.block_index_width();
         let (old_parent_path, old_leaf) = split_parent_leaf(old_path);
         let (new_parent_path, new_leaf) = split_parent_leaf(new_path);
         let old_dir_name = format!("{}/", old_leaf);
@@ -826,89 +899,61 @@ impl<L3: StreamLayer> Yak<L3> {
         let new_parent_id = self.resolve_dir_stream_id(new_parent_path)?;
 
         if old_parent_id == new_parent_id {
-            // Same parent: rename entry in place (blocking)
+            // Same parent: remove old entry, add new entry (both on same handle)
             let handle = self
                 .layer3
                 .open_stream_blocking(old_parent_id, OpenMode::Write)?;
-            let entries = self.read_entries_from_handle(&handle)?;
 
-            let old_entry = entries.iter().find(|e| e.name == old_dir_name);
-            if old_entry.is_none() {
-                self.layer3.close_stream(handle)?;
-                return Err(YakError::NotFound(old_path.to_string()));
-            }
-            let stream_id = old_entry.unwrap().id;
+            let stream_id =
+                match self.remove_entry_from_dir_handle(&handle, &old_dir_name, old_path) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        self.layer3.close_stream(handle)?;
+                        return Err(e);
+                    }
+                };
 
-            if entries
-                .iter()
-                .any(|e| e.name == new_dir_name || e.name == new_leaf)
+            if let Err(e) =
+                self.add_entry_to_dir_handle(&handle, &new_dir_name, stream_id, new_path)
             {
+                // Re-add the old entry to restore consistency
+                let _ = self.add_entry_to_dir_handle(&handle, &old_dir_name, stream_id, old_path);
                 self.layer3.close_stream(handle)?;
-                return Err(YakError::AlreadyExists(new_path.to_string()));
-            }
-
-            // Per architecture: rename = delete old + re-add at end
-            let mut remaining: Vec<StreamEntry> = entries
-                .into_iter()
-                .filter(|e| e.name != old_dir_name)
-                .collect();
-            remaining.push(StreamEntry {
-                id: stream_id,
-                name: new_dir_name,
-            });
-
-            let buf = serialize_entries(&remaining, biw);
-            self.layer3.truncate(&handle, 0)?;
-            if !buf.is_empty() {
-                self.layer3.write(&handle, 0, &buf)?;
+                return Err(e);
             }
             self.layer3.close_stream(handle)?;
         } else {
-            // Different parents: remove from old, add to new (blocking)
+            // Different parents: remove from old, add to new
             let old_handle = self
                 .layer3
                 .open_stream_blocking(old_parent_id, OpenMode::Write)?;
-            let old_entries = self.read_entries_from_handle(&old_handle)?;
-
-            let old_entry = old_entries.iter().find(|e| e.name == old_dir_name);
-            if old_entry.is_none() {
-                self.layer3.close_stream(old_handle)?;
-                return Err(YakError::NotFound(old_path.to_string()));
-            }
-            let stream_id = old_entry.unwrap().id;
-
-            let remaining: Vec<StreamEntry> = old_entries
-                .into_iter()
-                .filter(|e| e.name != old_dir_name)
-                .collect();
-            let buf = serialize_entries(&remaining, biw);
-            self.layer3.truncate(&old_handle, 0)?;
-            if !buf.is_empty() {
-                self.layer3.write(&old_handle, 0, &buf)?;
-            }
+            let stream_id =
+                match self.remove_entry_from_dir_handle(&old_handle, &old_dir_name, old_path) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        self.layer3.close_stream(old_handle)?;
+                        return Err(e);
+                    }
+                };
             self.layer3.close_stream(old_handle)?;
 
-            // Add to new parent (blocking)
+            // Add to new parent
             let new_handle = self
                 .layer3
                 .open_stream_blocking(new_parent_id, OpenMode::Write)?;
-            let new_entries = self.read_entries_from_handle(&new_handle)?;
-
-            if new_entries
-                .iter()
-                .any(|e| e.name == new_dir_name || e.name == new_leaf)
+            if let Err(e) =
+                self.add_entry_to_dir_handle(&new_handle, &new_dir_name, stream_id, new_path)
             {
                 self.layer3.close_stream(new_handle)?;
-                return Err(YakError::AlreadyExists(new_path.to_string()));
+                // Re-add to old parent to restore consistency
+                let old_handle = self
+                    .layer3
+                    .open_stream_blocking(old_parent_id, OpenMode::Write)?;
+                let _ =
+                    self.add_entry_to_dir_handle(&old_handle, &old_dir_name, stream_id, old_path);
+                self.layer3.close_stream(old_handle)?;
+                return Err(e);
             }
-
-            let entry = StreamEntry {
-                id: stream_id,
-                name: new_dir_name,
-            };
-            let entry_buf = serialize_entry(&entry, biw);
-            let len = self.layer3.stream_length(&new_handle)?;
-            self.layer3.write(&new_handle, len, &entry_buf)?;
             self.layer3.close_stream(new_handle)?;
         }
 
@@ -932,37 +977,24 @@ impl<L3: StreamLayer> Yak<L3> {
         }
         validate_path(path)?;
 
-        let biw = self.layer3.block_index_width();
         let (parent_path, leaf) = split_parent_leaf(path);
         let parent_id = self.resolve_dir_stream_id(parent_path)?;
-        let dir_entry_name = format!("{}/", leaf);
+
+        // Create new data stream in L3
+        let new_stream_id = self.layer3.create_stream(compressed)?;
 
         // Open parent dir stream for writing (blocking)
         let parent_handle = self
             .layer3
             .open_stream_blocking(parent_id, OpenMode::Write)?;
-        let entries = self.read_entries_from_handle(&parent_handle)?;
 
-        // Check for duplicates (stream or directory with same name)
-        if entries
-            .iter()
-            .any(|e| e.name == leaf || e.name == dir_entry_name)
-        {
+        // Add entry (checks for duplicates via name table binary search)
+        let result = self.add_entry_to_dir_handle(&parent_handle, leaf, new_stream_id, path);
+        if result.is_err() {
             self.layer3.close_stream(parent_handle)?;
-            return Err(YakError::AlreadyExists(path.to_string()));
+            let _ = self.layer3.delete_stream(new_stream_id);
+            return result.map(|_| StreamHandle(0)); // unreachable but keeps types happy
         }
-
-        // Create new data stream in L3
-        let new_stream_id = self.layer3.create_stream(compressed)?;
-
-        // Add entry to parent directory stream
-        let entry = StreamEntry {
-            id: new_stream_id,
-            name: leaf.to_string(),
-        };
-        let entry_buf = serialize_entry(&entry, biw);
-        let len = self.layer3.stream_length(&parent_handle)?;
-        self.layer3.write(&parent_handle, len, &entry_buf)?;
         self.layer3.close_stream(parent_handle)?;
 
         // Open the new data stream for writing
@@ -1051,7 +1083,6 @@ impl<L3: StreamLayer> Yak<L3> {
         }
         validate_path(path)?;
 
-        let biw = self.layer3.block_index_width();
         let (parent_path, leaf) = split_parent_leaf(path);
         let parent_id = self.resolve_dir_stream_id(parent_path)?;
 
@@ -1059,14 +1090,17 @@ impl<L3: StreamLayer> Yak<L3> {
         let parent_handle = self
             .layer3
             .open_stream_blocking(parent_id, OpenMode::Write)?;
-        let entries = self.read_entries_from_handle(&parent_handle)?;
 
-        let entry = entries.iter().find(|e| e.name == leaf);
-        if entry.is_none() {
-            self.layer3.close_stream(parent_handle)?;
-            return Err(YakError::NotFound(path.to_string()));
-        }
-        let stream_id = entry.unwrap().id;
+        // Find the entry first so we can check the open-streams lock
+        let biw = self.layer3.block_index_width() as usize;
+        let len = self.layer3.stream_length(&parent_handle)?;
+        let stream_id = match self.find_name_in_handle(&parent_handle, len, leaf, biw)? {
+            Some(id) => id,
+            None => {
+                self.layer3.close_stream(parent_handle)?;
+                return Err(YakError::NotFound(path.to_string()));
+            }
+        };
 
         // Check if stream is currently open at L4 level
         {
@@ -1084,13 +1118,8 @@ impl<L3: StreamLayer> Yak<L3> {
             }
         }
 
-        // Remove entry from parent
-        let remaining: Vec<StreamEntry> = entries.into_iter().filter(|e| e.name != leaf).collect();
-        let buf = serialize_entries(&remaining, biw);
-        self.layer3.truncate(&parent_handle, 0)?;
-        if !buf.is_empty() {
-            self.layer3.write(&parent_handle, 0, &buf)?;
-        }
+        // Remove entry from parent using in-place compaction
+        self.remove_entry_from_dir_handle(&parent_handle, leaf, path)?;
         self.layer3.close_stream(parent_handle)?;
 
         // Delete the stream in L3
@@ -1109,126 +1138,80 @@ impl<L3: StreamLayer> Yak<L3> {
         validate_path(old_path)?;
         validate_path(new_path)?;
 
-        let biw = self.layer3.block_index_width();
         let (old_parent_path, old_leaf) = split_parent_leaf(old_path);
         let (new_parent_path, new_leaf) = split_parent_leaf(new_path);
 
         let old_parent_id = self.resolve_dir_stream_id(old_parent_path)?;
         let new_parent_id = self.resolve_dir_stream_id(new_parent_path)?;
 
+        // Look up the stream ID and check it's not open before mutating anything
+        let stream_id = self
+            .find_entry_in_dir(old_parent_id, old_leaf)?
+            .ok_or_else(|| YakError::NotFound(old_path.to_string()))?;
+        {
+            let state = self.state.lock().unwrap();
+            if state
+                .open_streams
+                .values()
+                .any(|s| s.stream_id == stream_id)
+            {
+                return Err(YakError::LockConflict(
+                    "cannot rename an open stream".to_string(),
+                ));
+            }
+        }
+
         if old_parent_id == new_parent_id {
-            // Same parent (blocking)
+            // Same parent: remove old entry, add new entry
             let handle = self
                 .layer3
                 .open_stream_blocking(old_parent_id, OpenMode::Write)?;
-            let entries = self.read_entries_from_handle(&handle)?;
 
-            let old_entry = entries.iter().find(|e| e.name == old_leaf);
-            if old_entry.is_none() {
-                self.layer3.close_stream(handle)?;
-                return Err(YakError::NotFound(old_path.to_string()));
-            }
-            let stream_id = old_entry.unwrap().id;
-
-            // Check if stream is currently open
-            {
-                let state = self.state.lock().unwrap();
-                if state
-                    .open_streams
-                    .values()
-                    .any(|s| s.stream_id == stream_id)
-                {
-                    drop(state);
+            let removed_id = match self.remove_entry_from_dir_handle(&handle, old_leaf, old_path) {
+                Ok(id) => id,
+                Err(e) => {
                     self.layer3.close_stream(handle)?;
-                    return Err(YakError::LockConflict(
-                        "cannot rename an open stream".to_string(),
-                    ));
+                    return Err(e);
                 }
-            }
+            };
 
-            let new_dir_name = format!("{}/", new_leaf);
-            if entries
-                .iter()
-                .any(|e| e.name == new_leaf || e.name == new_dir_name)
-            {
+            if let Err(e) = self.add_entry_to_dir_handle(&handle, new_leaf, removed_id, new_path) {
+                // Restore old entry
+                let _ = self.add_entry_to_dir_handle(&handle, old_leaf, removed_id, old_path);
                 self.layer3.close_stream(handle)?;
-                return Err(YakError::AlreadyExists(new_path.to_string()));
-            }
-
-            let mut remaining: Vec<StreamEntry> =
-                entries.into_iter().filter(|e| e.name != old_leaf).collect();
-            remaining.push(StreamEntry {
-                id: stream_id,
-                name: new_leaf.to_string(),
-            });
-
-            let buf = serialize_entries(&remaining, biw);
-            self.layer3.truncate(&handle, 0)?;
-            if !buf.is_empty() {
-                self.layer3.write(&handle, 0, &buf)?;
+                return Err(e);
             }
             self.layer3.close_stream(handle)?;
         } else {
-            // Different parents (blocking)
+            // Different parents: remove from old, add to new
             let old_handle = self
                 .layer3
                 .open_stream_blocking(old_parent_id, OpenMode::Write)?;
-            let old_entries = self.read_entries_from_handle(&old_handle)?;
-
-            let old_entry = old_entries.iter().find(|e| e.name == old_leaf);
-            if old_entry.is_none() {
-                self.layer3.close_stream(old_handle)?;
-                return Err(YakError::NotFound(old_path.to_string()));
-            }
-            let stream_id = old_entry.unwrap().id;
-
-            {
-                let state = self.state.lock().unwrap();
-                if state
-                    .open_streams
-                    .values()
-                    .any(|s| s.stream_id == stream_id)
-                {
-                    drop(state);
-                    self.layer3.close_stream(old_handle)?;
-                    return Err(YakError::LockConflict(
-                        "cannot rename an open stream".to_string(),
-                    ));
-                }
-            }
-
-            let remaining: Vec<StreamEntry> = old_entries
-                .into_iter()
-                .filter(|e| e.name != old_leaf)
-                .collect();
-            let buf = serialize_entries(&remaining, biw);
-            self.layer3.truncate(&old_handle, 0)?;
-            if !buf.is_empty() {
-                self.layer3.write(&old_handle, 0, &buf)?;
-            }
+            let removed_id =
+                match self.remove_entry_from_dir_handle(&old_handle, old_leaf, old_path) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        self.layer3.close_stream(old_handle)?;
+                        return Err(e);
+                    }
+                };
             self.layer3.close_stream(old_handle)?;
 
             let new_handle = self
                 .layer3
                 .open_stream_blocking(new_parent_id, OpenMode::Write)?;
-            let new_entries = self.read_entries_from_handle(&new_handle)?;
-
-            let new_dir_name = format!("{}/", new_leaf);
-            if new_entries
-                .iter()
-                .any(|e| e.name == new_leaf || e.name == new_dir_name)
+            if let Err(e) =
+                self.add_entry_to_dir_handle(&new_handle, new_leaf, removed_id, new_path)
             {
                 self.layer3.close_stream(new_handle)?;
-                return Err(YakError::AlreadyExists(new_path.to_string()));
+                // Restore old entry
+                let old_handle = self
+                    .layer3
+                    .open_stream_blocking(old_parent_id, OpenMode::Write)?;
+                let _ = self.add_entry_to_dir_handle(&old_handle, old_leaf, removed_id, old_path);
+                self.layer3.close_stream(old_handle)?;
+                return Err(e);
             }
-
-            let entry = StreamEntry {
-                id: stream_id,
-                name: new_leaf.to_string(),
-            };
-            let entry_buf = serialize_entry(&entry, biw);
-            let len = self.layer3.stream_length(&new_handle)?;
-            self.layer3.write(&new_handle, len, &entry_buf)?;
             self.layer3.close_stream(new_handle)?;
         }
 
@@ -1438,6 +1421,7 @@ impl<L3: StreamLayer> Yak<L3> {
     }
 
     /// Read and parse all directory stream entries from an already-open handle.
+    /// Reads the full stream; used by list() and verify().
     fn read_entries_from_handle(&self, handle: &L3::Handle) -> Result<Vec<StreamEntry>, YakError> {
         let len = self.layer3.stream_length(handle)?;
         if len == 0 {
@@ -1449,7 +1433,8 @@ impl<L3: StreamLayer> Yak<L3> {
     }
 
     /// Look up a single entry by name in a directory stream.
-    /// Uses hash-accelerated scan — zero heap allocations on the search path.
+    /// O(log n) via binary search on the name table.
+    /// Reads only footer + name table + candidate entries (not full stream).
     /// Opens and closes the directory stream handle internally.
     fn find_entry_in_dir(&self, dir_stream_id: u64, name: &str) -> Result<Option<u64>, YakError> {
         let handle = self
@@ -1460,10 +1445,271 @@ impl<L3: StreamLayer> Yak<L3> {
             self.layer3.close_stream(handle)?;
             return Ok(None);
         }
-        let mut buf = vec![0u8; len as usize];
-        self.layer3.read(&handle, 0, &mut buf)?;
+
+        let biw = self.layer3.block_index_width() as usize;
+        let result = self.find_name_in_handle(&handle, len, name, biw);
         self.layer3.close_stream(handle)?;
-        find_entry_by_name(&buf, name, self.layer3.block_index_width())
+        result
+    }
+
+    /// Search for a name in an open directory stream using the name table.
+    /// Returns Some(id) if found, None otherwise.
+    fn find_name_in_handle(
+        &self,
+        handle: &L3::Handle,
+        stream_len: u64,
+        name: &str,
+        biw: usize,
+    ) -> Result<Option<u64>, YakError> {
+        if stream_len == 0 {
+            return Ok(None);
+        }
+        // Read footer
+        let mut footer_buf = [0u8; FOOTER_SIZE];
+        self.layer3
+            .read(handle, stream_len - FOOTER_SIZE as u64, &mut footer_buf)?;
+        let entry_count = u32::from_le_bytes(footer_buf[0..4].try_into().unwrap());
+        let name_table_offset = u32::from_le_bytes(footer_buf[4..8].try_into().unwrap());
+
+        // Read name table
+        let table_size = entry_count as usize * NAME_TABLE_SLOT_SIZE;
+        let mut name_table = vec![0u8; table_size];
+        self.layer3
+            .read(handle, name_table_offset as u64, &mut name_table)?;
+
+        // Binary search
+        let name_bytes = name.as_bytes();
+        let target_hash = fnv1a_hash(name_bytes);
+        let range = find_hash_range(&name_table, entry_count, target_hash);
+
+        for slot_idx in range {
+            let offset = slot_offset(&name_table, slot_idx) as usize;
+            // Read entry header: id (biw) + name_len (2)
+            let header_size = biw + 2;
+            let mut header_buf = vec![0u8; header_size];
+            self.layer3.read(handle, offset as u64, &mut header_buf)?;
+
+            let name_len = u16::from_le_bytes([header_buf[biw], header_buf[biw + 1]]) as usize;
+            if name_len == name_bytes.len() {
+                let mut name_buf = vec![0u8; name_len];
+                self.layer3
+                    .read(handle, (offset + header_size) as u64, &mut name_buf)?;
+                if name_buf == name_bytes {
+                    let mut id_bytes = [0u8; 8];
+                    id_bytes[..biw].copy_from_slice(&header_buf[..biw]);
+                    return Ok(Some(u64::from_le_bytes(id_bytes)));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Add an entry to a directory stream that is already open for writing.
+    /// Checks for duplicates (both `entry_name` and the dir/stream alternative).
+    /// On success the entry has been written; the caller must still close the handle.
+    fn add_entry_to_dir_handle(
+        &self,
+        handle: &L3::Handle,
+        entry_name: &str,
+        entry_id: u64,
+        error_path: &str,
+    ) -> Result<(), YakError> {
+        let biw = self.layer3.block_index_width();
+        let biw_usize = biw as usize;
+        let len = self.layer3.stream_length(handle)?;
+
+        // Determine the alternative name for duplicate checking
+        let alt_name = if let Some(stripped) = entry_name.strip_suffix('/') {
+            stripped.to_string()
+        } else {
+            format!("{}/", entry_name)
+        };
+
+        if len == 0 {
+            // Empty directory — write single entry + 1-slot table + footer
+            let entry = StreamEntry {
+                id: entry_id,
+                name: entry_name.to_string(),
+            };
+            let buf = build_directory_stream(&[entry], biw);
+            self.layer3.write(handle, 0, &buf)?;
+            return Ok(());
+        }
+
+        // Read footer
+        let mut footer_buf = [0u8; FOOTER_SIZE];
+        self.layer3
+            .read(handle, len - FOOTER_SIZE as u64, &mut footer_buf)?;
+        let entry_count = u32::from_le_bytes(footer_buf[0..4].try_into().unwrap());
+        let name_table_offset = u32::from_le_bytes(footer_buf[4..8].try_into().unwrap());
+
+        // Read name table
+        let table_size = entry_count as usize * NAME_TABLE_SLOT_SIZE;
+        let mut name_table = vec![0u8; table_size];
+        self.layer3
+            .read(handle, name_table_offset as u64, &mut name_table)?;
+
+        // Check for duplicates against both the entry name and its alternative
+        for check_name in [entry_name, alt_name.as_str()] {
+            let hash = fnv1a_hash(check_name.as_bytes());
+            let range = find_hash_range(&name_table, entry_count, hash);
+            let check_bytes = check_name.as_bytes();
+            for slot_idx in range {
+                let offset = slot_offset(&name_table, slot_idx) as usize;
+                let mut header_buf = vec![0u8; biw_usize + 2];
+                self.layer3.read(handle, offset as u64, &mut header_buf)?;
+                let name_len =
+                    u16::from_le_bytes([header_buf[biw_usize], header_buf[biw_usize + 1]]) as usize;
+                if name_len == check_bytes.len() {
+                    let mut name_buf = vec![0u8; name_len];
+                    self.layer3
+                        .read(handle, (offset + biw_usize + 2) as u64, &mut name_buf)?;
+                    if name_buf == check_bytes {
+                        return Err(YakError::AlreadyExists(error_path.to_string()));
+                    }
+                }
+            }
+        }
+
+        // Build the new entry bytes
+        let entry = StreamEntry {
+            id: entry_id,
+            name: entry_name.to_string(),
+        };
+        let entry_bytes = serialize_entry_data(&entry, biw);
+
+        // Parse name table into slots and insert the new slot in sorted order
+        let mut slots = parse_name_table_slots(&name_table, entry_count);
+        let new_hash = fnv1a_hash(entry_name.as_bytes());
+        // New entry goes at current name_table_offset (appended to entry data region)
+        let insert_pos = slots.partition_point(|&(h, _)| h < new_hash);
+        slots.insert(insert_pos, (new_hash, name_table_offset));
+
+        let new_nto = name_table_offset + entry_bytes.len() as u32;
+        let table_and_footer = serialize_table_and_footer(&slots, new_nto);
+
+        // Single contiguous write: entry_bytes + table + footer at old name_table_offset
+        let mut write_buf = Vec::with_capacity(entry_bytes.len() + table_and_footer.len());
+        write_buf.extend_from_slice(&entry_bytes);
+        write_buf.extend_from_slice(&table_and_footer);
+        self.layer3
+            .write(handle, name_table_offset as u64, &write_buf)?;
+
+        Ok(())
+    }
+
+    /// Remove an entry from a directory stream using in-place compaction.
+    /// Returns the stream ID of the removed entry.
+    /// The caller must still close the handle.
+    fn remove_entry_from_dir_handle(
+        &self,
+        handle: &L3::Handle,
+        entry_name: &str,
+        error_path: &str,
+    ) -> Result<u64, YakError> {
+        let biw = self.layer3.block_index_width() as usize;
+        let len = self.layer3.stream_length(handle)?;
+        if len == 0 {
+            return Err(YakError::NotFound(error_path.to_string()));
+        }
+
+        // Read footer
+        let mut footer_buf = [0u8; FOOTER_SIZE];
+        self.layer3
+            .read(handle, len - FOOTER_SIZE as u64, &mut footer_buf)?;
+        let entry_count = u32::from_le_bytes(footer_buf[0..4].try_into().unwrap());
+        let name_table_offset = u32::from_le_bytes(footer_buf[4..8].try_into().unwrap());
+
+        // Read name table
+        let table_size = entry_count as usize * NAME_TABLE_SLOT_SIZE;
+        let mut name_table = vec![0u8; table_size];
+        self.layer3
+            .read(handle, name_table_offset as u64, &mut name_table)?;
+
+        // Find the entry via binary search
+        let name_bytes = entry_name.as_bytes();
+        let target_hash = fnv1a_hash(name_bytes);
+        let range = find_hash_range(&name_table, entry_count, target_hash);
+
+        let mut found_slot_idx = None;
+        let mut found_offset = 0u32;
+        let mut found_id = 0u64;
+        let mut found_entry_size = 0usize;
+
+        for slot_idx in range {
+            let offset = slot_offset(&name_table, slot_idx);
+            let mut header_buf = vec![0u8; biw + 2];
+            self.layer3.read(handle, offset as u64, &mut header_buf)?;
+            let mut id_bytes = [0u8; 8];
+            id_bytes[..biw].copy_from_slice(&header_buf[..biw]);
+            let id = u64::from_le_bytes(id_bytes);
+            let name_len = u16::from_le_bytes([header_buf[biw], header_buf[biw + 1]]) as usize;
+
+            if name_len == name_bytes.len() {
+                let mut name_buf = vec![0u8; name_len];
+                self.layer3
+                    .read(handle, (offset as usize + biw + 2) as u64, &mut name_buf)?;
+                if name_buf == name_bytes {
+                    found_slot_idx = Some(slot_idx);
+                    found_offset = offset;
+                    found_id = id;
+                    found_entry_size = biw + 2 + name_len;
+                    break;
+                }
+            }
+        }
+
+        let slot_idx = match found_slot_idx {
+            Some(idx) => idx,
+            None => return Err(YakError::NotFound(error_path.to_string())),
+        };
+
+        let nto = name_table_offset as usize;
+        let gap_start = found_offset as usize;
+        let gap_end = gap_start + found_entry_size;
+
+        // Chunk-copy to close the gap in the entry data region
+        if gap_end < nto {
+            let mut copy_buf = vec![0u8; COMPACT_COPY_BUF_SIZE];
+            let mut src = gap_end;
+            let mut dst = gap_start;
+            while src < nto {
+                let chunk = (nto - src).min(COMPACT_COPY_BUF_SIZE);
+                self.layer3
+                    .read(handle, src as u64, &mut copy_buf[..chunk])?;
+                self.layer3.write(handle, dst as u64, &copy_buf[..chunk])?;
+                src += chunk;
+                dst += chunk;
+            }
+        }
+
+        // Update name table: remove the deleted slot and adjust offsets
+        let mut slots = parse_name_table_slots(&name_table, entry_count);
+        slots.remove(slot_idx);
+        for slot in &mut slots {
+            if slot.1 > found_offset {
+                slot.1 -= found_entry_size as u32;
+            }
+        }
+
+        let new_nto = (nto - found_entry_size) as u32;
+
+        if slots.is_empty() {
+            // Directory is now empty — truncate to zero
+            self.layer3.truncate(handle, 0)?;
+        } else {
+            // Write updated table + footer at the new name_table_offset
+            let table_and_footer = serialize_table_and_footer(&slots, new_nto);
+            self.layer3
+                .write(handle, new_nto as u64, &table_and_footer)?;
+
+            // Truncate to remove the old tail
+            let new_len =
+                new_nto as u64 + (slots.len() * NAME_TABLE_SLOT_SIZE) as u64 + FOOTER_SIZE as u64;
+            self.layer3.truncate(handle, new_len)?;
+        }
+
+        Ok(found_id)
     }
 }
 

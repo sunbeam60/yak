@@ -7,6 +7,29 @@ STREAMS_STREAM_ID lock is acquired. This unnecessarily evicts cached redirector 
 belonging to user streams that no other thread could have modified. The only blocks that
 genuinely need cross-thread coherency are the **Streams stream's own** redirector blocks.
 
+### When does invalidation actually fire?
+
+The stream descriptor's `size` field is updated **in memory** during `pyramid_write()`
+(`streams_from_blocks.rs:667,722`), so individual writes to an open stream do NOT trigger
+invalidation. However, every **open/close/create/delete/metadata-query** cycle does:
+
+| Operation | Invalidates? | Line |
+|-----------|-------------|------|
+| `write()` to a stream | No | — |
+| `close_stream()` (writer) | **Yes** | `:2080` |
+| `open_stream_inner()` | **Yes** | `:1684` |
+| `create_stream()` | **Yes** | `:1924` |
+| `delete_stream()` | **Yes** | `:2111` |
+| `stream_exists()` | **Yes** | `:2005` |
+| `stream_count()` | **Yes** | `:2024` |
+| `stream_ids()` | **Yes** | `:2043` |
+
+This means **short-lived stream open/write/close cycles** are the primary pain point —
+each close flushes the cached descriptor to the Streams stream and wipes the entire
+per-thread LRU, evicting warm redirector blocks for every other stream that thread was
+serving. Interleaved metadata queries (`stream_exists`, `stream_count`, `stream_ids`)
+cause the same collateral damage.
+
 ## Design
 
 Replace `cache: bool` with a `CacheMode` enum. Add a **shared** (Mutex-guarded) LRU cache
@@ -21,28 +44,31 @@ writes immediately. `invalidate_block_cache()` is no longer needed and can be re
 
 ## Step 0: Add a targeted benchmark (on master, before cache changes)
 
-None of the existing benchmarks stress the pattern where this optimisation helps:
-a thread doing repeated random I/O on a long-lived stream while Streams stream
-operations (open/close/create by other threads) force cache invalidation.
+The key insight is that cache invalidation fires on **stream lifecycle operations**
+(open/close/create/delete) and **metadata queries**, not on individual reads/writes.
+The most realistic scenario that suffers is **short-lived stream open/write/close
+cycles interleaved with long-running I/O on other streams** — each close wipes
+the calling thread's entire LRU, destroying warm redirector blocks for unrelated
+streams.
 
 **Add a `cache-pressure` benchmark** to `yak_cl/src/bench.rs` that captures this:
 
-1. **Setup (not timed):** Create N large streams (e.g. 10 × 2MB) so each has a
+1. **Setup (not timed):** Create N large streams (e.g. 10 × 2 MB) so each has a
    deep-ish pyramid with many redirector blocks worth caching.
 2. **Timed phase:** Launch T threads concurrently:
    - **I/O threads** (T/2): Each opens one of the pre-populated streams and performs
-     many small random reads (e.g. 500 × 4KB at random offsets). This repeatedly
+     many small random reads (e.g. 500 × 4 KB at random offsets). This repeatedly
      navigates the pyramid, benefiting from cached redirector blocks.
-   - **Churn threads** (T/2): Each loops creating and immediately deleting small
-     throwaway streams. This forces Streams stream lock acquisitions, which today
-     call `invalidate_block_cache()` on the churn thread — but critically, the I/O
-     threads *also* invalidate whenever they eventually close/reopen (or do any
-     Streams operation).
+   - **Churn threads** (T/2): Each loops performing short-lived open/write/close
+     cycles on throwaway streams. Every close calls `invalidate_block_cache()` on
+     the churn thread itself. This is realistic — think of a workload appending
+     log entries, rotating temp streams, or updating metadata streams frequently.
 
-   To make the I/O threads hit invalidation mid-flight, have them periodically call
-   `stream_exists()` or `open_stream()` for a different stream (a lightweight Streams
-   operation) between batches of reads. This triggers `invalidate_block_cache()` on
-   the I/O thread, wiping its warm user-stream redirector cache.
+   To make the I/O threads *also* hit invalidation mid-flight, have them
+   periodically perform a short-lived open/close of a different stream (or call
+   `stream_exists()`) between batches of reads. This triggers
+   `invalidate_block_cache()` **on the I/O thread**, wiping its warm user-stream
+   redirector cache — the exact collateral damage this optimisation eliminates.
 
 3. **Metric:** Wall-clock time for the I/O threads to complete all reads.
 
@@ -52,13 +78,16 @@ the same benchmark shows the improvement.
 
 ### Why this benchmark works
 
-- The I/O threads build up a warm thread-local cache of user stream redirectors
-  during random reads.
-- The periodic `stream_exists()` call acquires the Streams lock and calls
-  `invalidate_block_cache()`, flushing that warm cache.
-- After the dual-cache change, `invalidate_block_cache()` is gone. The I/O thread's
-  thread-local cache survives the Streams lock acquisition, so subsequent reads hit
-  cached redirectors instead of going to L1.
+- The I/O threads build up a warm thread-local cache of user stream redirector
+  blocks during random reads.
+- The periodic open/close cycle (or `stream_exists()` call) acquires the Streams
+  lock and calls `invalidate_block_cache()`, flushing the **entire** per-thread
+  LRU — including the warm redirector blocks for the I/O thread's own stream.
+- After the dual-cache change, `invalidate_block_cache()` is gone. The I/O
+  thread's thread-local cache survives Streams stream operations, so subsequent
+  reads hit cached redirectors instead of going to L1.
+- The churn threads model a realistic workload pattern (frequent short-lived
+  streams) rather than an artificial stress test.
 
 ---
 

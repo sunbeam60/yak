@@ -1,4 +1,10 @@
-<p align="center"><img width="256" height="256" alt="An icon of a yak coming out of a square" src="https://github.com/user-attachments/assets/775aac25-e418-43ab-977f-b0fb4e3aa540" /></p>
+<p align="center">
+<picture>
+  <source srcset="https://github.com/user-attachments/assets/765a4352-acbd-45e7-b071-dae1d66342e7" media="(prefers-color-scheme: dark)">
+  <img width="256" height="256" alt="An icon of a yak coming out of a square" src="https://github.com/user-attachments/assets/775aac25-e418-43ab-977f-b0fb4e3aa540" />
+</picture>
+</p>
+
 
 # Yak - Yet Another Kontainer
 Yak is a library that helps you to easily build your own binary file formats. 

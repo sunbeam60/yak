@@ -20,35 +20,33 @@ The architecture previously used "compressed virtual blocks" in diagrams and "vi
 
 The architecture previously said nothing about encryption at the block layer. It now documents L2's optional AES-XTS block-level encryption, including a full L2 header table with all encryption fields (salt, Argon2id parameters, verification hash, wrapped key).
 
+### Stream descriptor free list now documented (fixed)
+
+The architecture previously said "One possible optimization is to maintain a free list of streams. For now, a sequential scan ... is acceptable." The architecture now documents the implemented free list: 8-byte head at the start of the Streams stream, singly-linked chain through freed descriptors, reuse on allocation.
+
+### Name table and O(log n) directory lookups now documented (fixed)
+
+The architecture previously described sequential scanning with per-entry hash comparison. It now documents the Name Table approach: sorted (hash, offset) pairs appended after stream entries, binary search for O(log n) lookups, and the insert/delete mechanics.
+
 ## Active divergences
 
-### Directory entry format has diverged from architecture
+### Directory entry field order differs from architecture
 
-**Architecture says:** Stream entries in directory streams are serialized as:
-```
-| length (2 bytes) | stream identifier (2-8 bytes) | name hash (4 bytes) | name (1-65,522 bytes) |
-```
-With sequential scanning and hash comparison for lookups.
+**Architecture says:** Entry format is `| length (2 bytes) | stream identifier (2-8 bytes) | name |`
 
-**Reality:** L4 format version 2 uses a fundamentally different structure. Directory streams now have three regions:
+**Reality:** The code serializes entries as `| id (biw bytes) | name_len (2 bytes) | name |` — the stream identifier comes first, then the name length. The fields are the same but in a different order.
 
-1. **Entry data region** -- variable-length entries: `| id (biw bytes) | name_len (2 bytes) | name (variable) |`
-2. **Sorted name table** -- array of `(hash: u32, offset: u32)` pairs, sorted by hash for binary search
-3. **Footer** -- `| entry_count: u32 | name_table_offset: u32 |` (8 bytes)
+### Directory footer stores offset rather than size
 
-Lookups use binary search on the sorted name table (O(log n)) with FNV-1a hashing, falling back to full string comparison on hash collisions. This replaces the sequential scan described in the architecture. The per-entry `length` prefix from the architecture is also gone; entry length is derived from `name_len`.
+**Architecture says:** The footer is "an 8 byte that indicates the size of the Name Table."
+
+**Reality:** The footer is 4 bytes storing `name_table_offset: u32` — the byte position where the name table begins. The entry count is derived from `(stream_len - footer_size - name_table_offset) / slot_size`. Both approaches locate the name table equally well; the implementation chose offset (4 bytes) over size (8 bytes).
 
 ### Stream descriptor format has an additional field
 
-**Architecture says:** Stream descriptors have three fields: size (u64), top_block (u64), and reserved (u64) -- 24 bytes.
+**Architecture says:** Stream descriptors have three fields: size (u64), top_block (u64), and reserved (u64) — 24 bytes.
 
 **Reality:** Stream descriptors are 25 bytes. A `flags: u8` field was added at byte 24 to support per-stream compression (`STREAM_FLAG_COMPRESSED = 1`). The architecture's compression section discusses compression conceptually but doesn't mention this flag in the descriptor format.
-
-### Stream descriptor free list is implemented
-
-**Architecture says:** "One possible optimization is to maintain a free list of streams. For now, a sequential scan of the Streams stream for a free stream descriptor is acceptable."
-
-**Reality:** The free list optimization is fully implemented. The first 8 bytes of the Streams stream store a `free_list_head` index. Freed descriptors form a singly-linked list using the `top_block` field as the next pointer. New stream creation reuses free slots before appending.
 
 ### L2 API is broader than documented
 

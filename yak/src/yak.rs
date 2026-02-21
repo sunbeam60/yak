@@ -9,13 +9,14 @@ const L4_PAYLOAD_SIZE: u16 = 15;
 
 /// Current L4 format version. Bumped when the on-disk directory entry format changes.
 /// Version 2: sorted name table with O(log n) binary search lookup.
-const L4_FORMAT_VERSION: u8 = 2;
+/// Version 3: footer shrunk from 8 to 4 bytes (entry_count derived from name_table_offset).
+const L4_FORMAT_VERSION: u8 = 3;
 
 /// Size of one name table slot: hash (u32) + offset (u32) = 8 bytes.
 const NAME_TABLE_SLOT_SIZE: usize = 8;
 
-/// Size of the directory stream footer: entry_count (u32) + name_table_offset (u32) = 8 bytes.
-const FOOTER_SIZE: usize = 8;
+/// Size of the directory stream footer: name_table_offset (u32) = 4 bytes.
+const FOOTER_SIZE: usize = 4;
 
 /// Size of the copy buffer used when compacting entry data on delete.
 const COMPACT_COPY_BUF_SIZE: usize = 64 * 1024;
@@ -32,6 +33,13 @@ fn fnv1a_hash(bytes: &[u8]) -> u32 {
         hash = hash.wrapping_mul(FNV_PRIME);
     }
     hash
+}
+
+/// Derive the entry count from the stream length and name_table_offset.
+/// The name table sits between name_table_offset and the footer, so its
+/// byte size divided by NAME_TABLE_SLOT_SIZE gives the number of entries.
+fn entry_count_from_footer(stream_len: usize, name_table_offset: u32) -> u32 {
+    ((stream_len - FOOTER_SIZE - name_table_offset as usize) / NAME_TABLE_SLOT_SIZE) as u32
 }
 
 #[derive(Debug)]
@@ -145,7 +153,6 @@ fn build_directory_stream(entries: &[StreamEntry], block_index_width: u8) -> Vec
     slots.sort_by_key(|&(hash, _)| hash);
 
     let name_table_offset = entry_data.len() as u32;
-    let entry_count = entries.len() as u32;
 
     // Assemble: entry_data + name_table + footer
     let total = entry_data.len() + slots.len() * NAME_TABLE_SLOT_SIZE + FOOTER_SIZE;
@@ -155,24 +162,22 @@ fn build_directory_stream(entries: &[StreamEntry], block_index_width: u8) -> Vec
         buf.extend_from_slice(&hash.to_le_bytes());
         buf.extend_from_slice(&offset.to_le_bytes());
     }
-    buf.extend_from_slice(&entry_count.to_le_bytes());
     buf.extend_from_slice(&name_table_offset.to_le_bytes());
     buf
 }
 
 /// Parse the footer from the last FOOTER_SIZE bytes of a directory stream buffer.
-/// Returns (entry_count, name_table_offset).
-fn parse_footer(data: &[u8]) -> Result<(u32, u32), YakError> {
+/// Returns name_table_offset.
+fn parse_footer(data: &[u8]) -> Result<u32, YakError> {
     if data.len() < FOOTER_SIZE {
         return Err(YakError::IoError(
             "directory stream too short for footer".to_string(),
         ));
     }
     let footer_start = data.len() - FOOTER_SIZE;
-    let entry_count = u32::from_le_bytes(data[footer_start..footer_start + 4].try_into().unwrap());
     let name_table_offset =
-        u32::from_le_bytes(data[footer_start + 4..footer_start + 8].try_into().unwrap());
-    Ok((entry_count, name_table_offset))
+        u32::from_le_bytes(data[footer_start..footer_start + 4].try_into().unwrap());
+    Ok(name_table_offset)
 }
 
 /// Parse all entries from a complete directory stream buffer.
@@ -181,9 +186,10 @@ fn parse_entries(data: &[u8], block_index_width: u8) -> Result<Vec<StreamEntry>,
     if data.is_empty() {
         return Ok(Vec::new());
     }
-    let (entry_count, name_table_offset) = parse_footer(data)?;
+    let name_table_offset = parse_footer(data)?;
     let nto = name_table_offset as usize;
     let biw = block_index_width as usize;
+    let entry_count = entry_count_from_footer(data.len(), name_table_offset);
     // Minimum entry size: biw (id) + 2 (name_len) + 0 (empty name not valid, but parsing allows it)
     let min_entry_size = biw + 2;
 
@@ -213,13 +219,6 @@ fn parse_entries(data: &[u8], block_index_width: u8) -> Result<Vec<StreamEntry>,
         pos = name_end;
     }
 
-    if entries.len() != entry_count as usize {
-        return Err(YakError::IoError(format!(
-            "entry count mismatch: footer says {} but parsed {}",
-            entry_count,
-            entries.len()
-        )));
-    }
     Ok(entries)
 }
 
@@ -305,14 +304,12 @@ fn parse_name_table_slots(name_table: &[u8], entry_count: u32) -> Vec<(u32, u32)
 
 /// Serialize name table slots and footer into a contiguous byte buffer.
 fn serialize_table_and_footer(slots: &[(u32, u32)], name_table_offset: u32) -> Vec<u8> {
-    let entry_count = slots.len() as u32;
     let total = slots.len() * NAME_TABLE_SLOT_SIZE + FOOTER_SIZE;
     let mut buf = Vec::with_capacity(total);
     for &(hash, offset) in slots {
         buf.extend_from_slice(&hash.to_le_bytes());
         buf.extend_from_slice(&offset.to_le_bytes());
     }
-    buf.extend_from_slice(&entry_count.to_le_bytes());
     buf.extend_from_slice(&name_table_offset.to_le_bytes());
     buf
 }
@@ -1487,8 +1484,8 @@ impl<L3: StreamLayer> Yak<L3> {
         let mut footer_buf = [0u8; FOOTER_SIZE];
         self.layer3
             .read(handle, stream_len - FOOTER_SIZE as u64, &mut footer_buf)?;
-        let entry_count = u32::from_le_bytes(footer_buf[0..4].try_into().unwrap());
-        let name_table_offset = u32::from_le_bytes(footer_buf[4..8].try_into().unwrap());
+        let name_table_offset = u32::from_le_bytes(footer_buf[0..4].try_into().unwrap());
+        let entry_count = entry_count_from_footer(stream_len as usize, name_table_offset);
 
         let table_size = entry_count as usize * NAME_TABLE_SLOT_SIZE;
         let mut name_table = vec![0u8; table_size];

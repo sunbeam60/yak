@@ -120,13 +120,13 @@ Throughout this section, layers are described by L1, L2, L3 and L4, denoting Lay
 
 There are 5 projects across the workspace:
 
-| Module                    | Language      | Path              |
-| ------------------------- | ------------- | ----------------- |
-| Yak library               | Rust          | yak/              |
-| C ABI Yak wrapper         | Rust          | yak_c/            |
-| Python Yak wrapper        | Rust          | yak_python/       |
-| Command line Yak tool     | Rust          | yak_cl/           |
-| Testing harness and tests | Python/pytest | yak_pytest/       |
+| Module                    | Language      | Path        |
+| ------------------------- | ------------- | ----------- |
+| Yak library               | Rust          | yak/        |
+| C ABI Yak wrapper         | Rust          | yak_c/      |
+| Python Yak wrapper        | Rust          | yak_python/ |
+| Command line Yak tool     | Rust          | yak_cl/     |
+| Testing harness and tests | Python/pytest | yak_pytest/ |
 
 * The Yak library is published as a crate on crates.io
 * The C ABI wrapper produces a dynamic and a static library with non-mangled names for linking into a C/C++ project - and for use in any environment that supports C FFI libraries (e.g. LuaJIT). A Yak header file is generated using cbindgen, which defines the function names used in the libraries.
@@ -229,28 +229,24 @@ When an existing Yak file is opened, it reads the root directory stream index nu
 Stream entries in the directory streams are serialized compactly. Since the length of their names vary, they are encoded as follows:
 
 ```ASCII
-| length (2 bytes) | stream identifier (2-8 bytes) | name hash (4 bytes) | name (1-65,522 bytes) ........ | 
+| length (2 bytes) | stream identifier (2-8 bytes) | name (1-65,522 bytes) ........ | 
 ```
 
-The hash of the name allows for (relatively) quick skipping through the list of stream entries when searching for a specific name in the directory. Each entry's hash is compared against the hash of the name being searched for; only when the hashes match is a full string compare done (to prevent against the unlikely risk of a hash clash).
+Following all the name/stream ID entries is a so called "Name Table". The purpose of this table is to facilitate fast O(log n) searcing for a named stream. Of course, in a directory with 5 streams, this is rather overkill, but in a directory with 50,000 streams it drastically cuts down the time require to locate the right stream.
 
-When an entry is deleted from this stream, all the following entries are copied upwards in the stream and the stream is shortened, i.e.:
+At the very, very end of the directory stream is an 8 byte that indicates the size of the Name Table. When Yak needs to locate a stream by name, it jumps to the end (less 8 bytes) of the directory stream, reads the length of the Name Table, jumps that much further back in the table and reads the name table itself.
 
-```
-Before deletion	: | entry 1 | entry 2 | entry 3 | entry 4 | entry 5
--- Entry 2 is deleted --
-After deletion	: | entry 1 | entry 3 | entry 4 | entry 5
-```
+The Name Table consists of pairs of string hashes and offsets and it is sorted by string hashes. With the hash of the name the caller is searching for, Yak does a binary search to find the one or more hashes that matches the hash of the name the caller is attempting to open. If one or more identical hashes have been found in the Name Table, Yak jumps to these entries, compares the length of the string (for early rejection), then does a string compare for the caller requested name. If there's a match, L4 now has the Stream ID and can proceed to open this stream.
 
-When an entry is added, it is appended to the end of the stream, i.e.:
-
-```
-Before new entry:	| entry 1 | entry 2 | entry 3 
---- New entry inserted ---
-After new entry:	| entry 1 | entry 2 | entry 3 | entry 4
+```ASCII
+[Stream entries]* | [Name Table Entry]* | Size of Name Table
 ```
 
-If an entry is renamed, it is deleted and re-added at the end.
+When we insert a new Stream entry, we copy the Name Table, write the new Stream entry at the current end of the Stream entries (overwriting the existing Name Table), then insert the new Name table entry into the Name Table (keeping this table always sorted by hash) and then write the size of the Name Table. This is a quick operation.
+
+When we deleted a Stream entry, we "pull upwards" the remainders of streams by copying chunk by chunk forwards in the stream, then remove the hash/offset pair from the Name Table, write out the refreshed name table and finish by writing the size of the name table. This can be a slow operation.
+
+If an entry is renamed, it is deleted and re-added.
 
 ## L3 : Streams
 
@@ -409,11 +405,11 @@ This does, of course, introduce some slow downs in that every time a compressed 
 
 L3 has a list of Stream Descriptors for all streams that exist. This list itself stored in a stream. To track the stream that stores Stream Descriptors, a single Stream Descriptor is held "out of band"; lets call this descriptor "Streams" here for clarity of description. 
 
-When a new stream is created by a caller, we need to create a new Stream Descriptor. All Stream Descriptors are written into the Streams stream, which is expanded and contracted like every other stream. The Streams stream is of course initialised with 0 Stream Descriptors, because no other streams exist. As other streams are created, the Streams stream expands to hold these other Stream Descriptors.
+When a new stream is created by a caller, we need to create a new Stream Descriptor. All Stream Descriptors are written into the Streams stream, which is expanded and contracted like every other stream. The Streams stream is of course initialised with 0 Stream Descriptors, because no other streams exist. As other streams are created, the Streams stream expands to hold these other Stream Descriptors; this expansion happens in L2 block-size chunks (eventually we will have to expand into new blocks when we add Stream Descriptors; we may as well do a full block and keep some in reserve to avoid having to continually expanding the Streams stream every time a new stream is added)
 
-Eventually some streams are deleted and the associated Stream Descriptor in Streams is marked free by writing a magic 0xFFFF.... value in the Top Block (this of course means the very highest block available in the Yak file cannot be used as its index is used to denote something special).
+Eventually some streams are deleted and the associated Stream Descriptor in Streams is marked free. At the start of the Streams stream is written an 8 byte offset to the first free Stream Descriptor. If there are no free Stream Descriptors, a magic value if 0xFFF... is used to imply no free Stream Descriptors exist. In the Stream Descriptor pointed to by the offset in front of the Streams stream is written the value of the next free Stream Descriptor and so on, ensuring that all free Stream Descriptors are linked together as a chain. 
 
-One possible optimization is to maintain a free list of streams. For now, a sequential scan of the Streams stream for a free stream descriptor is acceptable. If a free stream descriptor is not found, the Streams stream is enlarged (written to) with a new, unused stream descriptor.
+When a new Stream Descriptor is required and the first free offset (the first 8 bytes of the Streams stream) points to something valid, the Stream Descriptors are plucked from the front of this chain of free Stream Descriptors and reused.
 
 ### Thread safety in L3
 

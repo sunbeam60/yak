@@ -177,7 +177,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Publish yak (core library)
-        run: cargo publish -p yak
+        run: cargo publish -p yak || echo "::warning::yak publish failed (may already exist)"
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
@@ -186,7 +186,7 @@ jobs:
         run: sleep 30
 
       - name: Publish yak_cl (CLI tool)
-        run: cargo publish -p yak_cl
+        run: cargo publish -p yak_cl || echo "::warning::yak_cl publish failed (may already exist)"
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 

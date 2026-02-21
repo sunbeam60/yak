@@ -22,7 +22,7 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
     "Topic :: System :: Filesystems",
 ]
-readme = "../README.md"
+readme = "README.md"
 
 [project.urls]
 Repository = "https://github.com/sunbeam60/yak"

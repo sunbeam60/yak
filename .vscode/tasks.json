@@ -34,14 +34,13 @@
             "command": "cargo",
             "args": [
                 "build",
-                "--workspace",
-                "--exclude",
-                "yak_python"
+                "--workspace"
             ],
             "options": {
                 "cwd": "${workspaceFolder}",
                 "env": {
-                    "PATH": "${env:PATH};C:/Users/bjorn/.cargo/bin"
+                    "PATH": "${env:PATH};C:/Users/bjorn/.cargo/bin",
+                    "VIRTUAL_ENV": "${workspaceFolder}/.venv"
                 }
             },
             "problemMatcher": [
@@ -109,8 +108,6 @@
                 "clippy",
                 "--workspace",
                 "--all-targets",
-                "--exclude",
-                "yak_python",
                 "--",
                 "-D",
                 "warnings"
@@ -118,7 +115,8 @@
             "options": {
                 "cwd": "${workspaceFolder}",
                 "env": {
-                    "PATH": "${env:PATH};C:/Users/bjorn/.cargo/bin"
+                    "PATH": "${env:PATH};C:/Users/bjorn/.cargo/bin",
+                    "VIRTUAL_ENV": "${workspaceFolder}/.venv"
                 }
             },
             "problemMatcher": [
@@ -167,17 +165,17 @@
         {
             "label": "maturin-develop",
             "type": "shell",
-            "command": "bash",
+            "command": "maturin",
             "args": [
-                "-c",
-                "cd '${workspaceFolder}/yak_python' && VIRTUAL_ENV='${workspaceFolder}/yak_pytest/.venv' ../yak_pytest/.venv/bin/maturin develop --release"
+                "develop",
+                "--release"
             ],
-            "windows": {
-                "command": "powershell",
-                "args": [
-                    "-Command",
-                    "$env:VIRTUAL_ENV='${workspaceFolder}/yak_pytest/.venv'; cd '${workspaceFolder}/yak_python'; ../yak_pytest/.venv/Scripts/maturin develop --release"
-                ]
+            "options": {
+                "cwd": "${workspaceFolder}/yak_python",
+                "env": {
+                    "PATH": "${env:PATH};${workspaceFolder}/.venv/Scripts;${workspaceFolder}/.venv/bin;C:/Users/bjorn/.cargo/bin",
+                    "VIRTUAL_ENV": "${workspaceFolder}/.venv"
+                }
             },
             "problemMatcher": [
                 "$rustc"
@@ -194,13 +192,13 @@
             "command": "bash",
             "args": [
                 "-c",
-                "'${workspaceFolder}/yak_pytest/.venv/bin/python' -m pytest tests/ -v"
+                "'${workspaceFolder}/.venv/bin/python' -m pytest tests/ -v"
             ],
             "windows": {
                 "command": "powershell",
                 "args": [
                     "-Command",
-                    "& '${workspaceFolder}/yak_pytest/.venv/Scripts/python.exe' -m pytest tests/ -v"
+                    "& '${workspaceFolder}/.venv/Scripts/python.exe' -m pytest tests/ -v"
                 ]
             },
             "options": {
@@ -263,14 +261,13 @@
             "args": [
                 "build",
                 "--release",
-                "--workspace",
-                "--exclude",
-                "yak_python"
+                "--workspace"
             ],
             "options": {
                 "cwd": "${workspaceFolder}",
                 "env": {
-                    "PATH": "${env:PATH};C:/Users/bjorn/.cargo/bin"
+                    "PATH": "${env:PATH};C:/Users/bjorn/.cargo/bin",
+                    "VIRTUAL_ENV": "${workspaceFolder}/.venv"
                 }
             },
             "problemMatcher": [

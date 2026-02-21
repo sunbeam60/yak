@@ -8,34 +8,53 @@
 
 ## Project structure
 
-| Module                   | Language      | Path                 |
-| ------------------------ | ------------- | -------------------- |
-| Yak library              | Rust          | `yak/`               |
-| C ABI wrapper            | Rust          | `yak_c/`             |
-| Python bindings (PyO3)   | Rust          | `yak_python/`        |
-| Command line tool        | Rust          | `yak_cl/`            |
-| Test harness             | Python/pytest | `yak_pytest/`        |
+| Module                 | Language      | Path          |
+| ---------------------- | ------------- | ------------- |
+| Yak library            | Rust          | `yak/`        |
+| C ABI wrapper          | Rust          | `yak_c/`      |
+| Python bindings (PyO3) | Rust          | `yak_python/` |
+| Command line tool      | Rust          | `yak_cl/`     |
+| Test harness           | Python/pytest | `yak_pytest/` |
 
 ## First-time setup
 
+The workspace includes a PyO3 crate (`yak_python`) which needs a Python interpreter at
+build time. A virtual environment (./.venv) must be configred at the project root so 
+that PyO3, maturin and the test harness all share the same Python. 
+
 ```bash
-# Clone and build the Rust workspace
+# 1. Create a virtual environment at the project root
+python3 -m venv .venv            # macOS / Linux
+# or
+python -m venv .venv             # Windows
+
+# 2. Activate it
+source .venv/bin/activate        # macOS / Linux
+# or
+.venv\Scripts\activate           # Windows (cmd / PowerShell)
+
+# 3. Install build and test tooling
+pip install maturin pytest
+
+# 4. Build the Rust workspace (PyO3 finds Python via VIRTUAL_ENV)
 cargo build
 
-# Set up the Python test environment
-cd yak_pytest
-python -m venv .venv
-source .venv/bin/activate
-pip install pytest maturin
-
-# Build and install the native Python module into the venv
-cd ../yak_python
+# 5. Build and install the native Python module into the venv
+cd yak_python
 maturin develop --release
 ```
 
 ## Day-to-day workflow
 
-After making changes to `yak` or `yak_python`, rebuild the Python module before running tests:
+Activate the venv before working (or ensure `VIRTUAL_ENV` points at `.venv`):
+
+```bash
+source .venv/bin/activate        # macOS / Linux
+.venv\Scripts\activate           # Windows
+```
+
+After making changes to `yak` or `yak_python`, rebuild the Python module before
+running tests:
 
 ```bash
 cd yak_python && maturin develop --release
@@ -44,16 +63,18 @@ cd yak_python && maturin develop --release
 Then run the test suite:
 
 ```bash
-cd ../yak_pytest && .venv/bin/python -m pytest tests/ -v
+cd yak_pytest && python -m pytest tests/ -v
 ```
 
 ## Quality checks
 
-A git pre-push hook runs `fmt` and `clippy`. You can run them manually:
+A git pre-push hook runs `fmt` and `clippy` across the full workspace (including
+`yak_python`). The hook auto-detects `.venv` so PyO3 can find Python. You can also
+run the checks manually:
 
 ```bash
-cargo fmt --all --check
-cargo clippy --all
+cargo fmt --all -- --check
+cargo clippy --workspace -- -D warnings
 ```
 
 ## Profiling
@@ -66,8 +87,8 @@ Publishing is automated via GitHub Actions on tag push. To create a release:
 
 ```bash
 # Ensure version is bumped in Cargo.toml and yak_python/pyproject.toml
-git tag v0.9.0
-git push origin v0.9.0
+git tag v0.10.0
+git push origin v0.10.0
 ```
 
 This triggers the release workflow which:

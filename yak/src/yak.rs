@@ -1517,12 +1517,14 @@ impl<L3: StreamLayer> Yak<L3> {
             let mut header_buf = vec![0u8; header_size];
             self.layer3.read(handle, offset as u64, &mut header_buf)?;
 
-            let name_len =
-                u16::from_le_bytes([header_buf[biw], header_buf[biw + 1]]) as usize;
+            let name_len = u16::from_le_bytes([header_buf[biw], header_buf[biw + 1]]) as usize;
             if name_len == name_bytes.len() {
                 let mut name_buf = vec![0u8; name_len];
-                self.layer3
-                    .read(handle, (offset as usize + header_size) as u64, &mut name_buf)?;
+                self.layer3.read(
+                    handle,
+                    (offset as usize + header_size) as u64,
+                    &mut name_buf,
+                )?;
                 if name_buf == name_bytes {
                     let mut id_bytes = [0u8; 8];
                     id_bytes[..biw].copy_from_slice(&header_buf[..biw]);
@@ -1624,8 +1626,7 @@ impl<L3: StreamLayer> Yak<L3> {
             return Err(YakError::NotFound(error_path.to_string()));
         }
 
-        let (name_table, entry_count, name_table_offset) =
-            self.read_name_table(handle, len)?;
+        let (name_table, entry_count, name_table_offset) = self.read_name_table(handle, len)?;
 
         let found = self
             .find_entry_in_name_table(handle, &name_table, entry_count, entry_name, biw)?

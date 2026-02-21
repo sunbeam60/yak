@@ -2,6 +2,7 @@ mod bench;
 mod cmd_dir;
 mod cmd_file;
 mod cmd_stream;
+mod cmd_transfer;
 mod error;
 mod helpers;
 
@@ -105,6 +106,18 @@ const COMMANDS: &[CommandEntry] = &[
         usage: "yak optimize <yak-file> [--encrypted]",
         description: "Compact and defragment by rewriting without free blocks",
         run: cmd_file::cmd_optimize,
+    },
+    CommandEntry {
+        name: "export",
+        usage: "yak export <yak-file>",
+        description: "Export all contents to a filesystem folder",
+        run: cmd_transfer::cmd_export,
+    },
+    CommandEntry {
+        name: "import",
+        usage: "yak import <yak-file> [--compressed] [--encrypted] [--cbss N]",
+        description: "Import a filesystem folder into a new Yak file",
+        run: cmd_transfer::cmd_import,
     },
     CommandEntry {
         name: "bench",

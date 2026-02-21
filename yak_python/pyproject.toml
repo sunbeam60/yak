@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "libyak"
-version = "0.9.0"
+version = "0.10.0"
 description = "Python bindings for Yak — yet another kontainer. A layered, embeddable file-in-file storage system."
 requires-python = ">=3.10"
 license = {text = "MIT OR Apache-2.0"}
@@ -22,7 +22,7 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
     "Topic :: System :: Filesystems",
 ]
-readme = "README.md"
+readme = "../README.md"
 
 [project.urls]
 Repository = "https://github.com/sunbeam60/yak"

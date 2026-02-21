@@ -151,6 +151,7 @@ fn print_bench_usage() {
     eprintln!("  single-stream    Write + read one 64MB stream (contiguous I/O test)");
     eprintln!("  warm-read        Write then read 2750x10KB streams (same instance, warm cache)");
     eprintln!("  overwrite        Write 10MB then 5000 overwrites (compress/decompress stress)");
+    eprintln!("  dir-lookup       Open 1000 streams by name in a 10000-entry directory");
     eprintln!("  all              Run all scenarios in sequence");
     eprintln!();
     eprintln!("Options:");
@@ -209,6 +210,9 @@ pub fn cmd_bench(args: &[String]) -> CliResult {
         }
         "warm-read" => run_quad(a.cbss, c, |v, pw| run_warm_read(a.bss, a.biw, v, pw)).map(|_| ()),
         "overwrite" => run_quad(a.cbss, c, |v, pw| run_overwrite(a.bss, a.biw, v, pw)).map(|_| ()),
+        "dir-lookup" => {
+            run_quad(a.cbss, c, |v, pw| run_dir_lookup(a.bss, a.biw, v, pw)).map(|_| ())
+        }
         "all" => run_all(a.bss, a.biw, a.cbss, a.threads, c),
         other => {
             print_bench_usage();
@@ -925,6 +929,49 @@ fn run_overwrite(bss: u8, biw: u8, cbss: u8, password: Option<&[u8]>) -> Result<
     Ok(elapsed_ms)
 }
 
+/// Create 10,000 streams in one directory, then time opening 1,000 by name.
+/// Measures directory name-lookup performance (linear scan cost).
+fn run_dir_lookup(bss: u8, biw: u8, cbss: u8, password: Option<&[u8]>) -> Result<f64, CliError> {
+    let _guard = CleanupGuard { path: BENCH_FILE };
+
+    let total_entries = 2_000usize;
+    let lookups = 2_000usize;
+
+    // Phase 1: populate directory with 10,000 empty streams (not timed)
+    let sfs = create_bench_yak(BENCH_FILE, biw, bss, cbss, password)?;
+    eprint!("    populating {} entries...", total_entries);
+    for i in 0..total_entries {
+        let name = format!("entry_{:05}.dat", i);
+        let handle = create_bench_stream(&sfs, &name, cbss)?;
+        sfs.close_stream(handle).map_err(err)?;
+    }
+    eprintln!(" done");
+    sfs.close().map_err(err)?;
+
+    // Phase 2: reopen read-only, then open 1,000 streams by name (timed)
+    let sfs = open_bench_yak(BENCH_FILE, OpenMode::Read, password)?;
+
+    // Deterministic scatter: pick indices spread across the full range
+    // using a multiplicative hash so we don't just hit sequential entries.
+    let t0 = Instant::now();
+    for i in 0..lookups {
+        let idx = ((i as u64).wrapping_mul(2654435761) % total_entries as u64) as usize;
+        let name = format!("entry_{:05}.dat", idx);
+        let handle = sfs.open_stream(&name, OpenMode::Read).map_err(err)?;
+        sfs.close_stream(handle).map_err(err)?;
+    }
+    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    let us_per_lookup = (elapsed_ms * 1000.0) / lookups as f64;
+    eprintln!(
+        "    {} lookups in {:.0} ms  ({:.1} us/lookup)",
+        lookups, elapsed_ms, us_per_lookup
+    );
+
+    sfs.close().map_err(err)?;
+    Ok(elapsed_ms)
+}
+
 /// Helper to run a named scenario via run_quad and accumulate timings.
 macro_rules! bench_scenario {
     ($name:expr, $normal:ident, $comp:ident, $enc:ident, $comp_enc:ident, $cbss:expr, $cases:expr, $body:expr) => {{
@@ -1063,6 +1110,16 @@ fn run_all(bss: u8, biw: u8, cbss: u8, threads: usize, cases: &str) -> CliResult
         cbss,
         cases,
         |v, pw| { run_overwrite(bss, biw, v, pw) }
+    );
+    bench_scenario!(
+        "dir-lookup",
+        total_normal,
+        total_comp,
+        total_enc,
+        total_comp_enc,
+        cbss,
+        cases,
+        |v, pw| { run_dir_lookup(bss, biw, v, pw) }
     );
 
     // Build summary line showing only the cases that were run

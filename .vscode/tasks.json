@@ -284,8 +284,9 @@
         },
         {
             "label": "copy-release-binaries",
-            "type": "shell",
-            "command": "echo unsupported platform",
+            "type": "process",
+            "command": "echo",
+            "args": ["unsupported platform"],
             "windows": {
                 "command": "powershell",
                 "args": [

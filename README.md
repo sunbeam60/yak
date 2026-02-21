@@ -149,7 +149,7 @@ Options:
 * An alternative to [rust-cfb](https://github.com/mdsteele/rust-cfb)
 
 ## Want to know more about how Yak works?
-Read the [Architecture Overview](docs/architecture.md)
+Read the [Architecture Overview](https://github.com/sunbeam60/yak/blob/master/docs/architecture.md)
 
 ## Quick Start
 

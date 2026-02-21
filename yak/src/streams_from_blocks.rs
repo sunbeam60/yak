@@ -19,6 +19,13 @@ const FREE_DESCRIPTOR_MARKER: u64 = u64::MAX;
 /// Size of a stream descriptor in bytes: u64 size + u64 top_block + u64 reserved + u8 flags.
 const DESCRIPTOR_SIZE: u64 = 25;
 
+/// Size of the free-list head prefix at the start of the Streams stream.
+/// The first 8 bytes store the index of the first free descriptor slot.
+const STREAMS_HEADER_SIZE: u64 = 8;
+
+/// Sentinel for "no free descriptor" / end of free list.
+const FREE_LIST_EMPTY: u64 = u64::MAX;
+
 /// Flag bit: this stream is compressed (leaf entries are compression redirectors).
 const STREAM_FLAG_COMPRESSED: u8 = 1;
 
@@ -37,6 +44,21 @@ fn block_sentinel(block_index_width: u8) -> u64 {
     } else {
         (1u64 << (w * 8)) - 1
     }
+}
+
+/// Number of descriptor slots given the Streams stream size.
+/// Accounts for the 8-byte free-list head prefix.
+fn num_descriptor_slots(streams_size: u64) -> u64 {
+    if streams_size < STREAMS_HEADER_SIZE {
+        0
+    } else {
+        (streams_size - STREAMS_HEADER_SIZE) / DESCRIPTOR_SIZE
+    }
+}
+
+/// Byte offset of a descriptor within the Streams stream.
+fn descriptor_offset(stream_id: u64) -> u64 {
+    STREAMS_HEADER_SIZE + stream_id * DESCRIPTOR_SIZE
 }
 
 // ---------------------------------------------------------------------------
@@ -147,6 +169,11 @@ pub struct StreamsFromBlocks<L2: BlockLayer> {
     /// Signalled when any stream lock is released, waking threads blocked
     /// in `acquire_lock`. Paired with `state`.
     lock_released: Condvar,
+
+    /// Cached head of the free descriptor list. FREE_LIST_EMPTY = no free slots.
+    /// Protected by STREAMS_STREAM_ID write lock; this Mutex is only for safe
+    /// value access (never contends in practice, same pattern as streams_descriptor).
+    free_list_head: Mutex<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1724,7 +1751,7 @@ impl<L2: BlockLayer> StreamsFromBlocks<L2> {
         streams_desc: &StreamDescriptor,
         stream_id: u64,
     ) -> Result<StreamDescriptor, YakError> {
-        let offset = stream_id * DESCRIPTOR_SIZE;
+        let offset = descriptor_offset(stream_id);
         if offset + DESCRIPTOR_SIZE > streams_desc.size {
             return Err(YakError::NotFound(format!("stream {}", stream_id)));
         }
@@ -1744,7 +1771,7 @@ impl<L2: BlockLayer> StreamsFromBlocks<L2> {
         stream_id: u64,
         desc: &StreamDescriptor,
     ) -> Result<(), YakError> {
-        let offset = stream_id * DESCRIPTOR_SIZE;
+        let offset = descriptor_offset(stream_id);
         let buf = desc.to_bytes();
         let bs = self.block_size();
         let fo = self.fan_out();
@@ -1753,12 +1780,124 @@ impl<L2: BlockLayer> StreamsFromBlocks<L2> {
         Ok(())
     }
 
+    // -----------------------------------------------------------------------
+    // Free-list helpers
+    // -----------------------------------------------------------------------
+
+    /// Write the free-list head to the first 8 bytes of the Streams stream.
+    /// Caller must hold the STREAMS_STREAM_ID write lock.
+    fn write_free_list_head(
+        &self,
+        streams_desc: &mut StreamDescriptor,
+        head: u64,
+    ) -> Result<(), YakError> {
+        let bs = self.block_size();
+        let fo = self.fan_out();
+        let biw = self.block_index_width_val();
+        pyramid_write(
+            &self.layer2,
+            streams_desc,
+            0,
+            &head.to_le_bytes(),
+            bs,
+            fo,
+            biw,
+        )?;
+        Ok(())
+    }
+
+    /// Pop a free descriptor from the free list.
+    /// Returns `Some(stream_id)` or `None` if the list is empty.
+    /// Updates the cached head and writes the new head to disk.
+    /// Caller must hold the STREAMS_STREAM_ID write lock.
+    fn pop_free_descriptor(
+        &self,
+        streams_desc: &mut StreamDescriptor,
+        cached_head: &mut u64,
+    ) -> Result<Option<u64>, YakError> {
+        if *cached_head == FREE_LIST_EMPTY {
+            return Ok(None);
+        }
+
+        let slot = *cached_head;
+        // Read the descriptor at the head to get the next-free pointer (stored in `size`)
+        let desc = self.read_descriptor(streams_desc, slot)?;
+        let next = desc.size; // next-free index (or FREE_LIST_EMPTY)
+
+        *cached_head = next;
+        self.write_free_list_head(streams_desc, next)?;
+
+        Ok(Some(slot))
+    }
+
+    /// Extend the Streams stream by a batch of free descriptors (roughly one
+    /// L2 block's worth, but at least one), chaining them into the free list.
+    /// Lowest IDs are allocated first (LIFO: the lowest new ID becomes the
+    /// free-list head). Caller must hold the STREAMS_STREAM_ID write lock.
+    fn bulk_extend_free_list(
+        &self,
+        streams_desc: &mut StreamDescriptor,
+        cached_head: &mut u64,
+    ) -> Result<(), YakError> {
+        let bs = self.block_size();
+        let fo = self.fan_out();
+        let biw = self.block_index_width_val();
+
+        // At least 1 descriptor per batch — pyramid_write handles cross-block spans,
+        // so this works even when block_size < DESCRIPTOR_SIZE.
+        let descriptors_per_block = ((bs as u64) / DESCRIPTOR_SIZE).max(1);
+        let base = num_descriptor_slots(streams_desc.size);
+
+        // Cap at sentinel to avoid stream ID overflow
+        let max_new = self.sentinel().saturating_sub(base);
+        let count = descriptors_per_block.min(max_new);
+        if count == 0 {
+            return Err(YakError::IoError(format!(
+                "stream ID overflow: no room for new descriptors (base={}, sentinel={})",
+                base,
+                self.sentinel()
+            )));
+        }
+
+        // Build a buffer of `count` free descriptors, chained lowest→highest.
+        // Each slot points to the next: base→base+1→…→base+count-1→old_head.
+        let buf_len = count as usize * DESCRIPTOR_SIZE as usize;
+        let mut buf = vec![0u8; buf_len];
+        let free_desc = StreamDescriptor {
+            size: 0, // patched per-slot below
+            top_block: FREE_DESCRIPTOR_MARKER,
+            reserved: 0,
+            flags: 0,
+        };
+        for i in 0..count {
+            let mut desc = free_desc;
+            desc.size = base + i + 1; // next in chain
+            let off = i as usize * DESCRIPTOR_SIZE as usize;
+            buf[off..off + DESCRIPTOR_SIZE as usize].copy_from_slice(&desc.to_bytes());
+        }
+        // Patch the last descriptor to link back to the old free-list head
+        let last_off = (count - 1) as usize * DESCRIPTOR_SIZE as usize;
+        let mut tail = free_desc;
+        tail.size = *cached_head;
+        buf[last_off..last_off + DESCRIPTOR_SIZE as usize].copy_from_slice(&tail.to_bytes());
+
+        // Single pyramid_write for the entire batch
+        let write_offset = descriptor_offset(base);
+        pyramid_write(&self.layer2, streams_desc, write_offset, &buf, bs, fo, biw)?;
+
+        // Update free-list head to the first new slot
+        *cached_head = base;
+        self.write_free_list_head(streams_desc, base)?;
+
+        Ok(())
+    }
+
     /// Serialize the L3 header (no length prefix).
     /// Format: | "pyra  ": [u8;6] | version: u8 | size: u64 | top_block: u64 | reserved: u64 | cbss: u8 |
     fn serialize_header(streams_desc: &StreamDescriptor, cbss: u8) -> Vec<u8> {
         let mut buf = Vec::with_capacity(L3_PAYLOAD_SIZE as usize);
         buf.extend_from_slice(b"pyra  ");
-        buf.push(2); // version 2: adds cbss and per-stream compressed flags
+        buf.push(3); // version 3: descriptor free-list (8-byte prefix in Streams stream)
         buf.extend_from_slice(&streams_desc.size.to_le_bytes());
         buf.extend_from_slice(&streams_desc.top_block.to_le_bytes());
         buf.extend_from_slice(&streams_desc.reserved.to_le_bytes());
@@ -1784,9 +1923,9 @@ impl<L2: BlockLayer> StreamsFromBlocks<L2> {
             )));
         }
         let version = data[6];
-        if version != 2 {
+        if version != 3 {
             return Err(YakError::IoError(format!(
-                "unsupported L3 version: {} (expected 2; re-create the file)",
+                "unsupported L3 version: {} (expected 3; re-create the file)",
                 version
             )));
         }
@@ -1846,12 +1985,27 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
         let my_slot = layer2.header_slot_for_upper(0);
 
         // Write initial L3 payload
-        let streams_desc = StreamDescriptor {
+        let mut streams_desc = StreamDescriptor {
             size: 0,
             top_block: 0,
             reserved: 0,
             flags: 0,
         };
+
+        // Write free-list head prefix (8 bytes, FREE_LIST_EMPTY = no free slots yet)
+        let bs = 1usize << block_size_shift;
+        let biw = block_index_width;
+        let fo = (bs / biw as usize) as u64;
+        pyramid_write(
+            &layer2,
+            &mut streams_desc,
+            0,
+            &FREE_LIST_EMPTY.to_le_bytes(),
+            bs,
+            fo,
+            biw,
+        )?;
+
         let l3_payload = Self::serialize_header(&streams_desc, compressed_block_size_shift);
         layer2.write_header_slot(my_slot, &l3_payload)?;
 
@@ -1866,6 +2020,7 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
                 open_handles: HashMap::new(),
             }),
             lock_released: Condvar::new(),
+            free_list_head: Mutex::new(FREE_LIST_EMPTY),
         })
     }
 
@@ -1880,6 +2035,18 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
         let header_buffer = layer2.read_header_slot(my_header_slot)?;
         let (streams_desc, cbss) = Self::deserialize_header(&header_buffer)?;
 
+        // Read free-list head from the first 8 bytes of the Streams stream
+        let free_head = if streams_desc.size >= STREAMS_HEADER_SIZE {
+            let bs = layer2.block_size();
+            let fo = (bs / layer2.block_index_width() as usize) as u64;
+            let biw = layer2.block_index_width();
+            let mut buf = [0u8; STREAMS_HEADER_SIZE as usize];
+            pyramid_read(&layer2, &streams_desc, 0, &mut buf, bs, fo, biw)?;
+            u64::from_le_bytes(buf)
+        } else {
+            FREE_LIST_EMPTY
+        };
+
         Ok(StreamsFromBlocks {
             layer2,
             streams_descriptor: Mutex::new(streams_desc),
@@ -1891,6 +2058,7 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
                 open_handles: HashMap::new(),
             }),
             lock_released: Condvar::new(),
+            free_list_head: Mutex::new(free_head),
         })
     }
 
@@ -1917,59 +2085,21 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
             ));
         }
 
-        // We're about to create a new stream, so we need to find an available stream descriptor
-        // from the Streams stream. We acquire the STREAMS_STREAM_ID write lock to ensure
-        // exclusive access while we scan for a free descriptor and potentially extend the stream.
         self.acquire_lock(STREAMS_STREAM_ID, OpenMode::Write, true)?;
         self.layer2.invalidate_block_cache();
 
         let result = (|| -> Result<u64, YakError> {
-            // We should never block on this call. The Mutex is just to satisfy Rust's safety
-            // guarantees around shared mutable access to the descriptor, but in practice we
-            // always hold the STREAMS_STREAM_ID write lock when accessing it, so there is no
-            // contention.
             let mut streams_desc = self.streams_descriptor.lock().unwrap();
-            let bs = self.block_size();
-            let fo = self.fan_out();
-            let biw = self.block_index_width_val();
+            let mut head = self.free_list_head.lock().unwrap();
 
-            // Scan for a free descriptor slot
-            let num_slots = streams_desc.size / DESCRIPTOR_SIZE;
-            let mut free_id: Option<u64> = None;
-
-            for i in 0..num_slots {
-                let desc = self.read_descriptor(&streams_desc, i)?;
-                if desc.is_free() {
-                    free_id = Some(i);
-                    break;
-                }
-            }
-
-            // Did we find a free slot? If not, extend the Streams stream
-            let stream_id = match free_id {
+            // Pop from free list; if empty, bulk-extend first
+            let stream_id = match self.pop_free_descriptor(&mut streams_desc, &mut head)? {
                 Some(id) => id,
                 None => {
-                    // TODO: optimize by writing a zeroed block instead of individual descriptors
-                    // TODO: Make it configurable how much to extend by
-                    let new_id = num_slots;
-                    if new_id >= self.sentinel() {
-                        return Err(YakError::IoError(format!(
-                            "stream ID overflow: {} >= sentinel {} for block_index_width={}",
-                            new_id,
-                            self.sentinel(),
-                            self.layer2.block_index_width()
-                        )));
-                    }
-                    let new_desc = StreamDescriptor {
-                        size: 0,
-                        top_block: 0,
-                        reserved: 0,
-                        flags: 0,
-                    };
-                    let offset = new_id * DESCRIPTOR_SIZE;
-                    let buf = new_desc.to_bytes();
-                    pyramid_write(&self.layer2, &mut streams_desc, offset, &buf, bs, fo, biw)?;
-                    new_id
+                    self.bulk_extend_free_list(&mut streams_desc, &mut head)?;
+                    // Must succeed now — we just added slots
+                    self.pop_free_descriptor(&mut streams_desc, &mut head)?
+                        .expect("bulk_extend_free_list added slots but free list is still empty")
                 }
             };
 
@@ -2005,7 +2135,7 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
         self.layer2.invalidate_block_cache();
         let result = {
             let streams_desc = self.streams_descriptor.lock().unwrap();
-            let offset = id * DESCRIPTOR_SIZE;
+            let offset = descriptor_offset(id);
             if offset + DESCRIPTOR_SIZE > streams_desc.size {
                 false
             } else {
@@ -2024,7 +2154,7 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
         self.layer2.invalidate_block_cache();
         let result = {
             let streams_desc = self.streams_descriptor.lock().unwrap();
-            let num_slots = streams_desc.size / DESCRIPTOR_SIZE;
+            let num_slots = num_descriptor_slots(streams_desc.size);
             let mut count = 0u64;
             for i in 0..num_slots {
                 let desc = self.read_descriptor(&streams_desc, i)?;
@@ -2043,7 +2173,7 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
         self.layer2.invalidate_block_cache();
         let result = {
             let streams_desc = self.streams_descriptor.lock().unwrap();
-            let num_slots = streams_desc.size / DESCRIPTOR_SIZE;
+            let num_slots = num_descriptor_slots(streams_desc.size);
             let mut ids = Vec::new();
             for i in 0..num_slots {
                 let desc = self.read_descriptor(&streams_desc, i)?;
@@ -2141,14 +2271,17 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
                 }
             }
 
-            // Mark descriptor as free
+            // Push descriptor onto free list
+            let mut head = self.free_list_head.lock().unwrap();
             let free_desc = StreamDescriptor {
-                size: 0,
+                size: *head, // next-free pointer
                 top_block: FREE_DESCRIPTOR_MARKER,
                 reserved: 0,
                 flags: 0,
             };
             self.write_descriptor(&mut streams_desc, id, &free_desc)?;
+            *head = id;
+            self.write_free_list_head(&mut streams_desc, id)?;
             self.persist_l3_header(&streams_desc)?;
 
             Ok(())
@@ -2372,7 +2505,7 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
         }
 
         // 3. Read all stream descriptors, build set of active stream IDs
-        let num_slots = streams_desc.size / DESCRIPTOR_SIZE;
+        let num_slots = num_descriptor_slots(streams_desc.size);
         let claimed_set: std::collections::HashSet<u64> = claimed_streams.iter().cloned().collect();
         let mut active_on_disk = std::collections::HashSet::new();
 
@@ -2469,7 +2602,96 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
             }
         }
 
-        // 6. Pass all collected blocks to L2 for verification
+        // 6. Verify free-list integrity
+        {
+            let mut free_on_list = std::collections::HashSet::new();
+            let mut free_by_scan = std::collections::HashSet::new();
+
+            // Collect all descriptors marked free by the linear scan above
+            for i in 0..num_slots {
+                if !active_on_disk.contains(&i) {
+                    // Must be free (if read succeeded; errors already reported above)
+                    if let Ok(desc) = self.read_descriptor(&streams_desc, i) {
+                        if desc.is_free() {
+                            free_by_scan.insert(i);
+                        }
+                    }
+                }
+            }
+
+            // Walk the free list chain from the on-disk head
+            if streams_desc.size >= STREAMS_HEADER_SIZE {
+                let mut head_buf = [0u8; STREAMS_HEADER_SIZE as usize];
+                if pyramid_read(&self.layer2, &streams_desc, 0, &mut head_buf, bs, fo, biw).is_ok()
+                {
+                    let mut cursor = u64::from_le_bytes(head_buf);
+                    while cursor != FREE_LIST_EMPTY {
+                        if cursor >= num_slots {
+                            issues.push(format!(
+                                "L3: free-list entry {} is out of range (num_slots={})",
+                                cursor, num_slots
+                            ));
+                            break;
+                        }
+                        if !free_on_list.insert(cursor) {
+                            issues.push(format!("L3: free-list cycle detected at slot {}", cursor));
+                            break;
+                        }
+                        match self.read_descriptor(&streams_desc, cursor) {
+                            Ok(desc) => {
+                                if !desc.is_free() {
+                                    issues.push(format!(
+                                        "L3: slot {} is on free list but top_block is not FREE_DESCRIPTOR_MARKER",
+                                        cursor
+                                    ));
+                                    break;
+                                }
+                                cursor = desc.size; // next-free pointer
+                            }
+                            Err(e) => {
+                                issues.push(format!(
+                                    "L3: error reading free-list entry {}: {}",
+                                    cursor, e
+                                ));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Cross-check: every free descriptor must be on the chain
+            for &slot in &free_by_scan {
+                if !free_on_list.contains(&slot) {
+                    issues.push(format!(
+                        "L3: slot {} is marked free but not reachable from free list",
+                        slot
+                    ));
+                }
+            }
+            for &slot in &free_on_list {
+                if !free_by_scan.contains(&slot) {
+                    issues.push(format!(
+                        "L3: slot {} is on free list but not marked free in descriptor",
+                        slot
+                    ));
+                }
+            }
+
+            // Count check
+            let total = active_on_disk.len() + free_by_scan.len();
+            if total as u64 != num_slots {
+                issues.push(format!(
+                    "L3: active ({}) + free ({}) = {} but num_slots = {}",
+                    active_on_disk.len(),
+                    free_by_scan.len(),
+                    total,
+                    num_slots
+                ));
+            }
+        }
+
+        // 7. Pass all collected blocks to L2 for verification
         issues.extend(self.layer2.verify(&all_claimed_blocks)?);
 
         Ok(issues)

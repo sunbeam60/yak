@@ -934,8 +934,8 @@ fn run_overwrite(bss: u8, biw: u8, cbss: u8, password: Option<&[u8]>) -> Result<
 fn run_dir_lookup(bss: u8, biw: u8, cbss: u8, password: Option<&[u8]>) -> Result<f64, CliError> {
     let _guard = CleanupGuard { path: BENCH_FILE };
 
-    let total_entries = 2_000usize;
-    let lookups = 2_000usize;
+    let total_entries = 4_000usize;
+    let lookups = 4_000usize;
 
     // Phase 1: populate directory with 10,000 empty streams (not timed)
     let sfs = create_bench_yak(BENCH_FILE, biw, bss, cbss, password)?;

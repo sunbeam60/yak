@@ -7,19 +7,15 @@
 - L4                = Layer 4
 
 ## Human & AI, working together
-Before committing, at all times present & allow edits to the commit message to the user. Do not include "co-authored by Claude" message.
+Before committing, at all times present & allow edits to the commit message to the user. Do not include "co-authored by Claude" message - human committers own the accountability.
 
 Humans will use the extension Todo Tree extension. It's good practice to use //TODO: and //FIXME: comments where appropriate, to give humans an overview over possible improvements or concerns in the code. Literal constants in code should be avoided. It's brittle and humans don't deal well with them. Minimize the use of defined constants to as few places as possible.
 
 Readability of the code for humans is important. If constants are being added, explain in a comment what the constant signifies.
 
-If a function gets above 100 lines, question whether some functionality can be extracted from this function and, if a similar function already exits that isn't quite right can be made generic to work for both places. This isn't a strict rule, but very long functions are mostly a sign that we're throwing too much code down - this may work for an AI but not for a human that wants to read and edit together with the AI.
-
-Use generics rather than dynamic dispatch when possible.
-
-If a function starts to acquire a lot of parameters and a lot of variables internally, usually the function is doing too many things at once. Can we extract and re-use functionality instead?
-
 When a human is making suggestions and something seems more trouble than it's worth, it's ok to question the human's intent, offering up pros and cons of the suggestions before asking for directions.
+
+When a new, larger piece of work is to be undertaken, please create a worktree & a branch for the work so it can be separated and benchmarked in isolation, against what is currently in master.
 
 ## Architecture
 Please read the [architecture](./../docs/architecture.md) for a comprehensive overview of Yak. This architecture must be respected - if it cannot, please stop, inform and ask for directions.
@@ -28,7 +24,13 @@ Whenever you are updating .md files, do not ever change ./../docs/architecture.m
 
 Duplication of code should be concerning when we write code. If duplicated code exists, and there's no performance penalty to extracting it into a function, we should consider doing so. In release mode, small functions are likely to be inlined by the compiler.
 
-If we have to perform disk read/writing (i.e. if we have to ask L2 for a block or L1 to read/write), we must try to avoid doing that inside of a loop, unless absolutely required. Consider whether we can read the data once and then iterate through the data in the local loop, instead of continually asking for reading/writing at disk level inside of the loop. Even if we have a cache, touching the cache is not free.
+If we have to perform disk read/writing (i.e. if we have to ask L2 for a block or L1 to read/write), we must try to avoid doing that inside of a loop, unless absolutely required. Consider whether we can read the data once and then iterate through the data in the local loop, instead of continually asking for reading/writing at disk level inside of the loop. Even if we have a cache, touching the cache is not free. 
+
+If a function gets above 100 lines, question whether some functionality can be extracted from this function and, if a similar function already exits that isn't quite right can be made generic to work for both places. This isn't a strict rule, but very long functions are mostly a sign that we're throwing too much code down - this may work for an AI but not for a human that wants to read and edit together with the AI.
+
+Use generics rather than dynamic dispatch when possible.
+
+If a function starts to acquire a lot of parameters and a lot of variables internally, usually the function is doing too many things at once. Can we extract and re-use functionality instead?
 
 ## Performance and memory
 This is a low level library. Memory allocations should be minimized when possible. Performance matters.
@@ -53,7 +55,7 @@ If there's a cleaner/neater way to do something, please suggest it.
 Don't use #[allow()] to get around warnings. Warnings from clippy shouldn't be worked around, they should be fixed.
 There's a git hook to run fmt and clippy before we push to remote master. Please finish off big tasks by running both and fixing any warnings.
 
-## Some files not to be modified
+## Some files are not to be modified
 Do not modify the following files without explicit permission:
 * ./docs/architecture.md
 * ./README.md
@@ -67,4 +69,4 @@ Yak uses the `aes` crate (0.8+) for AES-XTS block encryption at L2. Hardware acc
 - **aarch64 (ARM64)**: Requires `--cfg aes_armv8` in rustflags to enable runtime detection
   of ARMv8 crypto extensions. Without this flag, ARM builds silently fall back to a pure
   software AES implementation. All aarch64 targets must have this flag in `.cargo/config.toml`.
-- See https://docs.rs/aes/0.8.4/aes/ for the full list of configuration flags.
+- See https://docs.rs/aes/0.8.4/aes/ for the list of configuration flags.

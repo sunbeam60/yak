@@ -282,6 +282,14 @@ fn slot_offset(name_table: &[u8], slot_index: usize) -> u32 {
     ])
 }
 
+/// Result of a name-table lookup: everything callers might need.
+struct FoundEntry {
+    slot_idx: usize,
+    offset: u32,
+    id: u64,
+    entry_size: usize,
+}
+
 /// Parse the name table bytes into a Vec of (hash, offset) pairs.
 fn parse_name_table_slots(name_table: &[u8], entry_count: u32) -> Vec<(u32, u32)> {
     let count = entry_count as usize;
@@ -1464,40 +1472,66 @@ impl<L3: StreamLayer> Yak<L3> {
         if stream_len == 0 {
             return Ok(None);
         }
-        // Read footer
+        let (name_table, entry_count, _) = self.read_name_table(handle, stream_len)?;
+        let found = self.find_entry_in_name_table(handle, &name_table, entry_count, name, biw)?;
+        Ok(found.map(|e| e.id))
+    }
+
+    /// Read footer + name table from an open directory stream.
+    /// Returns (name_table_bytes, entry_count, name_table_offset).
+    fn read_name_table(
+        &self,
+        handle: &L3::Handle,
+        stream_len: u64,
+    ) -> Result<(Vec<u8>, u32, u32), YakError> {
         let mut footer_buf = [0u8; FOOTER_SIZE];
         self.layer3
             .read(handle, stream_len - FOOTER_SIZE as u64, &mut footer_buf)?;
         let entry_count = u32::from_le_bytes(footer_buf[0..4].try_into().unwrap());
         let name_table_offset = u32::from_le_bytes(footer_buf[4..8].try_into().unwrap());
 
-        // Read name table
         let table_size = entry_count as usize * NAME_TABLE_SLOT_SIZE;
         let mut name_table = vec![0u8; table_size];
         self.layer3
             .read(handle, name_table_offset as u64, &mut name_table)?;
+        Ok((name_table, entry_count, name_table_offset))
+    }
 
-        // Binary search
+    /// Search for a name in an already-loaded name table.
+    /// Returns full entry info on match, or None.
+    fn find_entry_in_name_table(
+        &self,
+        handle: &L3::Handle,
+        name_table: &[u8],
+        entry_count: u32,
+        name: &str,
+        biw: usize,
+    ) -> Result<Option<FoundEntry>, YakError> {
         let name_bytes = name.as_bytes();
         let target_hash = fnv1a_hash(name_bytes);
-        let range = find_hash_range(&name_table, entry_count, target_hash);
+        let range = find_hash_range(name_table, entry_count, target_hash);
+        let header_size = biw + 2;
 
         for slot_idx in range {
-            let offset = slot_offset(&name_table, slot_idx) as usize;
-            // Read entry header: id (biw) + name_len (2)
-            let header_size = biw + 2;
+            let offset = slot_offset(name_table, slot_idx);
             let mut header_buf = vec![0u8; header_size];
             self.layer3.read(handle, offset as u64, &mut header_buf)?;
 
-            let name_len = u16::from_le_bytes([header_buf[biw], header_buf[biw + 1]]) as usize;
+            let name_len =
+                u16::from_le_bytes([header_buf[biw], header_buf[biw + 1]]) as usize;
             if name_len == name_bytes.len() {
                 let mut name_buf = vec![0u8; name_len];
                 self.layer3
-                    .read(handle, (offset + header_size) as u64, &mut name_buf)?;
+                    .read(handle, (offset as usize + header_size) as u64, &mut name_buf)?;
                 if name_buf == name_bytes {
                     let mut id_bytes = [0u8; 8];
                     id_bytes[..biw].copy_from_slice(&header_buf[..biw]);
-                    return Ok(Some(u64::from_le_bytes(id_bytes)));
+                    return Ok(Some(FoundEntry {
+                        slot_idx,
+                        offset,
+                        id: u64::from_le_bytes(id_bytes),
+                        entry_size: header_size + name_len,
+                    }));
                 }
             }
         }
@@ -1536,38 +1570,15 @@ impl<L3: StreamLayer> Yak<L3> {
             return Ok(());
         }
 
-        // Read footer
-        let mut footer_buf = [0u8; FOOTER_SIZE];
-        self.layer3
-            .read(handle, len - FOOTER_SIZE as u64, &mut footer_buf)?;
-        let entry_count = u32::from_le_bytes(footer_buf[0..4].try_into().unwrap());
-        let name_table_offset = u32::from_le_bytes(footer_buf[4..8].try_into().unwrap());
-
-        // Read name table
-        let table_size = entry_count as usize * NAME_TABLE_SLOT_SIZE;
-        let mut name_table = vec![0u8; table_size];
-        self.layer3
-            .read(handle, name_table_offset as u64, &mut name_table)?;
+        let (name_table, entry_count, name_table_offset) = self.read_name_table(handle, len)?;
 
         // Check for duplicates against both the entry name and its alternative
         for check_name in [entry_name, alt_name.as_str()] {
-            let hash = fnv1a_hash(check_name.as_bytes());
-            let range = find_hash_range(&name_table, entry_count, hash);
-            let check_bytes = check_name.as_bytes();
-            for slot_idx in range {
-                let offset = slot_offset(&name_table, slot_idx) as usize;
-                let mut header_buf = vec![0u8; biw_usize + 2];
-                self.layer3.read(handle, offset as u64, &mut header_buf)?;
-                let name_len =
-                    u16::from_le_bytes([header_buf[biw_usize], header_buf[biw_usize + 1]]) as usize;
-                if name_len == check_bytes.len() {
-                    let mut name_buf = vec![0u8; name_len];
-                    self.layer3
-                        .read(handle, (offset + biw_usize + 2) as u64, &mut name_buf)?;
-                    if name_buf == check_bytes {
-                        return Err(YakError::AlreadyExists(error_path.to_string()));
-                    }
-                }
+            if self
+                .find_entry_in_name_table(handle, &name_table, entry_count, check_name, biw_usize)?
+                .is_some()
+            {
+                return Err(YakError::AlreadyExists(error_path.to_string()));
             }
         }
 
@@ -1613,57 +1624,17 @@ impl<L3: StreamLayer> Yak<L3> {
             return Err(YakError::NotFound(error_path.to_string()));
         }
 
-        // Read footer
-        let mut footer_buf = [0u8; FOOTER_SIZE];
-        self.layer3
-            .read(handle, len - FOOTER_SIZE as u64, &mut footer_buf)?;
-        let entry_count = u32::from_le_bytes(footer_buf[0..4].try_into().unwrap());
-        let name_table_offset = u32::from_le_bytes(footer_buf[4..8].try_into().unwrap());
+        let (name_table, entry_count, name_table_offset) =
+            self.read_name_table(handle, len)?;
 
-        // Read name table
-        let table_size = entry_count as usize * NAME_TABLE_SLOT_SIZE;
-        let mut name_table = vec![0u8; table_size];
-        self.layer3
-            .read(handle, name_table_offset as u64, &mut name_table)?;
+        let found = self
+            .find_entry_in_name_table(handle, &name_table, entry_count, entry_name, biw)?
+            .ok_or_else(|| YakError::NotFound(error_path.to_string()))?;
 
-        // Find the entry via binary search
-        let name_bytes = entry_name.as_bytes();
-        let target_hash = fnv1a_hash(name_bytes);
-        let range = find_hash_range(&name_table, entry_count, target_hash);
-
-        let mut found_slot_idx = None;
-        let mut found_offset = 0u32;
-        let mut found_id = 0u64;
-        let mut found_entry_size = 0usize;
-
-        for slot_idx in range {
-            let offset = slot_offset(&name_table, slot_idx);
-            let mut header_buf = vec![0u8; biw + 2];
-            self.layer3.read(handle, offset as u64, &mut header_buf)?;
-            let mut id_bytes = [0u8; 8];
-            id_bytes[..biw].copy_from_slice(&header_buf[..biw]);
-            let id = u64::from_le_bytes(id_bytes);
-            let name_len = u16::from_le_bytes([header_buf[biw], header_buf[biw + 1]]) as usize;
-
-            if name_len == name_bytes.len() {
-                let mut name_buf = vec![0u8; name_len];
-                self.layer3
-                    .read(handle, (offset as usize + biw + 2) as u64, &mut name_buf)?;
-                if name_buf == name_bytes {
-                    found_slot_idx = Some(slot_idx);
-                    found_offset = offset;
-                    found_id = id;
-                    found_entry_size = biw + 2 + name_len;
-                    break;
-                }
-            }
-        }
-
-        let slot_idx = match found_slot_idx {
-            Some(idx) => idx,
-            None => return Err(YakError::NotFound(error_path.to_string())),
-        };
-
+        let slot_idx = found.slot_idx;
+        let found_id = found.id;
+        let found_offset = found.offset;
+        let found_entry_size = found.entry_size;
         let nto = name_table_offset as usize;
         let gap_start = found_offset as usize;
         let gap_end = gap_start + found_entry_size;

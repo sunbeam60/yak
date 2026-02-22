@@ -1767,7 +1767,12 @@ impl<L2: BlockLayer> StreamsFromBlocks<L2> {
             ));
         }
 
-        // 1. Acquire per-stream lock
+        // 1. Clear stale thread-local cache entries. Another thread may have
+        //    modified this stream's blocks since our last access (e.g. a shared
+        //    directory stream).
+        self.layer2.invalidate_thread_local_cache();
+
+        // 2. Acquire per-stream lock
         self.acquire_lock(id, mode, blocking)?;
 
         // 2. Read the stream's descriptor (acquire STREAMS read lock, always blocking)
@@ -2292,25 +2297,39 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
                 .ok_or_else(|| YakError::NotFound("invalid stream handle".to_string()))?
         };
 
-        // If writer, flush cached descriptor back to Streams stream
-        if info.mode == OpenMode::Write {
-            self.acquire_lock(STREAMS_STREAM_ID, OpenMode::Write, true)?;
-            let result = {
-                let mut streams_desc = self.streams_descriptor.lock().unwrap();
-                self.write_descriptor(&mut streams_desc, info.stream_id, &info.cached_descriptor)?;
-                self.persist_l3_header(&streams_desc)
-            };
-            self.release_lock(STREAMS_STREAM_ID, OpenMode::Write);
-            result?;
-        }
+        // If writer, flush cached descriptor back to Streams stream.
+        // Locks must be released even if the flush fails, to avoid deadlocking
+        // other threads waiting on STREAMS_STREAM_ID or this stream.
+        let flush_result = if info.mode == OpenMode::Write {
+            self.acquire_lock(STREAMS_STREAM_ID, OpenMode::Write, true)
+                .and_then(|()| {
+                    let result = {
+                        let mut streams_desc = self.streams_descriptor.lock().unwrap();
+                        self.write_descriptor(
+                            &mut streams_desc,
+                            info.stream_id,
+                            &info.cached_descriptor,
+                        )
+                        .and_then(|()| self.persist_l3_header(&streams_desc))
+                    };
+                    self.release_lock(STREAMS_STREAM_ID, OpenMode::Write);
+                    result
+                })
+        } else {
+            Ok(())
+        };
 
-        // Release per-stream lock
+        // Always release per-stream lock, regardless of flush outcome
         self.release_lock(info.stream_id, info.mode);
 
-        Ok(())
+        flush_result
     }
 
     fn delete_stream(&self, id: u64) -> Result<(), YakError> {
+        // Clear stale thread-local cache before traversing the stream's
+        // pyramid tree — blocks may have been recycled since our last access.
+        self.layer2.invalidate_thread_local_cache();
+
         // Check that stream is not currently open
         {
             let state = self.state.lock().unwrap();

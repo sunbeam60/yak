@@ -3,6 +3,7 @@ use ::yak::{
     YakError as RustYakError,
 };
 use pyo3::prelude::*;
+use std::sync::{Arc, Mutex};
 
 // ---------------------------------------------------------------------------
 // Error handling
@@ -88,14 +89,19 @@ impl DirEntry {
 
 #[pyclass]
 struct Yak {
-    inner: Option<YakDefault>,
+    /// Arc-wrapped so `close()` can use `&self` (no exclusive PyCell borrow),
+    /// avoiding "Already borrowed" when threads are still mid-call.
+    inner: Mutex<Option<Arc<YakDefault>>>,
 }
 
 impl Yak {
-    /// Borrow the inner Yak handle, returning an error if already closed.
-    fn get(&self) -> PyResult<&YakDefault> {
-        self.inner
+    /// Clone the inner Arc, returning an error if already closed.
+    /// The Mutex is held only for the duration of Arc::clone (nanoseconds).
+    fn get(&self) -> PyResult<Arc<YakDefault>> {
+        let guard = self.inner.lock().unwrap();
+        guard
             .as_ref()
+            .map(Arc::clone)
             .ok_or_else(|| YakError::new_err("Yak file has been closed"))
     }
 }
@@ -134,7 +140,9 @@ impl Yak {
                 )
             })
             .map_err(to_py_err)?;
-        Ok(Yak { inner: Some(inner) })
+        Ok(Yak {
+            inner: Mutex::new(Some(Arc::new(inner))),
+        })
     }
 
     /// Open an existing Yak file.
@@ -151,12 +159,24 @@ impl Yak {
                 None => YakDefault::open(&path, rust_mode),
             })
             .map_err(to_py_err)?;
-        Ok(Yak { inner: Some(inner) })
+        Ok(Yak {
+            inner: Mutex::new(Some(Arc::new(inner))),
+        })
     }
 
-    fn close(&mut self, py: Python<'_>) -> PyResult<()> {
-        match self.inner.take() {
-            Some(inner) => py.detach(move || inner.close()).map_err(to_py_err),
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
+        let taken = self.inner.lock().unwrap().take();
+        match taken {
+            Some(arc) => py
+                .detach(move || match Arc::try_unwrap(arc) {
+                    Ok(yak) => yak.close(),
+                    Err(_) => {
+                        // Other threads still hold references — YakDefault
+                        // will be cleaned up when the last Arc is dropped.
+                        Ok(())
+                    }
+                })
+                .map_err(to_py_err),
             None => Ok(()),
         }
     }

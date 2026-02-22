@@ -814,6 +814,15 @@ impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlockLayer
         self.layer1.read_header_slot(slot)
     }
 
+    fn invalidate_thread_local_cache(&self) {
+        if CACHE_BUDGET_BYTES == 0 {
+            return;
+        }
+        if let Some(tc) = self.block_cache.get() {
+            tc.borrow_mut().clear();
+        }
+    }
+
     fn verify(&self, claimed_blocks: &[u64]) -> Result<Vec<String>, YakError> {
         let mut issues = Vec::new();
 

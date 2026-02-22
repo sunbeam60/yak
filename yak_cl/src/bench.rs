@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
@@ -152,6 +153,7 @@ fn print_bench_usage() {
     eprintln!("  warm-read        Write then read 2750x10KB streams (same instance, warm cache)");
     eprintln!("  overwrite        Write 10MB then 5000 overwrites (compress/decompress stress)");
     eprintln!("  dir-lookup       Open 1000 streams by name in a 10000-entry directory");
+    eprintln!("  cache-pressure   Random reads under cache-invalidation pressure (threaded)");
     eprintln!("  all              Run all scenarios in sequence");
     eprintln!();
     eprintln!("Options:");
@@ -213,6 +215,10 @@ pub fn cmd_bench(args: &[String]) -> CliResult {
         "dir-lookup" => {
             run_quad(a.cbss, c, |v, pw| run_dir_lookup(a.bss, a.biw, v, pw)).map(|_| ())
         }
+        "cache-pressure" => run_quad(a.cbss, c, |v, pw| {
+            run_cache_pressure(a.bss, a.biw, v, pw, a.threads)
+        })
+        .map(|_| ()),
         "all" => run_all(a.bss, a.biw, a.cbss, a.threads, c),
         other => {
             print_bench_usage();
@@ -972,6 +978,190 @@ fn run_dir_lookup(bss: u8, biw: u8, cbss: u8, password: Option<&[u8]>) -> Result
     Ok(elapsed_ms)
 }
 
+/// Measures collateral cache damage from stream lifecycle operations.
+///
+/// The L2 block cache is per-thread. Every stream open/close/create/delete
+/// acquires the Streams stream lock and calls `invalidate_block_cache()`,
+/// which wipes the **entire** thread-local LRU — including warm redirector
+/// blocks for unrelated user streams the thread was serving.
+///
+/// This benchmark models the worst-case pattern: I/O threads performing many
+/// random reads on large streams (building warm redirector caches), while
+/// periodically triggering cache invalidation via short-lived open/close
+/// cycles on other streams. Churn threads run in parallel, modelling a
+/// realistic workload of frequent short-lived stream operations.
+///
+/// After the dual-cache optimisation, `invalidate_block_cache()` is removed
+/// and per-thread caches survive Streams stream lock acquisitions — so the
+/// same benchmark should run faster.
+fn run_cache_pressure(
+    bss: u8,
+    biw: u8,
+    cbss: u8,
+    password: Option<&[u8]>,
+    threads: usize,
+) -> Result<f64, CliError> {
+    let _guard = CleanupGuard { path: BENCH_FILE };
+
+    // 10 large streams, each 8MB — deep enough for a multi-level pyramid
+    // at default params (biw=4, bss=12 → fan-out 1024, depth 2 at 2048 blocks)
+    const LARGE_STREAMS: usize = 10;
+    const STREAM_SIZE: usize = 8 * 1024 * 1024;
+
+    // Each I/O thread does 2000 random 4KB reads across the stream
+    const READS_PER_THREAD: usize = 2000;
+    const READ_SIZE: usize = 4096;
+
+    // Every N reads, the I/O thread opens+closes another stream, triggering
+    // invalidate_block_cache() on itself — wiping its warm redirector cache
+    const INVALIDATION_INTERVAL: usize = 25;
+
+    // Churn threads write a small buffer per cycle
+    const CHURN_WRITE_SIZE: usize = 4096;
+
+    // Phase 1: populate large streams (not timed)
+    eprint!("    populating {} x {}MB streams...", LARGE_STREAMS, STREAM_SIZE / (1024 * 1024));
+    {
+        let sfs = create_bench_yak(BENCH_FILE, biw, bss, cbss, password)?;
+        let buf = make_buffer(STREAM_SIZE);
+        for i in 0..LARGE_STREAMS {
+            let name = format!("large_{:04}.bin", i);
+            let handle = create_bench_stream(&sfs, &name, cbss)?;
+            sfs.write(&handle, &buf).map_err(err)?;
+            sfs.close_stream(handle).map_err(err)?;
+        }
+        sfs.close().map_err(err)?;
+    }
+    eprintln!(" done");
+
+    // Phase 2: concurrent I/O + churn (timed)
+    let sfs = Arc::new(open_bench_yak(BENCH_FILE, OpenMode::Write, password)?);
+    let done = Arc::new(AtomicBool::new(false));
+    let churn_ops = Arc::new(AtomicU64::new(0));
+
+    // At least 1 I/O thread + 1 churn thread
+    let effective_threads = threads.max(2);
+    let io_count = effective_threads / 2;
+    let churn_count = effective_threads - io_count;
+
+    let t0 = Instant::now();
+
+    // I/O threads: random reads on a large stream, with periodic invalidation
+    let io_handles: Vec<_> = (0..io_count)
+        .map(|t| {
+            let sfs = Arc::clone(&sfs);
+            let stream_idx = t % LARGE_STREAMS;
+            thread::spawn(move || -> Result<(), String> {
+                let name = format!("large_{:04}.bin", stream_idx);
+                let handle = sfs
+                    .open_stream(&name, OpenMode::Read)
+                    .map_err(|e| e.to_string())?;
+                let max_offset = (STREAM_SIZE - READ_SIZE) as u64;
+                let mut buf = vec![0u8; READ_SIZE];
+
+                for r in 0..READS_PER_THREAD {
+                    // Deterministic pseudo-random offset (Knuth multiplicative hash)
+                    let offset = ((r as u64).wrapping_mul(2654435761) % max_offset) & !7;
+                    sfs.seek(&handle, offset).map_err(|e| e.to_string())?;
+                    sfs.read(&handle, &mut buf).map_err(|e| e.to_string())?;
+
+                    // Periodically trigger cache invalidation by opening+closing
+                    // a different stream — this acquires the Streams stream lock
+                    // and calls invalidate_block_cache() on THIS thread
+                    if r > 0 && r % INVALIDATION_INTERVAL == 0 {
+                        let other =
+                            (stream_idx + 1 + r / INVALIDATION_INTERVAL) % LARGE_STREAMS;
+                        let other_name = format!("large_{:04}.bin", other);
+                        let h = sfs
+                            .open_stream(&other_name, OpenMode::Read)
+                            .map_err(|e| e.to_string())?;
+                        sfs.close_stream(h).map_err(|e| e.to_string())?;
+                    }
+                }
+
+                sfs.close_stream(handle).map_err(|e| e.to_string())?;
+                Ok(())
+            })
+        })
+        .collect();
+
+    // Churn threads: rapid create/write/close/delete cycles until I/O finishes
+    let churn_handles: Vec<_> = (0..churn_count)
+        .map(|t| {
+            let sfs = Arc::clone(&sfs);
+            let done = Arc::clone(&done);
+            let churn_ops = Arc::clone(&churn_ops);
+            thread::spawn(move || -> Result<(), String> {
+                let buf = vec![0xABu8; CHURN_WRITE_SIZE];
+                let mut cycle = 0u64;
+                while !done.load(Ordering::Relaxed) {
+                    let name = format!("_churn_t{}_{}.tmp", t, cycle);
+                    let h = sfs
+                        .create_stream(&name, cbss > 0)
+                        .map_err(|e| e.to_string())?;
+                    sfs.write(&h, &buf).map_err(|e| e.to_string())?;
+                    sfs.close_stream(h).map_err(|e| e.to_string())?;
+                    sfs.delete_stream(&name).map_err(|e| e.to_string())?;
+                    cycle += 1;
+                }
+                churn_ops.fetch_add(cycle, Ordering::Relaxed);
+                Ok(())
+            })
+        })
+        .collect();
+
+    // Wait for I/O threads — these determine the benchmark time
+    let mut failed = false;
+    for h in io_handles {
+        if let Err(e) = h.join().unwrap_or(Err("thread panicked".to_string())) {
+            eprintln!("I/O thread error: {}", e);
+            failed = true;
+        }
+    }
+    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    // Signal churn threads to stop, then join
+    done.store(true, Ordering::Relaxed);
+    for h in churn_handles {
+        if let Err(e) = h.join().unwrap_or(Err("thread panicked".to_string())) {
+            eprintln!("Churn thread error: {}", e);
+            failed = true;
+        }
+    }
+
+    let total_reads = io_count * READS_PER_THREAD;
+    let invalidations_per_thread = (READS_PER_THREAD - 1) / INVALIDATION_INTERVAL;
+    let total_churn = churn_ops.load(Ordering::Relaxed);
+    eprintln!(
+        "    I/O: {} threads x {} reads, invalidation every {} reads ({} cache wipes/thread)",
+        io_count, READS_PER_THREAD, INVALIDATION_INTERVAL, invalidations_per_thread
+    );
+    eprintln!(
+        "    Churn: {} threads, {} create/write/close/delete cycles",
+        churn_count, total_churn
+    );
+    eprintln!(
+        "    elapsed: {:.0} ms  ({:.1} reads/s)",
+        elapsed_ms,
+        total_reads as f64 / (elapsed_ms / 1000.0)
+    );
+
+    match Arc::try_unwrap(sfs) {
+        Ok(s) => {
+            if let Err(e) = s.close() {
+                eprintln!("Error closing Yak: {}", e);
+            }
+        }
+        Err(_) => eprintln!("Warning: could not unwrap Arc for close"),
+    }
+
+    if failed {
+        Err(CliError::new("One or more threads failed"))
+    } else {
+        Ok(elapsed_ms)
+    }
+}
+
 /// Helper to run a named scenario via run_quad and accumulate timings.
 macro_rules! bench_scenario {
     ($name:expr, $normal:ident, $comp:ident, $enc:ident, $comp_enc:ident, $cbss:expr, $cases:expr, $body:expr) => {{
@@ -1120,6 +1310,16 @@ fn run_all(bss: u8, biw: u8, cbss: u8, threads: usize, cases: &str) -> CliResult
         cbss,
         cases,
         |v, pw| { run_dir_lookup(bss, biw, v, pw) }
+    );
+    bench_scenario!(
+        "cache-pressure",
+        total_normal,
+        total_comp,
+        total_enc,
+        total_comp_enc,
+        cbss,
+        cases,
+        |v, pw| { run_cache_pressure(bss, biw, v, pw, threads) }
     );
 
     // Build summary line showing only the cases that were run

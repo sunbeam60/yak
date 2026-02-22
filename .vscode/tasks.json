@@ -288,29 +288,40 @@
                 "command": "powershell",
                 "args": [
                     "-Command",
-                    "$branch = (git -C '${workspaceFolder}' branch --show-current).Trim().Replace('/','-'); if ($branch -eq 'master') { $name = 'yak.exe' } else { $name = 'yak-' + $branch + '.exe' }; New-Item -ItemType Directory -Force -Path '${env:USERPROFILE}/bin'; Copy-Item '${workspaceFolder}/target/release/yak.exe' ('${env:USERPROFILE}/bin/' + $name) -Force; Copy-Item '${workspaceFolder}/target/release/yak_c.dll' '${env:USERPROFILE}/bin/yak_c.dll' -Force; Write-Host ('Release binary copied to ~/bin/' + $name)"
+                    "$best=$null; $bt=[datetime]::MinValue; foreach($line in (git -C '${workspaceFolder}' worktree list --porcelain)){ if($line -match '^worktree (.+)'){ $wt=$Matches[1]; $bin=Join-Path $wt 'target\\release\\yak.exe'; if(Test-Path $bin){ $t=(Get-Item $bin).LastWriteTime; if($t -gt $bt){ $bt=$t; $best=$wt } } } }; if(-not $best){ Write-Error 'No release binary found in any worktree'; exit 1 }; $branch=(git -C $best branch --show-current).Trim().Replace('/','-'); if($branch -eq 'master'){ $name='yak.exe' } else { $name='yak-'+$branch+'.exe' }; New-Item -ItemType Directory -Force -Path '${env:USERPROFILE}/bin' | Out-Null; Copy-Item (Join-Path $best 'target\\release\\yak.exe') (Join-Path '${env:USERPROFILE}/bin' $name) -Force; $dll=Join-Path $best 'target\\release\\yak_c.dll'; if(Test-Path $dll){ Copy-Item $dll '${env:USERPROFILE}/bin/yak_c.dll' -Force; Write-Host ('Copied ' + $best + ' [' + $branch + '] -> ~/bin/' + $name + ' + yak_c.dll') } else { Write-Host ('Copied ' + $best + ' [' + $branch + '] -> ~/bin/' + $name + ' (yak_c.dll not built, skipped)') }"
                 ]
             },
             "osx": {
                 "command": "bash",
                 "args": [
                     "-c",
-                    "branch=$(git -C '${workspaceFolder}' branch --show-current | tr '/' '-') && if [ \"$branch\" = \"master\" ]; then name=yak; else name=yak-$branch; fi && mkdir -p ~/.local/bin && cp '${workspaceFolder}/target/release/yak' ~/.local/bin/$name && cp '${workspaceFolder}/target/release/libyak_c.dylib' ~/.local/bin/libyak_c.dylib && echo \"Release binary copied to ~/.local/bin/$name\""
+                    "best=''; bt=0; while IFS= read -r line; do case \"$line\" in worktree\\ *) wt=\"${line#worktree }\"; bin=\"$wt/target/release/yak\"; if [ -f \"$bin\" ]; then t=$(stat -f%m \"$bin\" 2>/dev/null || stat -c%Y \"$bin\" 2>/dev/null); if [ \"$t\" -gt \"$bt\" ]; then bt=$t; best=$wt; fi; fi;; esac; done < <(git -C '${workspaceFolder}' worktree list --porcelain) && if [ -z \"$best\" ]; then echo 'No release binary found in any worktree' >&2; exit 1; fi && branch=$(git -C \"$best\" branch --show-current | tr '/' '-') && if [ \"$branch\" = \"master\" ]; then name=yak; else name=yak-$branch; fi && mkdir -p ~/.local/bin && cp \"$best/target/release/yak\" ~/.local/bin/$name && dll=\"$best/target/release/libyak_c.dylib\" && if [ -f \"$dll\" ]; then cp \"$dll\" ~/.local/bin/libyak_c.dylib && echo \"Copied $best [$branch] -> ~/.local/bin/$name + libyak_c.dylib\"; else echo \"Copied $best [$branch] -> ~/.local/bin/$name (libyak_c.dylib not built, skipped)\"; fi"
                 ]
             },
             "linux": {
                 "command": "bash",
                 "args": [
                     "-c",
-                    "branch=$(git -C '${workspaceFolder}' branch --show-current | tr '/' '-') && if [ \"$branch\" = \"master\" ]; then name=yak; else name=yak-$branch; fi && mkdir -p ~/.local/bin && cp '${workspaceFolder}/target/release/yak' ~/.local/bin/$name && cp '${workspaceFolder}/target/release/libyak_c.so' ~/.local/bin/libyak_c.so && echo \"Release binary copied to ~/.local/bin/$name\""
+                    "best=''; bt=0; while IFS= read -r line; do case \"$line\" in worktree\\ *) wt=\"${line#worktree }\"; bin=\"$wt/target/release/yak\"; if [ -f \"$bin\" ]; then t=$(stat -c%Y \"$bin\" 2>/dev/null || stat -f%m \"$bin\" 2>/dev/null); if [ \"$t\" -gt \"$bt\" ]; then bt=$t; best=$wt; fi; fi;; esac; done < <(git -C '${workspaceFolder}' worktree list --porcelain) && if [ -z \"$best\" ]; then echo 'No release binary found in any worktree' >&2; exit 1; fi && branch=$(git -C \"$best\" branch --show-current | tr '/' '-') && if [ \"$branch\" = \"master\" ]; then name=yak; else name=yak-$branch; fi && mkdir -p ~/.local/bin && cp \"$best/target/release/yak\" ~/.local/bin/$name && so=\"$best/target/release/libyak_c.so\" && if [ -f \"$so\" ]; then cp \"$so\" ~/.local/bin/libyak_c.so && echo \"Copied $best [$branch] -> ~/.local/bin/$name + libyak_c.so\"; else echo \"Copied $best [$branch] -> ~/.local/bin/$name (libyak_c.so not built, skipped)\"; fi"
                 ]
             },
             "options": {
                 "cwd": "${workspaceFolder}"
             },
+            "problemMatcher": [],
+            "group": "build",
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared"
+            }
+        },
+        {
+            "label": "build-and-copy-release",
             "dependsOn": [
-                "cargo-build-all-release"
+                "cargo-build-all-release",
+                "copy-release-binaries"
             ],
+            "dependsOrder": "sequence",
             "problemMatcher": [],
             "group": "build",
             "presentation": {

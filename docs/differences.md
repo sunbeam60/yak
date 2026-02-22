@@ -6,7 +6,7 @@ This file tracks divergences between the implementation and the architecture doc
 
 ### Publication status (fixed)
 
-The workspace `Cargo.toml` previously set `publish = false`. As of v0.9.0, `yak` and `yak_cl` are published to crates.io, and Python bindings are published to PyPI as `libyak` (the `yak` name was taken on PyPI). The architecture says `pip install yak` but the actual command is `pip install libyak`; the import name remains `import yak`.
+The workspace `Cargo.toml` previously set `publish = false`. As of v0.9.0, `yak` and `yak_cl` are published to crates.io, and Python bindings are published to PyPI as `libyak` (the `yak` name was taken on PyPI). The architecture says `pip install yak` but the actual command is `pip install libyak`; the import name is `import libyak` (or `import libyak as yak` for convenience).
 
 ### Python wrapper path (fixed)
 
@@ -28,25 +28,19 @@ The architecture previously said "One possible optimization is to maintain a fre
 
 The architecture previously described sequential scanning with per-entry hash comparison. It now documents the Name Table approach: sorted (hash, offset) pairs appended after stream entries, binary search for O(log n) lookups, and the insert/delete mechanics.
 
+### Directory entry field order now matches (fixed)
+
+The differences file previously claimed the architecture had `| length | identifier | name |` while the code had `| identifier | length | name |`. The architecture now shows the same order as the code: `| stream identifier (2-8 bytes) | length (2 bytes) | name |`.
+
+### Directory footer now matches (fixed)
+
+The differences file previously claimed the architecture said "an 8 byte that indicates the size of the Name Table." The architecture now says "an 4 byte that indicates the offset of the Name Table", matching the implementation's 4-byte `name_table_offset: u32`.
+
+### Stream descriptor flags byte now documented (fixed)
+
+The architecture previously described only 3 fields (size, top_block, reserved = 24 bytes). It now documents the full 25-byte layout including `flags (1 byte)` for per-stream compression.
+
 ## Active divergences
-
-### Directory entry field order differs from architecture
-
-**Architecture says:** Entry format is `| length (2 bytes) | stream identifier (2-8 bytes) | name |`
-
-**Reality:** The code serializes entries as `| id (biw bytes) | name_len (2 bytes) | name |` — the stream identifier comes first, then the name length. The fields are the same but in a different order.
-
-### Directory footer stores offset rather than size
-
-**Architecture says:** The footer is "an 8 byte that indicates the size of the Name Table."
-
-**Reality:** The footer is 4 bytes storing `name_table_offset: u32` — the byte position where the name table begins. The entry count is derived from `(stream_len - footer_size - name_table_offset) / slot_size`. Both approaches locate the name table equally well; the implementation chose offset (4 bytes) over size (8 bytes).
-
-### Stream descriptor format has an additional field
-
-**Architecture says:** Stream descriptors have three fields: size (u64), top_block (u64), and reserved (u64) — 24 bytes.
-
-**Reality:** Stream descriptors are 25 bytes. A `flags: u8` field was added at byte 24 to support per-stream compression (`STREAM_FLAG_COMPRESSED = 1`). The architecture's compression section discusses compression conceptually but doesn't mention this flag in the descriptor format.
 
 ### L2 API is broader than documented
 
@@ -55,7 +49,7 @@ The architecture previously described sequential scanning with per-entry hash co
 **Reality:** The `BlockLayer` trait also exposes:
 - `allocate_blocks()` / `deallocate_blocks()` -- batch operations that sort indices to promote contiguous reuse
 - `read_contiguous_blocks()` / `write_contiguous_blocks()` -- multi-block I/O across runs of contiguous blocks
-- `invalidate_block_cache()` -- thread-local cache management
+- `invalidate_thread_local_cache()` -- clears the calling thread's per-thread cache (used before accessing shared streams like directories)
 - `is_encrypted()` -- query whether file uses encryption
 - `verify()` -- integrity checking
 
@@ -101,11 +95,16 @@ The architecture discusses reserved capacity and compression conceptually but do
 
 **Reality:** `verify()` is implemented as a chain across all four layers (L4 -> L3 -> L2 -> L1), each layer checking its own invariants and passing claimed resource lists down. This is a significant feature not described in any layer's API section.
 
-### Block cache has configurable budget via const generic
+### Block cache is a dual-cache system with configurable budget
 
-**Architecture says:** L2 manages a write-through cache of blocks (no mention of configurability).
+**Architecture says:** L2 manages a write-through cache of blocks (no mention of configurability or dual caching).
 
-**Reality:** `BlocksInFile<L1, const CACHE_BUDGET_BYTES: usize>` takes a const generic parameter for the cache memory budget (default: 2 MB). The cache is implemented as a thread-local LRU with a maximum of 4096 entries. The architecture correctly describes the cache as thread-local and write-through but doesn't mention the budget parameter.
+**Reality:** `BlocksInFile<L1, const CACHE_BUDGET_BYTES: usize>` takes a const generic parameter for the cache memory budget (default: 2 MB). The cache is a dual system:
+- **Thread-local LRU** — per-thread, lock-free, used for user stream redirector blocks (`CacheMode::ThreadLocal`)
+- **Shared LRU** — Mutex-guarded, cross-thread coherent, used for Streams stream redirector blocks (`CacheMode::Shared`)
+- **Bypass** — `CacheMode::None` for contiguous block I/O and data blocks
+
+Both caches are write-through. The `CacheMode` enum is threaded through L3 to select the appropriate cache for each operation. The architecture describes a single thread-local cache; the dual-cache avoids full cache invalidation when threads share access to internal streams (like the Streams stream that holds descriptors).
 
 ### Architecture header example has a terminology inconsistency
 

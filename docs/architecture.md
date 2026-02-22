@@ -166,7 +166,7 @@ When the four layers instantiate for creation, they request through L1 a "header
 ```
 Magic: File magic header | header layout version | total layer header length
 L1: length | L1 identifier | L1 version
-L2: length | L2 identifier | L2 version | block size shift | block index size shift | free list head | encryption flag | [additional encryption parameters]
+L2: length | L2 identifier | L2 version | block size shift | block index width | free list head | encryption flag | [additional encryption parameters]
 L3: length | L3 identifier | L3 version | Streams stream descriptor
 L4: length | L4 identifier | L4 version | root directory stream index
 ```
@@ -229,12 +229,12 @@ When an existing Yak file is opened, it reads the root directory stream index nu
 Stream entries in the directory streams are serialized compactly. Since the length of their names vary, they are encoded as follows:
 
 ```ASCII
-| length (2 bytes) | stream identifier (2-8 bytes) | name (1-65,522 bytes) ........ | 
+| stream identifier (2-8 bytes) | length (2 bytes) | name (1-65,522 bytes) ........ | 
 ```
 
 Following all the name/stream ID entries is a so called "Name Table". The purpose of this table is to facilitate fast O(log n) searcing for a named stream. Of course, in a directory with 5 streams, this is rather overkill, but in a directory with 50,000 streams it drastically cuts down the time require to locate the right stream.
 
-At the very, very end of the directory stream is an 8 byte that indicates the size of the Name Table. When Yak needs to locate a stream by name, it jumps to the end (less 8 bytes) of the directory stream, reads the length of the Name Table, jumps that much further back in the table and reads the name table itself.
+At the very, very end of the directory stream is an 4 byte that indicates the offset of the Name Table. When Yak needs to locate a stream by name, it jumps to the end (less 4 bytes) of the directory stream, reads the offset of the Name Table, jumps to that offset and reads the name table itself.
 
 The Name Table consists of pairs of string hashes and offsets and it is sorted by string hashes. With the hash of the name the caller is searching for, Yak does a binary search to find the one or more hashes that matches the hash of the name the caller is attempting to open. If one or more identical hashes have been found in the Name Table, Yak jumps to these entries, compares the length of the string (for early rejection), then does a string compare for the caller requested name. If there's a match, L4 now has the Stream ID and can proceed to open this stream.
 
@@ -401,11 +401,18 @@ On the other hand, if compressed blocks are defined to hold 32 kb, their data mi
 
 This does, of course, introduce some slow downs in that every time a compressed block needs modification, we need to locate the compressed data, decompress the data, modify the data and then recompress the data. Yak uses LZ4 as the compression algorithm, broadly considered the fastest, "decent" compression algorithm. The gain, on the other hand, is that we often need less IO (because we need to write and read less from the disk due to the data being smaller). In some scenarios, using compression actually improves the read and writing speed of Yak, but broadly it is best to think that compression trades reading/writing time for storage space requirements. Callers must decide through testing whether compression is worthwhile for their scenario. It is given, but is nevertheless worth stating, that data that's already compressed before it is added to the Yak file will not compress further and will, in fact, end up larger if added to a Yak file as a compressed stream.
 
+Since some streams can be compressed and some streams won't be compressed, the Stream Descriptor has a single byte to hold flags at the end of the Stream Descriptor so that the actual layout looks as follows:
+```ASCII
+size (8 bytes) | top block (8 bytes) | reserved size (8 bytes) | flags (1 byte)
+```
+
+Currently only one flag (compression on or off) is stored in this byte, leaving space for 7 additional flags.
+
 ### Tracking streams in L3
 
 L3 has a list of Stream Descriptors for all streams that exist. This list itself stored in a stream. To track the stream that stores Stream Descriptors, a single Stream Descriptor is held "out of band"; lets call this descriptor "Streams" here for clarity of description. 
 
-When a new stream is created by a caller, we need to create a new Stream Descriptor. All Stream Descriptors are written into the Streams stream, which is expanded and contracted like every other stream. The Streams stream is of course initialised with 0 Stream Descriptors, because no other streams exist. As other streams are created, the Streams stream expands to hold these other Stream Descriptors; this expansion happens in L2 block-size chunks (eventually we will have to expand into new blocks when we add Stream Descriptors; we may as well do a full block and keep some in reserve to avoid having to continually expanding the Streams stream every time a new stream is added)
+When a new stream is created by a caller, we need to create a new Stream Descriptor. All Stream Descriptors are written into the Streams stream, which is expanded and contracted like every other stream. The Streams stream is of course initialised with 0 Stream Descriptors, because no other streams exist. As other streams are created, the Streams stream expands to hold these other Stream Descriptors; this expansion happens in L2 block-size chunks (eventually we will have to expand into new blocks when we add Stream Descriptors; we may as well do a full block and keep some in reserve to avoid having to continually expanding the Streams stream every time a new stream is added), which leaves a buffer of available stream descriptors for the next streams.
 
 Eventually some streams are deleted and the associated Stream Descriptor in Streams is marked free. At the start of the Streams stream is written an 8 byte offset to the first free Stream Descriptor. If there are no free Stream Descriptors, a magic value if 0xFFF... is used to imply no free Stream Descriptors exist. In the Stream Descriptor pointed to by the offset in front of the Streams stream is written the value of the next free Stream Descriptor and so on, ensuring that all free Stream Descriptors are linked together as a chain. 
 

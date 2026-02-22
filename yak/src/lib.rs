@@ -9,7 +9,7 @@ mod streams_from_blocks;
 mod streams_from_files;
 mod yak;
 
-pub use block_layer::BlockLayer;
+pub use block_layer::{BlockLayer, CacheMode};
 pub use blocks_from_files::BlocksFromFiles;
 pub use blocks_in_file::{BlocksInFile, DEFAULT_CACHE_BUDGET_BYTES};
 pub use file_layer::FileLayer;

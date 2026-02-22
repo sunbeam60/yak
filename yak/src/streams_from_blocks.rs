@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Condvar, Mutex};
 
-use crate::block_layer::BlockLayer;
+use crate::block_layer::{BlockLayer, CacheMode};
 use crate::stream_layer::StreamLayer;
 use crate::{HeaderSlotId, OpenMode, YakError};
 
@@ -212,11 +212,12 @@ fn read_block_index<L2: BlockLayer>(
     redirector_block: u64,
     slot: u64,
     block_index_width: u8,
+    cache: CacheMode,
 ) -> Result<u64, YakError> {
     let biw = block_index_width as usize;
     let offset = (slot as usize) * biw;
     let mut buf = [0u8; 8];
-    layer2.read_block(redirector_block, offset, &mut buf[..biw], true)?;
+    layer2.read_block(redirector_block, offset, &mut buf[..biw], cache)?;
     Ok(u64::from_le_bytes(buf))
 }
 
@@ -227,11 +228,12 @@ fn write_block_index<L2: BlockLayer>(
     slot: u64,
     index: u64,
     block_index_width: u8,
+    cache: CacheMode,
 ) -> Result<(), YakError> {
     let biw = block_index_width as usize;
     let offset = (slot as usize) * biw;
     let bytes = index.to_le_bytes();
-    layer2.write_block(redirector_block, offset, &bytes[..biw], true)?;
+    layer2.write_block(redirector_block, offset, &bytes[..biw], cache)?;
     Ok(())
 }
 
@@ -243,10 +245,11 @@ fn fill_sentinel<L2: BlockLayer>(
     block: u64,
     block_size: usize,
     block_index_width: u8,
+    cache: CacheMode,
 ) -> Result<usize, YakError> {
     let _ = block_index_width; // sentinel is always all-0xFF regardless of width
     let buf = vec![0xFFu8; block_size];
-    layer2.write_block(block, 0, &buf, true)
+    layer2.write_block(block, 0, &buf, cache)
 }
 
 /// Navigate from root to the leaf redirector containing `data_block_idx`.
@@ -263,6 +266,7 @@ fn navigate_to_leaf<L2: BlockLayer>(
     depth: u32,
     fan_out: u64,
     block_index_width: u8,
+    cache: CacheMode,
 ) -> Result<u64, YakError> {
     if depth <= 1 {
         return Ok(descriptor.top_block);
@@ -276,7 +280,7 @@ fn navigate_to_leaf<L2: BlockLayer>(
         let slot = remaining_idx / span;
         remaining_idx %= span;
 
-        let child = read_block_index(layer2, current_block, slot, block_index_width)?;
+        let child = read_block_index(layer2, current_block, slot, block_index_width, cache)?;
         if child == block_sentinel(block_index_width) {
             return Err(YakError::IoError(format!(
                 "navigate_to_leaf: invalid block at depth {}, slot {}",
@@ -350,6 +354,11 @@ fn scan_run_from_buffer(
     Ok((first_block, run_length as u64))
 }
 
+/// Compute fan-out (redirector slots per block) from an L2 layer.
+fn compute_fan_out<L2: BlockLayer>(layer2: &L2) -> u64 {
+    (layer2.block_size() / layer2.block_index_width() as usize) as u64
+}
+
 /// Write data block indices into leaf redirectors in batches.
 ///
 /// Instead of writing each data block's index one at a time (with a full
@@ -362,10 +371,11 @@ fn batch_fill_leaf_redirectors<L2: BlockLayer>(
     descriptor: &StreamDescriptor,
     new_blocks: &[u64],
     starting_data_block_idx: u64,
-    fan_out: u64,
     block_index_width: u8,
     depth: u32,
+    cache: CacheMode,
 ) -> Result<(), YakError> {
+    let fan_out = compute_fan_out(layer2);
     if depth == 0 || new_blocks.is_empty() {
         return Ok(());
     }
@@ -388,12 +398,13 @@ fn batch_fill_leaf_redirectors<L2: BlockLayer>(
             let slot = remaining_idx / span;
             remaining_idx %= span;
 
-            let mut child = read_block_index(layer2, current_block, slot, block_index_width)?;
+            let mut child =
+                read_block_index(layer2, current_block, slot, block_index_width, cache)?;
             if child == sentinel {
                 // Allocate new intermediate redirector, fill with sentinels
                 child = layer2.allocate_block()?;
-                fill_sentinel(layer2, child, block_size, block_index_width)?;
-                write_block_index(layer2, current_block, slot, child, block_index_width)?;
+                fill_sentinel(layer2, child, block_size, block_index_width, cache)?;
+                write_block_index(layer2, current_block, slot, child, block_index_width, cache)?;
             }
             current_block = child;
         }
@@ -413,7 +424,7 @@ fn batch_fill_leaf_redirectors<L2: BlockLayer>(
 
         // Write all indices to the leaf in one call
         let offset = start_slot * biw;
-        layer2.write_block(current_block, offset, &buf, true)?;
+        layer2.write_block(current_block, offset, &buf, cache)?;
 
         i += batch_size;
     }
@@ -436,7 +447,7 @@ trait PyramidOps<L2: BlockLayer> {
     fn blocks_needed(&self, size: u64) -> u64;
 
     /// Initialize a newly allocated block for use as a leaf-level entry.
-    fn init_leaf_block(&self, layer2: &L2, block: u64) -> Result<(), YakError>;
+    fn init_leaf_block(&self, layer2: &L2, block: u64, cache: CacheMode) -> Result<(), YakError>;
 
     /// Collect all physical blocks owned by a leaf slot value, for deallocation.
     fn collect_leaf_blocks_for_dealloc(
@@ -444,6 +455,7 @@ trait PyramidOps<L2: BlockLayer> {
         layer2: &L2,
         leaf_value: u64,
         blocks: &mut Vec<u64>,
+        cache: CacheMode,
     ) -> Result<(), YakError>;
 
     /// Collect all physical blocks owned by a leaf slot value, for verification.
@@ -454,6 +466,7 @@ trait PyramidOps<L2: BlockLayer> {
         layer2: &L2,
         leaf_value: u64,
         collector: &mut TreeCollector<'_>,
+        cache: CacheMode,
     );
 }
 
@@ -471,7 +484,12 @@ impl<L2: BlockLayer> PyramidOps<L2> for UncompressedOps {
         size.div_ceil(self.block_size as u64)
     }
 
-    fn init_leaf_block(&self, _layer2: &L2, _block: u64) -> Result<(), YakError> {
+    fn init_leaf_block(
+        &self,
+        _layer2: &L2,
+        _block: u64,
+        _cache: CacheMode,
+    ) -> Result<(), YakError> {
         Ok(()) // Data blocks need no initialization
     }
 
@@ -480,6 +498,7 @@ impl<L2: BlockLayer> PyramidOps<L2> for UncompressedOps {
         _layer2: &L2,
         leaf_value: u64,
         blocks: &mut Vec<u64>,
+        _cache: CacheMode,
     ) -> Result<(), YakError> {
         blocks.push(leaf_value);
         Ok(())
@@ -490,6 +509,7 @@ impl<L2: BlockLayer> PyramidOps<L2> for UncompressedOps {
         _layer2: &L2,
         leaf_value: u64,
         collector: &mut TreeCollector<'_>,
+        _cache: CacheMode,
     ) {
         collector.blocks.push(leaf_value);
     }
@@ -512,10 +532,10 @@ impl<L2: BlockLayer> PyramidOps<L2> for CompressedOps {
         size.div_ceil(self.compressed_block_size as u64)
     }
 
-    fn init_leaf_block(&self, layer2: &L2, block: u64) -> Result<(), YakError> {
+    fn init_leaf_block(&self, layer2: &L2, block: u64, cache: CacheMode) -> Result<(), YakError> {
         // Initialize compression redirector with compressed_length=0
         let zero_buf = [0u8; 4];
-        layer2.write_block(block, 0, &zero_buf, true)?;
+        layer2.write_block(block, 0, &zero_buf, cache)?;
         Ok(())
     }
 
@@ -524,8 +544,15 @@ impl<L2: BlockLayer> PyramidOps<L2> for CompressedOps {
         layer2: &L2,
         leaf_value: u64,
         blocks: &mut Vec<u64>,
+        cache: CacheMode,
     ) -> Result<(), YakError> {
-        let redir = read_comp_redir(layer2, leaf_value, self.block_size, self.block_index_width)?;
+        let redir = read_comp_redir(
+            layer2,
+            leaf_value,
+            self.block_size,
+            self.block_index_width,
+            cache,
+        )?;
         for &db in &redir.data_blocks {
             blocks.push(db);
         }
@@ -538,9 +565,16 @@ impl<L2: BlockLayer> PyramidOps<L2> for CompressedOps {
         layer2: &L2,
         leaf_value: u64,
         collector: &mut TreeCollector<'_>,
+        cache: CacheMode,
     ) {
         collector.blocks.push(leaf_value);
-        match read_comp_redir(layer2, leaf_value, self.block_size, self.block_index_width) {
+        match read_comp_redir(
+            layer2,
+            leaf_value,
+            self.block_size,
+            self.block_index_width,
+            cache,
+        ) {
             Ok(redir) => {
                 for &db in &redir.data_blocks {
                     collector.blocks.push(db);
@@ -566,9 +600,10 @@ fn pyramid_read<L2: BlockLayer>(
     pos: u64,
     buf: &mut [u8],
     block_size: usize,
-    fan_out: u64,
     block_index_width: u8,
+    cache: CacheMode,
 ) -> Result<usize, YakError> {
+    let fan_out = compute_fan_out(layer2);
     if pos >= descriptor.size {
         return Ok(0);
     }
@@ -616,8 +651,9 @@ fn pyramid_read<L2: BlockLayer>(
                 depth,
                 fan_out,
                 block_index_width,
+                cache,
             )?;
-            layer2.read_block(leaf_block, 0, &mut leaf_buf, true)?;
+            layer2.read_block(leaf_block, 0, &mut leaf_buf, cache)?;
             cached_leaf_start = leaf_start;
         }
 
@@ -658,9 +694,10 @@ fn pyramid_write<L2: BlockLayer>(
     pos: u64,
     buf: &[u8],
     block_size: usize,
-    fan_out: u64,
     block_index_width: u8,
+    cache: CacheMode,
 ) -> Result<usize, YakError> {
+    let fan_out = compute_fan_out(layer2);
     if buf.is_empty() {
         return Ok(0);
     }
@@ -674,9 +711,9 @@ fn pyramid_write<L2: BlockLayer>(
         descriptor,
         end_pos.max(descriptor.size),
         block_size,
-        fan_out,
         block_index_width,
         &ops,
+        cache,
     )?;
 
     let old_size = descriptor.size;
@@ -717,8 +754,9 @@ fn pyramid_write<L2: BlockLayer>(
                 depth,
                 fan_out,
                 block_index_width,
+                cache,
             )?;
-            layer2.read_block(leaf_block, 0, &mut leaf_buf, true)?;
+            layer2.read_block(leaf_block, 0, &mut leaf_buf, cache)?;
             cached_leaf_start = leaf_start;
         }
 
@@ -764,9 +802,10 @@ fn is_redirector_empty<L2: BlockLayer>(
     block: u64,
     fan_out: u64,
     block_index_width: u8,
+    cache: CacheMode,
 ) -> Result<bool, YakError> {
     for slot in 0..fan_out {
-        let child = read_block_index(layer2, block, slot, block_index_width)?;
+        let child = read_block_index(layer2, block, slot, block_index_width, cache)?;
         if child != block_sentinel(block_index_width) {
             return Ok(false);
         }
@@ -785,28 +824,29 @@ fn collect_tree_blocks_for_dealloc<L2: BlockLayer, P: PyramidOps<L2>>(
     layer2: &L2,
     block: u64,
     depth: u32,
-    fan_out: u64,
     block_index_width: u8,
     blocks: &mut Vec<u64>,
     ops: &P,
+    cache: CacheMode,
 ) -> Result<(), YakError> {
+    let fan_out = compute_fan_out(layer2);
     if depth == 0 {
-        return ops.collect_leaf_blocks_for_dealloc(layer2, block, blocks);
+        return ops.collect_leaf_blocks_for_dealloc(layer2, block, blocks, cache);
     }
 
     // Pyramid redirector: recurse into children, then collect self
     let sentinel = block_sentinel(block_index_width);
     for slot in 0..fan_out {
-        let child = read_block_index(layer2, block, slot, block_index_width)?;
+        let child = read_block_index(layer2, block, slot, block_index_width, cache)?;
         if child != sentinel {
             collect_tree_blocks_for_dealloc(
                 layer2,
                 child,
                 depth - 1,
-                fan_out,
                 block_index_width,
                 blocks,
                 ops,
+                cache,
             )?;
         }
     }
@@ -821,19 +861,19 @@ fn deallocate_tree<L2: BlockLayer, P: PyramidOps<L2>>(
     layer2: &L2,
     block: u64,
     depth: u32,
-    fan_out: u64,
     block_index_width: u8,
     ops: &P,
+    cache: CacheMode,
 ) -> Result<(), YakError> {
     let mut blocks = Vec::new();
     collect_tree_blocks_for_dealloc(
         layer2,
         block,
         depth,
-        fan_out,
         block_index_width,
         &mut blocks,
         ops,
+        cache,
     )?;
     layer2.deallocate_blocks(&mut blocks)?;
     Ok(())
@@ -846,13 +886,14 @@ fn collect_tree_blocks<L2: BlockLayer, P: PyramidOps<L2>>(
     layer2: &L2,
     block: u64,
     depth: u32,
-    fan_out: u64,
     block_index_width: u8,
     collector: &mut TreeCollector<'_>,
     ops: &P,
+    cache: CacheMode,
 ) {
+    let fan_out = compute_fan_out(layer2);
     if depth == 0 {
-        ops.collect_leaf_blocks_verify(layer2, block, collector);
+        ops.collect_leaf_blocks_verify(layer2, block, collector, cache);
         return;
     }
 
@@ -860,17 +901,17 @@ fn collect_tree_blocks<L2: BlockLayer, P: PyramidOps<L2>>(
     collector.blocks.push(block);
     let sentinel = block_sentinel(block_index_width);
     for slot in 0..fan_out {
-        match read_block_index(layer2, block, slot, block_index_width) {
+        match read_block_index(layer2, block, slot, block_index_width, cache) {
             Ok(child) => {
                 if child != sentinel {
                     collect_tree_blocks(
                         layer2,
                         child,
                         depth - 1,
-                        fan_out,
                         block_index_width,
                         collector,
                         ops,
+                        cache,
                     );
                 }
             }
@@ -891,10 +932,11 @@ fn deallocate_slot_at<L2: BlockLayer, P: PyramidOps<L2>>(
     top_block: u64,
     block_idx: u64,
     depth: u32,
-    fan_out: u64,
     block_index_width: u8,
     ops: &P,
+    cache: CacheMode,
 ) -> Result<(), YakError> {
+    let fan_out = compute_fan_out(layer2);
     let sentinel = block_sentinel(block_index_width);
 
     if depth == 0 {
@@ -913,7 +955,7 @@ fn deallocate_slot_at<L2: BlockLayer, P: PyramidOps<L2>>(
         remaining_idx %= span;
         path.push((current_block, slot));
 
-        let child = read_block_index(layer2, current_block, slot, block_index_width)?;
+        let child = read_block_index(layer2, current_block, slot, block_index_width, cache)?;
         if child == sentinel {
             return Ok(()); // Already deallocated
         }
@@ -922,21 +964,28 @@ fn deallocate_slot_at<L2: BlockLayer, P: PyramidOps<L2>>(
 
     // current_block is the bottom (leaf) redirector, remaining_idx is the slot
     let slot = remaining_idx;
-    let leaf_value = read_block_index(layer2, current_block, slot, block_index_width)?;
+    let leaf_value = read_block_index(layer2, current_block, slot, block_index_width, cache)?;
     if leaf_value == sentinel {
         return Ok(());
     }
 
     // Collect and deallocate all physical blocks owned by this leaf entry
     let mut to_dealloc = Vec::new();
-    ops.collect_leaf_blocks_for_dealloc(layer2, leaf_value, &mut to_dealloc)?;
+    ops.collect_leaf_blocks_for_dealloc(layer2, leaf_value, &mut to_dealloc, cache)?;
     layer2.deallocate_blocks(&mut to_dealloc)?;
 
     // Mark the leaf slot as sentinel
-    write_block_index(layer2, current_block, slot, sentinel, block_index_width)?;
+    write_block_index(
+        layer2,
+        current_block,
+        slot,
+        sentinel,
+        block_index_width,
+        cache,
+    )?;
 
     // Check if leaf redirector is now empty; if so, deallocate it and mark in parent
-    if is_redirector_empty(layer2, current_block, fan_out, block_index_width)? {
+    if is_redirector_empty(layer2, current_block, fan_out, block_index_width, cache)? {
         layer2.deallocate_block(current_block)?;
         if let Some(&(parent_block, parent_slot)) = path.last() {
             write_block_index(
@@ -945,6 +994,7 @@ fn deallocate_slot_at<L2: BlockLayer, P: PyramidOps<L2>>(
                 parent_slot,
                 sentinel,
                 block_index_width,
+                cache,
             )?;
         }
     }
@@ -960,10 +1010,11 @@ fn ensure_capacity<L2: BlockLayer, P: PyramidOps<L2>>(
     descriptor: &mut StreamDescriptor,
     target_blocks: u64,
     block_size: usize,
-    fan_out: u64,
     block_index_width: u8,
     ops: &P,
+    cache: CacheMode,
 ) -> Result<(), YakError> {
+    let fan_out = compute_fan_out(layer2);
     if target_blocks == 0 {
         return Ok(());
     }
@@ -975,7 +1026,7 @@ fn ensure_capacity<L2: BlockLayer, P: PyramidOps<L2>>(
     // Handle empty stream: allocate first leaf entry
     if descriptor.reserved == 0 && descriptor.top_block == 0 {
         let block = layer2.allocate_block()?;
-        ops.init_leaf_block(layer2, block)?;
+        ops.init_leaf_block(layer2, block, cache)?;
         descriptor.top_block = block;
 
         if target_blocks <= 1 {
@@ -993,8 +1044,15 @@ fn ensure_capacity<L2: BlockLayer, P: PyramidOps<L2>>(
     let mut current_top = descriptor.top_block;
     for _ in effective_current_depth..target_depth {
         let new_redirector = layer2.allocate_block()?;
-        fill_sentinel(layer2, new_redirector, block_size, block_index_width)?;
-        write_block_index(layer2, new_redirector, 0, current_top, block_index_width)?;
+        fill_sentinel(layer2, new_redirector, block_size, block_index_width, cache)?;
+        write_block_index(
+            layer2,
+            new_redirector,
+            0,
+            current_top,
+            block_index_width,
+            cache,
+        )?;
         current_top = new_redirector;
     }
     descriptor.top_block = current_top;
@@ -1011,7 +1069,7 @@ fn ensure_capacity<L2: BlockLayer, P: PyramidOps<L2>>(
 
         // Initialize each new leaf entry
         for &block in &new_blocks {
-            ops.init_leaf_block(layer2, block)?;
+            ops.init_leaf_block(layer2, block, cache)?;
         }
 
         // Fill leaf slots in the pyramid tree
@@ -1020,9 +1078,9 @@ fn ensure_capacity<L2: BlockLayer, P: PyramidOps<L2>>(
             descriptor,
             &new_blocks,
             effective_current,
-            fan_out,
             block_index_width,
             target_depth,
+            cache,
         )?;
     }
 
@@ -1036,9 +1094,9 @@ fn pyramid_reserve<L2: BlockLayer, P: PyramidOps<L2>>(
     descriptor: &mut StreamDescriptor,
     n_bytes: u64,
     block_size: usize,
-    fan_out: u64,
     block_index_width: u8,
     ops: &P,
+    cache: CacheMode,
 ) -> Result<(), YakError> {
     if n_bytes < descriptor.size {
         return Err(YakError::IoError(format!(
@@ -1058,9 +1116,9 @@ fn pyramid_reserve<L2: BlockLayer, P: PyramidOps<L2>>(
         descriptor,
         target_blocks,
         block_size,
-        fan_out,
         block_index_width,
         ops,
+        cache,
     )?;
     descriptor.reserved = target_blocks * lbs;
     Ok(())
@@ -1071,10 +1129,11 @@ fn pyramid_truncate<L2: BlockLayer, P: PyramidOps<L2>>(
     layer2: &L2,
     descriptor: &mut StreamDescriptor,
     new_len: u64,
-    fan_out: u64,
     block_index_width: u8,
     ops: &P,
+    cache: CacheMode,
 ) -> Result<(), YakError> {
+    let fan_out = compute_fan_out(layer2);
     if new_len >= descriptor.size {
         return Ok(());
     }
@@ -1090,9 +1149,9 @@ fn pyramid_truncate<L2: BlockLayer, P: PyramidOps<L2>>(
                 layer2,
                 descriptor.top_block,
                 old_depth,
-                fan_out,
                 block_index_width,
                 ops,
+                cache,
             )?;
         }
         descriptor.size = 0;
@@ -1115,9 +1174,9 @@ fn pyramid_truncate<L2: BlockLayer, P: PyramidOps<L2>>(
                 descriptor.top_block,
                 block_idx,
                 old_depth,
-                fan_out,
                 block_index_width,
                 ops,
+                cache,
             )?;
         }
     }
@@ -1125,7 +1184,7 @@ fn pyramid_truncate<L2: BlockLayer, P: PyramidOps<L2>>(
     // Collapse depth if needed
     let mut current_top = descriptor.top_block;
     for _ in new_depth..old_depth {
-        let child = read_block_index(layer2, current_top, 0, block_index_width)?;
+        let child = read_block_index(layer2, current_top, 0, block_index_width, cache)?;
         layer2.deallocate_block(current_top)?;
         current_top = child;
     }
@@ -1166,10 +1225,11 @@ fn resolve_redir_block<L2: BlockLayer>(
     descriptor: &StreamDescriptor,
     cblock_idx: u64,
     depth: u32,
-    fan_out: u64,
     block_index_width: u8,
-    cache: &mut LeafCache,
+    leaf_cache: &mut LeafCache,
+    cache: CacheMode,
 ) -> Result<u64, YakError> {
+    let fan_out = compute_fan_out(layer2);
     if depth == 0 {
         return Ok(descriptor.top_block);
     }
@@ -1177,7 +1237,7 @@ fn resolve_redir_block<L2: BlockLayer>(
     let biw = block_index_width as usize;
     let leaf_start = (cblock_idx / fan_out) * fan_out;
 
-    if leaf_start != cache.cached_start {
+    if leaf_start != leaf_cache.cached_start {
         let leaf_block = navigate_to_leaf(
             layer2,
             descriptor,
@@ -1185,15 +1245,16 @@ fn resolve_redir_block<L2: BlockLayer>(
             depth,
             fan_out,
             block_index_width,
+            cache,
         )?;
-        layer2.read_block(leaf_block, 0, &mut cache.buf, true)?;
-        cache.cached_start = leaf_start;
+        layer2.read_block(leaf_block, 0, &mut leaf_cache.buf, cache)?;
+        leaf_cache.cached_start = leaf_start;
     }
 
     let slot = (cblock_idx % fan_out) as usize;
     let offset = slot * biw;
     let mut idx_buf = [0u8; 8];
-    idx_buf[..biw].copy_from_slice(&cache.buf[offset..offset + biw]);
+    idx_buf[..biw].copy_from_slice(&leaf_cache.buf[offset..offset + biw]);
     Ok(u64::from_le_bytes(idx_buf))
 }
 
@@ -1216,11 +1277,12 @@ fn read_comp_redir<L2: BlockLayer>(
     redir_block: u64,
     block_size: usize,
     block_index_width: u8,
+    cache: CacheMode,
 ) -> Result<CompRedir, YakError> {
     // Read the full block once, then parse compressed length and block
     // pointers from the buffer.
     let mut buf = vec![0u8; block_size];
-    layer2.read_block(redir_block, 0, &mut buf, true)?;
+    layer2.read_block(redir_block, 0, &mut buf, cache)?;
 
     let compressed_length = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
 
@@ -1307,8 +1369,9 @@ fn decompress_cblock<L2: BlockLayer>(
     block_index_width: u8,
     compressed_buf: &mut Vec<u8>,
     out_buf: &mut [u8],
+    cache: CacheMode,
 ) -> Result<(), YakError> {
-    let redir = read_comp_redir(layer2, redir_block, block_size, block_index_width)?;
+    let redir = read_comp_redir(layer2, redir_block, block_size, block_index_width, cache)?;
     decompress_cblock_data(layer2, &redir, block_size, compressed_buf, out_buf)
 }
 
@@ -1338,10 +1401,11 @@ fn compress_cblock_data<L2: BlockLayer>(
     redir_block: u64,
     old_redir: &CompRedir,
     data: &[u8],
-    block_size: usize,
     block_index_width: u8,
     ws: &mut CompressWorkspace,
+    cache: CacheMode,
 ) -> Result<(), YakError> {
+    let block_size = layer2.block_size();
     let biw_sz = block_index_width as usize;
 
     // Compress the data
@@ -1397,7 +1461,7 @@ fn compress_cblock_data<L2: BlockLayer>(
         let bytes = block_ptr.to_le_bytes();
         ws.redir_buf[off..off + biw_sz].copy_from_slice(&bytes[..biw_sz]);
     }
-    layer2.write_block(redir_block, 0, &ws.redir_buf[..redir_buf_size], true)?;
+    layer2.write_block(redir_block, 0, &ws.redir_buf[..redir_buf_size], cache)?;
 
     Ok(())
 }
@@ -1418,9 +1482,10 @@ fn pyramid_read_compressed<L2: BlockLayer>(
     pos: u64,
     buf: &mut [u8],
     compressed_block_size: usize,
-    fan_out: u64,
     block_index_width: u8,
+    cache: CacheMode,
 ) -> Result<usize, YakError> {
+    let fan_out = compute_fan_out(layer2);
     if pos >= descriptor.size {
         return Ok(0);
     }
@@ -1455,9 +1520,9 @@ fn pyramid_read_compressed<L2: BlockLayer>(
             descriptor,
             cblock_idx,
             depth,
-            fan_out,
             block_index_width,
             &mut leaf_cache,
+            cache,
         )?;
 
         if redir_block == sentinel {
@@ -1478,6 +1543,7 @@ fn pyramid_read_compressed<L2: BlockLayer>(
             block_index_width,
             &mut compressed_read_buf,
             &mut cblock_buf,
+            cache,
         )?;
 
         // Copy the requested range from the decompressed data
@@ -1499,9 +1565,10 @@ fn pyramid_write_compressed<L2: BlockLayer>(
     pos: u64,
     buf: &[u8],
     compressed_block_size: usize,
-    fan_out: u64,
     block_index_width: u8,
+    cache: CacheMode,
 ) -> Result<usize, YakError> {
+    let fan_out = compute_fan_out(layer2);
     if buf.is_empty() {
         return Ok(0);
     }
@@ -1520,9 +1587,9 @@ fn pyramid_write_compressed<L2: BlockLayer>(
         descriptor,
         end_pos.max(descriptor.size),
         block_size,
-        fan_out,
         block_index_width,
         &comp_ops,
+        cache,
     )?;
 
     let old_size = descriptor.size;
@@ -1550,9 +1617,9 @@ fn pyramid_write_compressed<L2: BlockLayer>(
             descriptor,
             cblock_idx,
             depth,
-            fan_out,
             biw,
             &mut leaf_cache,
+            cache,
         )?;
 
         if redir_block == sentinel {
@@ -1563,7 +1630,7 @@ fn pyramid_write_compressed<L2: BlockLayer>(
         }
 
         // Read and decompress existing compressed block data
-        let old_redir = read_comp_redir(layer2, redir_block, block_size, biw)?;
+        let old_redir = read_comp_redir(layer2, redir_block, block_size, biw, cache)?;
         decompress_cblock_data(
             layer2,
             &old_redir,
@@ -1594,9 +1661,9 @@ fn pyramid_write_compressed<L2: BlockLayer>(
             redir_block,
             &old_redir,
             &cblock_buf[..valid_extent],
-            block_size,
             biw,
             &mut compress_ws,
+            cache,
         )?;
 
         bytes_written += chunk;
@@ -1708,7 +1775,6 @@ impl<L2: BlockLayer> StreamsFromBlocks<L2> {
             self.release_lock(id, mode);
             return Err(e);
         }
-        self.layer2.invalidate_block_cache();
         let desc_result = {
             let streams_desc = self.streams_descriptor.lock().unwrap();
             self.read_descriptor(&streams_desc, id)
@@ -1757,9 +1823,16 @@ impl<L2: BlockLayer> StreamsFromBlocks<L2> {
         }
         let mut buf = [0u8; DESCRIPTOR_SIZE as usize];
         let bs = self.block_size();
-        let fo = self.fan_out();
         let biw = self.block_index_width_val();
-        pyramid_read(&self.layer2, streams_desc, offset, &mut buf, bs, fo, biw)?;
+        pyramid_read(
+            &self.layer2,
+            streams_desc,
+            offset,
+            &mut buf,
+            bs,
+            biw,
+            CacheMode::Shared,
+        )?;
         Ok(StreamDescriptor::from_bytes(&buf))
     }
 
@@ -1774,9 +1847,16 @@ impl<L2: BlockLayer> StreamsFromBlocks<L2> {
         let offset = descriptor_offset(stream_id);
         let buf = desc.to_bytes();
         let bs = self.block_size();
-        let fo = self.fan_out();
         let biw = self.block_index_width_val();
-        pyramid_write(&self.layer2, streams_desc, offset, &buf, bs, fo, biw)?;
+        pyramid_write(
+            &self.layer2,
+            streams_desc,
+            offset,
+            &buf,
+            bs,
+            biw,
+            CacheMode::Shared,
+        )?;
         Ok(())
     }
 
@@ -1792,7 +1872,6 @@ impl<L2: BlockLayer> StreamsFromBlocks<L2> {
         head: u64,
     ) -> Result<(), YakError> {
         let bs = self.block_size();
-        let fo = self.fan_out();
         let biw = self.block_index_width_val();
         pyramid_write(
             &self.layer2,
@@ -1800,8 +1879,8 @@ impl<L2: BlockLayer> StreamsFromBlocks<L2> {
             0,
             &head.to_le_bytes(),
             bs,
-            fo,
             biw,
+            CacheMode::Shared,
         )?;
         Ok(())
     }
@@ -1840,7 +1919,6 @@ impl<L2: BlockLayer> StreamsFromBlocks<L2> {
         cached_head: &mut u64,
     ) -> Result<(), YakError> {
         let bs = self.block_size();
-        let fo = self.fan_out();
         let biw = self.block_index_width_val();
 
         // At least 1 descriptor per batch — pyramid_write handles cross-block spans,
@@ -1883,7 +1961,15 @@ impl<L2: BlockLayer> StreamsFromBlocks<L2> {
 
         // Single pyramid_write for the entire batch
         let write_offset = descriptor_offset(base);
-        pyramid_write(&self.layer2, streams_desc, write_offset, &buf, bs, fo, biw)?;
+        pyramid_write(
+            &self.layer2,
+            streams_desc,
+            write_offset,
+            &buf,
+            bs,
+            biw,
+            CacheMode::Shared,
+        )?;
 
         // Update free-list head to the first new slot
         *cached_head = base;
@@ -1995,15 +2081,14 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
         // Write free-list head prefix (8 bytes, FREE_LIST_EMPTY = no free slots yet)
         let bs = 1usize << block_size_shift;
         let biw = block_index_width;
-        let fo = (bs / biw as usize) as u64;
         pyramid_write(
             &layer2,
             &mut streams_desc,
             0,
             &FREE_LIST_EMPTY.to_le_bytes(),
             bs,
-            fo,
             biw,
+            CacheMode::Shared,
         )?;
 
         let l3_payload = Self::serialize_header(&streams_desc, compressed_block_size_shift);
@@ -2038,10 +2123,17 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
         // Read free-list head from the first 8 bytes of the Streams stream
         let free_head = if streams_desc.size >= STREAMS_HEADER_SIZE {
             let bs = layer2.block_size();
-            let fo = (bs / layer2.block_index_width() as usize) as u64;
             let biw = layer2.block_index_width();
             let mut buf = [0u8; STREAMS_HEADER_SIZE as usize];
-            pyramid_read(&layer2, &streams_desc, 0, &mut buf, bs, fo, biw)?;
+            pyramid_read(
+                &layer2,
+                &streams_desc,
+                0,
+                &mut buf,
+                bs,
+                biw,
+                CacheMode::Shared,
+            )?;
             u64::from_le_bytes(buf)
         } else {
             FREE_LIST_EMPTY
@@ -2086,7 +2178,6 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
         }
 
         self.acquire_lock(STREAMS_STREAM_ID, OpenMode::Write, true)?;
-        self.layer2.invalidate_block_cache();
 
         let result = (|| -> Result<u64, YakError> {
             let mut streams_desc = self.streams_descriptor.lock().unwrap();
@@ -2132,7 +2223,6 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
         {
             return false;
         }
-        self.layer2.invalidate_block_cache();
         let result = {
             let streams_desc = self.streams_descriptor.lock().unwrap();
             let offset = descriptor_offset(id);
@@ -2151,7 +2241,6 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
 
     fn stream_count(&self) -> Result<u64, YakError> {
         self.acquire_lock(STREAMS_STREAM_ID, OpenMode::Read, true)?;
-        self.layer2.invalidate_block_cache();
         let result = {
             let streams_desc = self.streams_descriptor.lock().unwrap();
             let num_slots = num_descriptor_slots(streams_desc.size);
@@ -2170,7 +2259,6 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
 
     fn stream_ids(&self) -> Result<Vec<u64>, YakError> {
         self.acquire_lock(STREAMS_STREAM_ID, OpenMode::Read, true)?;
-        self.layer2.invalidate_block_cache();
         let result = {
             let streams_desc = self.streams_descriptor.lock().unwrap();
             let num_slots = num_descriptor_slots(streams_desc.size);
@@ -2207,7 +2295,6 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
         // If writer, flush cached descriptor back to Streams stream
         if info.mode == OpenMode::Write {
             self.acquire_lock(STREAMS_STREAM_ID, OpenMode::Write, true)?;
-            self.layer2.invalidate_block_cache();
             let result = {
                 let mut streams_desc = self.streams_descriptor.lock().unwrap();
                 self.write_descriptor(&mut streams_desc, info.stream_id, &info.cached_descriptor)?;
@@ -2238,7 +2325,6 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
         }
 
         self.acquire_lock(STREAMS_STREAM_ID, OpenMode::Write, true)?;
-        self.layer2.invalidate_block_cache();
 
         let result = (|| -> Result<(), YakError> {
             let mut streams_desc = self.streams_descriptor.lock().unwrap();
@@ -2262,12 +2348,26 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
                     };
                     let num_cblocks = compressed_blocks_needed(capacity, cbs);
                     let depth = pyramid_depth(num_cblocks, fo);
-                    deallocate_tree(&self.layer2, desc.top_block, depth, fo, biw, &ops)?;
+                    deallocate_tree(
+                        &self.layer2,
+                        desc.top_block,
+                        depth,
+                        biw,
+                        &ops,
+                        CacheMode::ThreadLocal,
+                    )?;
                 } else {
                     let ops = UncompressedOps { block_size: bs };
                     let num_blocks = data_blocks_needed(capacity, bs);
                     let depth = pyramid_depth(num_blocks, fo);
-                    deallocate_tree(&self.layer2, desc.top_block, depth, fo, biw, &ops)?;
+                    deallocate_tree(
+                        &self.layer2,
+                        desc.top_block,
+                        depth,
+                        biw,
+                        &ops,
+                        CacheMode::ThreadLocal,
+                    )?;
                 }
             }
 
@@ -2302,13 +2402,28 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
         };
 
         let bs = self.block_size();
-        let fo = self.fan_out();
         let biw = self.block_index_width_val();
         if desc.is_compressed() {
             let cbs = 1usize << self.compressed_block_size_shift;
-            pyramid_read_compressed(&self.layer2, &desc, pos, buf, cbs, fo, biw)
+            pyramid_read_compressed(
+                &self.layer2,
+                &desc,
+                pos,
+                buf,
+                cbs,
+                biw,
+                CacheMode::ThreadLocal,
+            )
         } else {
-            pyramid_read(&self.layer2, &desc, pos, buf, bs, fo, biw)
+            pyramid_read(
+                &self.layer2,
+                &desc,
+                pos,
+                buf,
+                bs,
+                biw,
+                CacheMode::ThreadLocal,
+            )
         }
     }
 
@@ -2331,13 +2446,28 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
         let _ = stream_id; // might be useful for debugging
 
         let bs = self.block_size();
-        let fo = self.fan_out();
         let biw = self.block_index_width_val();
         let n = if desc.is_compressed() {
             let cbs = 1usize << self.compressed_block_size_shift;
-            pyramid_write_compressed(&self.layer2, &mut desc, pos, buf, cbs, fo, biw)?
+            pyramid_write_compressed(
+                &self.layer2,
+                &mut desc,
+                pos,
+                buf,
+                cbs,
+                biw,
+                CacheMode::ThreadLocal,
+            )?
         } else {
-            pyramid_write(&self.layer2, &mut desc, pos, buf, bs, fo, biw)?
+            pyramid_write(
+                &self.layer2,
+                &mut desc,
+                pos,
+                buf,
+                bs,
+                biw,
+                CacheMode::ThreadLocal,
+            )?
         };
 
         // Update cached descriptor
@@ -2375,7 +2505,6 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
         };
 
         let bs = self.block_size();
-        let fo = self.fan_out();
         let biw = self.block_index_width_val();
         if desc.is_compressed() {
             let cbs = 1usize << self.compressed_block_size_shift;
@@ -2384,10 +2513,24 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
                 compressed_block_size: cbs,
                 block_index_width: biw,
             };
-            pyramid_truncate(&self.layer2, &mut desc, new_len, fo, biw, &ops)?;
+            pyramid_truncate(
+                &self.layer2,
+                &mut desc,
+                new_len,
+                biw,
+                &ops,
+                CacheMode::ThreadLocal,
+            )?;
         } else {
             let ops = UncompressedOps { block_size: bs };
-            pyramid_truncate(&self.layer2, &mut desc, new_len, fo, biw, &ops)?;
+            pyramid_truncate(
+                &self.layer2,
+                &mut desc,
+                new_len,
+                biw,
+                &ops,
+                CacheMode::ThreadLocal,
+            )?;
         }
 
         // Update cached descriptor
@@ -2416,7 +2559,6 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
         };
 
         let bs = self.block_size();
-        let fo = self.fan_out();
         let biw = self.block_index_width_val();
         if desc.is_compressed() {
             let cbs = 1usize << self.compressed_block_size_shift;
@@ -2425,10 +2567,26 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
                 compressed_block_size: cbs,
                 block_index_width: biw,
             };
-            pyramid_reserve(&self.layer2, &mut desc, n_bytes, bs, fo, biw, &ops)?;
+            pyramid_reserve(
+                &self.layer2,
+                &mut desc,
+                n_bytes,
+                bs,
+                biw,
+                &ops,
+                CacheMode::ThreadLocal,
+            )?;
         } else {
             let ops = UncompressedOps { block_size: bs };
-            pyramid_reserve(&self.layer2, &mut desc, n_bytes, bs, fo, biw, &ops)?;
+            pyramid_reserve(
+                &self.layer2,
+                &mut desc,
+                n_bytes,
+                bs,
+                biw,
+                &ops,
+                CacheMode::ThreadLocal,
+            )?;
         }
 
         // Update cached descriptor
@@ -2497,10 +2655,10 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
                 &self.layer2,
                 streams_desc.top_block,
                 depth,
-                fo,
                 biw,
                 &mut collector,
                 &uc_ops,
+                CacheMode::Shared,
             );
         }
 
@@ -2551,10 +2709,10 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
                                     &self.layer2,
                                     desc.top_block,
                                     depth,
-                                    fo,
                                     biw,
                                     &mut collector,
                                     &ops,
+                                    CacheMode::ThreadLocal,
                                 );
                             } else {
                                 let uc_ops = UncompressedOps { block_size: bs };
@@ -2564,10 +2722,10 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
                                     &self.layer2,
                                     desc.top_block,
                                     depth,
-                                    fo,
                                     biw,
                                     &mut collector,
                                     &uc_ops,
+                                    CacheMode::ThreadLocal,
                                 );
                             }
                         }
@@ -2622,7 +2780,16 @@ impl<L2: BlockLayer> StreamLayer for StreamsFromBlocks<L2> {
             // Walk the free list chain from the on-disk head
             if streams_desc.size >= STREAMS_HEADER_SIZE {
                 let mut head_buf = [0u8; STREAMS_HEADER_SIZE as usize];
-                if pyramid_read(&self.layer2, &streams_desc, 0, &mut head_buf, bs, fo, biw).is_ok()
+                if pyramid_read(
+                    &self.layer2,
+                    &streams_desc,
+                    0,
+                    &mut head_buf,
+                    bs,
+                    biw,
+                    CacheMode::Shared,
+                )
+                .is_ok()
                 {
                     let mut cursor = u64::from_le_bytes(head_buf);
                     while cursor != FREE_LIST_EMPTY {

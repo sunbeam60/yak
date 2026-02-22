@@ -4,7 +4,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use crate::block_layer::BlockLayer;
+use crate::block_layer::{BlockLayer, CacheMode};
 use crate::{HeaderSlotId, OpenMode, YakError};
 
 /// L2 mock identifier in the header section.
@@ -304,7 +304,7 @@ impl BlockLayer for BlocksFromFiles {
         index: u64,
         offset: usize,
         buf: &mut [u8],
-        _cache: bool,
+        _cache: CacheMode,
     ) -> Result<usize, YakError> {
         if index >= self.sentinel() {
             return Err(YakError::IoError(format!(
@@ -340,7 +340,7 @@ impl BlockLayer for BlocksFromFiles {
         index: u64,
         offset: usize,
         buf: &[u8],
-        _cache: bool,
+        _cache: CacheMode,
     ) -> Result<usize, YakError> {
         let block_size = self.block_size();
         if offset + buf.len() > block_size {

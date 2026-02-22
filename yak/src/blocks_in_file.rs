@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use lru::LruCache;
 use thread_local::ThreadLocal;
 
-use crate::block_layer::BlockLayer;
+use crate::block_layer::{BlockLayer, CacheMode};
 use crate::encryption::{self, BlockCipher, EncryptionConfig};
 use crate::file_layer::FileLayer;
 use std::collections::VecDeque;
@@ -59,13 +59,15 @@ struct BlocksInFileState {
 /// (or sentinel for end of list). `free_list_head` in the L2 header section
 /// points to the first free block.
 ///
-/// Includes a per-thread write-through LRU block cache. Reads check the cache
-/// first; misses read a full block from L1 and cache it. Writes go to L1
-/// immediately and update the cached copy if present.
+/// Dual-cache design:
+/// - **Per-thread LRU** (`block_cache`): user stream redirector blocks.
+///   Zero cross-thread contention; survives Streams stream lock acquisitions.
+/// - **Shared LRU** (`shared_cache`): Streams stream redirector blocks.
+///   Mutex-guarded for cross-thread coherency; write-through semantics
+///   ensure all threads see each other's Streams stream writes immediately.
 ///
 /// Thread-safe: bookkeeping state is behind a `Mutex`. File I/O goes through
-/// L1 which has its own internal mutex. The block cache is thread-local
-/// (no cross-thread synchronization needed).
+/// L1 which has its own internal mutex.
 pub struct BlocksInFile<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> {
     layer1: L1,
     block_size_shift: u8,
@@ -73,10 +75,11 @@ pub struct BlocksInFile<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> {
     state: Mutex<BlocksInFileState>,
     /// L2's own header slot ID.
     my_slot: HeaderSlotId,
-    /// Per-thread LRU cache of full **decrypted** block contents.
-    /// Key: block index. Value: full block as Vec<u8>.
+    /// Per-thread LRU cache of full **decrypted** block contents (user streams).
     block_cache: ThreadLocal<RefCell<LruCache<u64, Vec<u8>>>>,
-    /// Precomputed cache capacity (entry count) for this instance's block size.
+    /// Shared LRU cache of full **decrypted** block contents (Streams stream).
+    shared_cache: Mutex<LruCache<u64, Vec<u8>>>,
+    /// Precomputed cache capacity (entry count).
     cache_capacity: NonZeroUsize,
     /// Runtime cipher for block encryption/decryption. None = unencrypted.
     cipher: Option<BlockCipher>,
@@ -152,6 +155,105 @@ impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlocksInFile<L1, CACHE_BUDG
         let entries = by_budget.clamp(1, BLOCK_CACHE_MAX_ENTRIES);
         NonZeroUsize::new(entries).unwrap()
     }
+
+    // -----------------------------------------------------------------
+    // Cache helpers — route to the appropriate cache based on CacheMode
+    // -----------------------------------------------------------------
+
+    /// Try a cache read. Returns `Some(())` if data was served from cache.
+    fn try_cache_read(
+        &self,
+        index: u64,
+        offset: usize,
+        buf: &mut [u8],
+        cache: CacheMode,
+    ) -> Option<()> {
+        if CACHE_BUDGET_BYTES == 0 {
+            return None;
+        }
+        match cache {
+            CacheMode::None => None,
+            CacheMode::ThreadLocal => {
+                let mut lru = self.thread_cache().borrow_mut();
+                let cached = lru.get(&index)?;
+                buf.copy_from_slice(&cached[offset..offset + buf.len()]);
+                Some(())
+            }
+            CacheMode::Shared => {
+                let mut lru = self.shared_cache.lock().unwrap();
+                let cached = lru.get(&index)?;
+                buf.copy_from_slice(&cached[offset..offset + buf.len()]);
+                Some(())
+            }
+        }
+    }
+
+    /// Store a full block in the appropriate cache.
+    fn cache_put(&self, index: u64, full_block: Vec<u8>, cache: CacheMode) {
+        if CACHE_BUDGET_BYTES == 0 {
+            return;
+        }
+        match cache {
+            CacheMode::None => {}
+            CacheMode::ThreadLocal => {
+                self.thread_cache().borrow_mut().put(index, full_block);
+            }
+            CacheMode::Shared => {
+                self.shared_cache.lock().unwrap().put(index, full_block);
+            }
+        }
+    }
+
+    /// Update a cached block in-place (unencrypted write-through).
+    fn cache_update_in_place(&self, index: u64, offset: usize, buf: &[u8], cache: CacheMode) {
+        if CACHE_BUDGET_BYTES == 0 {
+            return;
+        }
+        match cache {
+            CacheMode::None => {}
+            CacheMode::ThreadLocal => {
+                let mut lru = self.thread_cache().borrow_mut();
+                if let Some(cached) = lru.get_mut(&index) {
+                    cached[offset..offset + buf.len()].copy_from_slice(buf);
+                }
+            }
+            CacheMode::Shared => {
+                let mut lru = self.shared_cache.lock().unwrap();
+                if let Some(cached) = lru.get_mut(&index) {
+                    cached[offset..offset + buf.len()].copy_from_slice(buf);
+                }
+            }
+        }
+    }
+
+    /// Peek a full plaintext block from cache (for encrypted RMW).
+    fn try_cache_peek_full_block(&self, index: u64, cache: CacheMode) -> Option<Vec<u8>> {
+        if CACHE_BUDGET_BYTES == 0 {
+            return None;
+        }
+        match cache {
+            CacheMode::None => None,
+            CacheMode::ThreadLocal => {
+                let lru = self.thread_cache().borrow();
+                lru.peek(&index).cloned()
+            }
+            CacheMode::Shared => {
+                let lru = self.shared_cache.lock().unwrap();
+                lru.peek(&index).cloned()
+            }
+        }
+    }
+
+    /// Evict a block from **both** caches. Called on allocate/deallocate.
+    fn evict_from_all_caches(&self, index: u64) {
+        if CACHE_BUDGET_BYTES == 0 {
+            return;
+        }
+        if let Some(tc) = self.block_cache.get() {
+            tc.borrow_mut().pop(&index);
+        }
+        self.shared_cache.lock().unwrap().pop(&index);
+    }
 }
 
 /// Compute the sentinel value for a given block_index_width.
@@ -210,6 +312,7 @@ impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlockLayer
         );
         layer1.write_header_slot(my_slot, &l2_payload)?;
 
+        let cache_capacity = Self::compute_cache_capacity(block_size_shift);
         Ok(BlocksInFile {
             layer1,
             block_size_shift,
@@ -220,7 +323,8 @@ impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlockLayer
             }),
             my_slot,
             block_cache: ThreadLocal::new(),
-            cache_capacity: Self::compute_cache_capacity(block_size_shift),
+            shared_cache: Mutex::new(LruCache::new(cache_capacity)),
+            cache_capacity,
             cipher,
             encryption_config,
         })
@@ -288,6 +392,7 @@ impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlockLayer
         let block_size = 1u64 << block_size_shift;
         let total_blocks = (layer1.len()? - layer1.data_offset()) / block_size;
 
+        let cache_capacity = Self::compute_cache_capacity(block_size_shift);
         Ok(BlocksInFile {
             layer1,
             block_size_shift,
@@ -298,7 +403,8 @@ impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlockLayer
             }),
             my_slot,
             block_cache: ThreadLocal::new(),
-            cache_capacity: Self::compute_cache_capacity(block_size_shift),
+            shared_cache: Mutex::new(LruCache::new(cache_capacity)),
+            cache_capacity,
             cipher,
             encryption_config,
         })
@@ -415,14 +521,11 @@ impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlockLayer
         self.persist_l2_header(state.free_list_head)?;
         drop(state);
 
-        // Phase 5: evict allocated blocks from thread-local cache.
+        // Phase 5: evict allocated blocks from both caches.
         // These blocks may have stale data from a previous incarnation
         // (recycled from the free list).
-        if CACHE_BUDGET_BYTES > 0 {
-            let mut cache = self.thread_cache().borrow_mut();
-            for &block_id in &result {
-                cache.pop(&block_id);
-            }
+        for &block_id in &result {
+            self.evict_from_all_caches(block_id);
         }
 
         Ok(result)
@@ -456,11 +559,8 @@ impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlockLayer
         self.persist_l2_header(state.free_list_head)?;
         drop(state);
 
-        // Evict deallocated block from thread-local cache.
-        // Block content is now a free-list pointer, not useful data.
-        if CACHE_BUDGET_BYTES > 0 {
-            self.thread_cache().borrow_mut().pop(&index);
-        }
+        // Evict deallocated block from both caches.
+        self.evict_from_all_caches(index);
 
         Ok(())
     }
@@ -518,12 +618,9 @@ impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlockLayer
         self.persist_l2_header(state.free_list_head)?;
         drop(state);
 
-        // Evict freed blocks from thread-local cache
-        if CACHE_BUDGET_BYTES > 0 {
-            let mut cache = self.thread_cache().borrow_mut();
-            for &id in indices.iter() {
-                cache.pop(&id);
-            }
+        // Evict freed blocks from both caches
+        for &id in indices.iter() {
+            self.evict_from_all_caches(id);
         }
 
         Ok(())
@@ -534,7 +631,7 @@ impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlockLayer
         index: u64,
         offset: usize,
         buf: &mut [u8],
-        cache: bool,
+        cache: CacheMode,
     ) -> Result<usize, YakError> {
         if index >= self.sentinel() {
             return Err(YakError::IoError(format!(
@@ -554,14 +651,9 @@ impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlockLayer
             )));
         }
 
-        if cache && CACHE_BUDGET_BYTES > 0 {
-            let mut lru = self.thread_cache().borrow_mut();
-
-            // Cache hit: serve from cached full block (already decrypted)
-            if let Some(cached_block) = lru.get(&index) {
-                buf.copy_from_slice(&cached_block[offset..offset + buf.len()]);
-                return Ok(buf.len());
-            }
+        // Cache hit: serve from the appropriate cache (already decrypted)
+        if self.try_cache_read(index, offset, buf, cache).is_some() {
+            return Ok(buf.len());
         }
 
         // Cache miss (or cache disabled/bypassed): read full block from L1
@@ -577,9 +669,9 @@ impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlockLayer
         // Copy requested sub-region to caller's buffer
         buf.copy_from_slice(&full_block[offset..offset + buf.len()]);
 
-        // Only cache if caller requested caching and we got a complete block read
-        if cache && CACHE_BUDGET_BYTES > 0 && n == block_size {
-            self.thread_cache().borrow_mut().put(index, full_block);
+        // Cache the full block if we got a complete read
+        if n == block_size {
+            self.cache_put(index, full_block, cache);
         }
 
         Ok(buf.len())
@@ -590,7 +682,7 @@ impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlockLayer
         index: u64,
         offset: usize,
         buf: &[u8],
-        cache: bool,
+        cache: CacheMode,
     ) -> Result<usize, YakError> {
         let block_size = self.block_size();
         if offset + buf.len() > block_size {
@@ -605,24 +697,17 @@ impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlockLayer
         if let Some(cipher) = &self.cipher {
             // Encrypted path: XTS operates on full blocks, so partial writes
             // require read-modify-write.
-            let mut full_block = vec![0u8; block_size];
-
-            // Try cache first for the plaintext block
-            let mut from_cache = false;
-            if CACHE_BUDGET_BYTES > 0 {
-                let lru = self.thread_cache().borrow();
-                if let Some(cached) = lru.peek(&index) {
-                    full_block.copy_from_slice(cached);
-                    from_cache = true;
-                }
-            }
-
-            if !from_cache {
+            let mut full_block = if let Some(cached) = self.try_cache_peek_full_block(index, cache)
+            {
+                cached
+            } else {
                 // Read from L1 and decrypt
+                let mut block = vec![0u8; block_size];
                 let file_offset = self.block_offset(index);
-                self.layer1.read(file_offset, &mut full_block)?;
-                encryption::decrypt_block(cipher, index, &mut full_block);
-            }
+                self.layer1.read(file_offset, &mut block)?;
+                encryption::decrypt_block(cipher, index, &mut block);
+                block
+            };
 
             // Apply the partial write to plaintext
             full_block[offset..offset + buf.len()].copy_from_slice(buf);
@@ -634,21 +719,14 @@ impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlockLayer
             self.layer1.write(file_offset, &encrypted)?;
 
             // Update cache with plaintext
-            if cache && CACHE_BUDGET_BYTES > 0 {
-                self.thread_cache().borrow_mut().put(index, full_block);
-            }
+            self.cache_put(index, full_block, cache);
         } else {
             // Unencrypted path: write partial data directly to L1
             let file_offset = self.block_offset(index) + offset as u64;
             self.layer1.write(file_offset, buf)?;
 
-            // Update cache if caller requested caching and block is already cached
-            if cache && CACHE_BUDGET_BYTES > 0 {
-                let mut lru = self.thread_cache().borrow_mut();
-                if let Some(cached_block) = lru.get_mut(&index) {
-                    cached_block[offset..offset + buf.len()].copy_from_slice(buf);
-                }
-            }
+            // Update cache if block is already cached
+            self.cache_update_in_place(index, offset, buf, cache);
         }
 
         Ok(buf.len())
@@ -721,14 +799,6 @@ impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlockLayer
         let file_offset = self.block_offset(start_index);
         self.layer1.write(file_offset, &raw)?;
         Ok(buf.len())
-    }
-
-    fn invalidate_block_cache(&self) {
-        if CACHE_BUDGET_BYTES > 0 {
-            if let Some(cache_cell) = self.block_cache.get() {
-                cache_cell.borrow_mut().clear();
-            }
-        }
     }
 
     fn header_slot_for_upper(&self, index: u8) -> HeaderSlotId {

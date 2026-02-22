@@ -2,6 +2,17 @@ use std::collections::VecDeque;
 
 use crate::{HeaderSlotId, OpenMode, YakError};
 
+/// Controls which cache layer a block read/write should use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheMode {
+    /// Bypass all caches; read from / write through to L1 directly.
+    None,
+    /// Per-thread LRU cache (no cross-thread synchronization).
+    ThreadLocal,
+    /// Shared Mutex-guarded LRU cache (cross-thread coherent).
+    Shared,
+}
+
 /// L2 trait: Block storage abstraction.
 ///
 /// Provides numbered fixed-size block management to L3. L2 implementations
@@ -89,28 +100,26 @@ pub trait BlockLayer: Send + Sync {
 
     /// Read from a block at the given offset within the block.
     /// `offset + buf.len()` must not exceed `block_size`.
-    /// When `cache` is true, the block may be served from and stored in the
-    /// block cache. When false, the cache is bypassed entirely.
+    /// `cache` selects which cache to consult/populate, or `None` to bypass.
     /// Returns the number of bytes actually read.
     fn read_block(
         &self,
         index: u64,
         offset: usize,
         buf: &mut [u8],
-        cache: bool,
+        cache: CacheMode,
     ) -> Result<usize, YakError>;
 
     /// Write to a block at the given offset within the block.
     /// `offset + buf.len()` must not exceed `block_size`.
-    /// When `cache` is true, any cached copy of this block is kept coherent.
-    /// When false, the cache is not consulted or updated.
+    /// `cache` selects which cache to keep coherent, or `None` to bypass.
     /// Returns the number of bytes actually written.
     fn write_block(
         &self,
         index: u64,
         offset: usize,
         buf: &[u8],
-        cache: bool,
+        cache: CacheMode,
     ) -> Result<usize, YakError>;
 
     /// Read across a run of contiguous block indices in a single operation.
@@ -135,7 +144,12 @@ pub trait BlockLayer: Send + Sync {
         let mut off = offset;
         while bytes_read < buf.len() {
             let chunk = (buf.len() - bytes_read).min(bs - off);
-            let n = self.read_block(block, off, &mut buf[bytes_read..bytes_read + chunk], false)?;
+            let n = self.read_block(
+                block,
+                off,
+                &mut buf[bytes_read..bytes_read + chunk],
+                CacheMode::None,
+            )?;
             bytes_read += n;
             block += 1;
             off = 0;
@@ -169,7 +183,7 @@ pub trait BlockLayer: Send + Sync {
                 block,
                 off,
                 &buf[bytes_written..bytes_written + chunk],
-                false,
+                CacheMode::None,
             )?;
             bytes_written += n;
             block += 1;
@@ -193,14 +207,6 @@ pub trait BlockLayer: Send + Sync {
     ///
     /// Returns the section payload (without the 2-byte length prefix).
     fn read_header_slot(&self, slot: HeaderSlotId) -> Result<Vec<u8>, YakError>;
-
-    /// Invalidate the calling thread's block cache.
-    ///
-    /// Used by L3 to ensure cross-thread coherency for shared data
-    /// structures (e.g., the Streams stream). Implementations that
-    /// maintain a per-thread cache should clear it so subsequent reads
-    /// go to the backing store. The default implementation is a no-op.
-    fn invalidate_block_cache(&self) {}
 
     /// Run L2 integrity checks. `claimed_blocks` are block IDs that upper
     /// layers assert are in use. L2 validates that claimed + free == all blocks,

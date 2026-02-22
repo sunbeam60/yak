@@ -1020,7 +1020,11 @@ fn run_cache_pressure(
     const CHURN_WRITE_SIZE: usize = 4096;
 
     // Phase 1: populate large streams (not timed)
-    eprint!("    populating {} x {}MB streams...", LARGE_STREAMS, STREAM_SIZE / (1024 * 1024));
+    eprint!(
+        "    populating {} x {}MB streams...",
+        LARGE_STREAMS,
+        STREAM_SIZE / (1024 * 1024)
+    );
     {
         let sfs = create_bench_yak(BENCH_FILE, biw, bss, cbss, password)?;
         let buf = make_buffer(STREAM_SIZE);
@@ -1069,8 +1073,7 @@ fn run_cache_pressure(
                     // a different stream — this acquires the Streams stream lock
                     // and calls invalidate_block_cache() on THIS thread
                     if r > 0 && r % INVALIDATION_INTERVAL == 0 {
-                        let other =
-                            (stream_idx + 1 + r / INVALIDATION_INTERVAL) % LARGE_STREAMS;
+                        let other = (stream_idx + 1 + r / INVALIDATION_INTERVAL) % LARGE_STREAMS;
                         let other_name = format!("large_{:04}.bin", other);
                         let h = sfs
                             .open_stream(&other_name, OpenMode::Read)

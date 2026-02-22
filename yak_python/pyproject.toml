@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "libyak"
-version = "0.10.0"
+version = "0.11.0"
 description = "Python bindings for Yak. Yak is a modern container file library, useful for quickly building your own binary file formats. A file system in a file, focused on performance and ease of use."
 requires-python = ">=3.10"
 license = { text = "MIT OR Apache-2.0" }

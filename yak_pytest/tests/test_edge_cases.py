@@ -1,7 +1,7 @@
 """Phase 6: Edge cases tests."""
 
 import pytest
-import yak
+import libyak as yak
 
 
 class TestEdgeCases:

@@ -21,40 +21,38 @@ Yak is a file system, inside a file:
 * Streams can be optionally compressed - Yak handles this transparently, compressing and decompressing as you read and write.
 * Yak files can be optionally encrypted - Yak handles this transparently too, encrypting and decrypting as you read and write.
 
-```Rust
-use yak::{CreateOptions, OpenMode, YakDefault};
+```python
+from libyak import Yak, OpenMode
 
-fn main() {
-    let path = "example.yak";
+path = "example.yak"
 
-    // Create a new Yak file with default settings
-    let yk = YakDefault::create(path, CreateOptions::default()).unwrap();
+# Create a new Yak file with default settings
+yk = Yak.create(path)
 
-    // Write a demonstration text buffer
-    let s1 = yk.create_stream("hello.txt", false).unwrap();
-    yk.write(&s1, b"The yak does not speak, but its presence speaks volumes.").unwrap();
-    yk.close_stream(s1).unwrap();
+# Write a demonstration text buffer
+s1 = yk.create_stream("hello.txt")
+yk.write(s1, b"The yak does not speak, but its presence speaks volumes.")
+yk.close_stream(s1)
 
-    // close the Yak file
-    yk.close().unwrap();
+# Close the Yak file
+yk.close()
 
-    // Read back the text stream
-    let yk = YakDefault::open(path, OpenMode::Read).unwrap();
+# Read back the text stream
+yk = Yak.open(path, OpenMode.Read)
 
-    // we stored it as "hello.txt" but you can use whatever
-    let h = yk.open_stream("hello.txt", OpenMode::Read).unwrap();
+# We stored it as "hello.txt" but you can use whatever
+h = yk.open_stream("hello.txt", OpenMode.Read)
 
-    // Read into buffer
-    let mut buf = vec![0u8; 56];
-    yk.read(&h, &mut buf).unwrap();
+# Read into buffer
+buf = yk.read(h, 56)
 
-    // We've shown text here, but you can write all types of data
-    assert_eq!(&buf, b"The yak does not speak, but its presence speaks volumes.");
+# We've shown text here, but you can write all types of data
+assert buf == b"The yak does not speak, but its presence speaks volumes."
 
-    yk.close_stream(h).unwrap();
-    yk.close().unwrap();
-}
+yk.close_stream(h)
+yk.close()
 ```
+
 Yak is implemented in Rust and [published on crates.io](https://crates.io/crates/yak) but can be used in many languages:
 * C/C++ via the included yak_c library, which builds to a static lib and a .h file using CBindGen.
 * Python via yak_python library, which is [published as a PyPI wheel](https://pypi.org/project/libyak/), using PyO3 to create native Python bindings.

@@ -6,7 +6,7 @@ complement the basic CRUD tests in test_directories.py and test_streams.py.
 """
 
 import pytest
-import yak
+import libyak as yak
 
 
 class TestNameTableLookup:

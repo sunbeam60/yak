@@ -1,7 +1,7 @@
 """Tests for stream reserve (pre-allocation) functionality."""
 
 import pytest
-import yak
+import libyak as yak
 
 
 class TestReserve:

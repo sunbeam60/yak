@@ -1,7 +1,7 @@
 """Phase 5: Locking tests."""
 
 import pytest
-import yak
+import libyak as yak
 
 
 class TestLocking:

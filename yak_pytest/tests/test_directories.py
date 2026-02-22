@@ -1,7 +1,7 @@
 """Phase 2: Directory operation tests."""
 
 import pytest
-import yak
+import libyak as yak
 
 
 class TestDirectories:

@@ -8,7 +8,7 @@ publish = false
 description = "Python bindings for the Yak library"
 
 [lib]
-name = "yak"
+name = "libyak"
 crate-type = ["cdylib"]
 
 [dependencies]

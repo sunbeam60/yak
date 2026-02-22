@@ -1,7 +1,7 @@
 """Phase 3: Stream creation and basic operations tests."""
 
 import pytest
-import yak
+import libyak as yak
 
 
 class TestStreams:

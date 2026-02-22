@@ -1,7 +1,7 @@
 """Phase 4: Stream I/O tests."""
 
 import pytest
-import yak
+import libyak as yak
 
 
 class TestStreamIO:

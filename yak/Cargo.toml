@@ -5,10 +5,16 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = true
-description = "Yak - yet another kontainer"
+description = "A modern container file library, useful for quickly building your own binary file formats. A file system in a file, focused on performance and ease of use. C and Python bindings available."
 readme = "../README.md"
 homepage = "https://github.com/sunbeam60/yak"
-keywords = ["filesystem", "embedded", "storage", "container-files", "file-formats"]
+keywords = [
+    "filesystem",
+    "embedded",
+    "storage",
+    "container-files",
+    "file-formats",
+]
 categories = ["filesystem", "data-structures"]
 
 [dependencies]

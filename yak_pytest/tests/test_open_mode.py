@@ -18,7 +18,7 @@ import subprocess
 import sys
 
 import pytest
-import yak
+import libyak as yak
 
 
 class TestOpenModeReadOnly:
@@ -229,7 +229,7 @@ class TestOpenModeLocking:
 _CHILD_SCRIPT = """\
 import os, sys
 sys.path.insert(0, sys.argv[1])
-import yak
+import libyak as yak
 
 mode = yak.OpenMode.READ if sys.argv[3] == "0" else yak.OpenMode.WRITE
 try:

@@ -24,17 +24,22 @@ Whenever you are updating .md files, do not ever change ./../docs/architecture.m
 
 Duplication of code should be concerning when we write code. If duplicated code exists, and there's no performance penalty to extracting it into a function, we should consider doing so. In release mode, small functions are likely to be inlined by the compiler.
 
-If we have to perform disk read/writing (i.e. if we have to ask L2 for a block or L1 to read/write), we must try to avoid doing that inside of a loop, unless absolutely required. Consider whether we can read the data once and then iterate through the data in the local loop, instead of continually asking for reading/writing at disk level inside of the loop. Even if we have a cache, touching the cache is not free. 
-
 If a function gets above 100 lines, question whether some functionality can be extracted from this function and, if a similar function already exits that isn't quite right can be made generic to work for both places. This isn't a strict rule, but very long functions are mostly a sign that we're throwing too much code down - this may work for an AI but not for a human that wants to read and edit together with the AI.
 
 Use generics rather than dynamic dispatch when possible.
 
 If a function starts to acquire a lot of parameters and a lot of variables internally, usually the function is doing too many things at once. Can we extract and re-use functionality instead?
 
+It's not healthy for us to store multiple versions of the same truth. If one truth can be derived from the other with some computation and no IO, we should derive the other truth when we need it.
+
 ## Performance and memory
 This is a low level library. Memory allocations should be minimized when possible. Performance matters.
 Samply is used for profiling release builds. Please see ./.vscode/tasks.json for how they are defined.
+
+If we have to perform disk read/writing (i.e. if we have to ask L2 for a block or L1 to read/write), we must try to avoid doing that inside of a loop, unless absolutely required. Consider whether we can read the data once and then iterate through the data in the local loop, instead of continually asking for reading/writing at disk level inside of the loop. Even if we have a cache, touching the cache is not free. 
+
+## Release
+Whenever a new version is tagged and pushed to Github, workflows publish to crates.io and pypi.org. Before pushing a new version tag, please ensure that the README.md in the workspace root is aligned with the README.md in yak_python so that the description of Yak across github, crates.io and pypi.org are aligned and appropriate for the audience on those three platforms.
 
 ## Workspace harness
 Whenever you make changes, they must be in sync across the five key projects:
@@ -70,3 +75,6 @@ Yak uses the `aes` crate (0.8+) for AES-XTS block encryption at L2. Hardware acc
   of ARMv8 crypto extensions. Without this flag, ARM builds silently fall back to a pure
   software AES implementation. All aarch64 targets must have this flag in `.cargo/config.toml`.
 - See https://docs.rs/aes/0.8.4/aes/ for the list of configuration flags.
+
+## Building Pything bindings with Maturin
+Maturin is set up via the .venv. Build the PyO3 with that, rather than attempting to locate it manually.3

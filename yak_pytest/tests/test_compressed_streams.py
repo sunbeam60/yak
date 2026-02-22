@@ -2,7 +2,7 @@
 
 import os
 import pytest
-import yak
+import libyak as yak
 
 
 # Default parameters: 4KB blocks, 32KB compressed blocks

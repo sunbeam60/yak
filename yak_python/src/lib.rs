@@ -9,9 +9,9 @@ use std::sync::{Arc, Mutex};
 // Error handling
 // ---------------------------------------------------------------------------
 
-pyo3::create_exception!(yak, YakError, pyo3::exceptions::PyException);
+pyo3::create_exception!(libyak, YakError, pyo3::exceptions::PyException);
 
-/// Convert a Rust `YakError` into a Python `yak.YakError` exception.
+/// Convert a Rust `YakError` into a Python `libyak.YakError` exception.
 fn to_py_err(e: RustYakError) -> PyErr {
     YakError::new_err(e.to_string())
 }
@@ -355,7 +355,7 @@ impl Yak {
 // ---------------------------------------------------------------------------
 
 #[pymodule]
-fn yak(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn libyak(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Yak>()?;
     m.add_class::<OpenMode>()?;
     m.add_class::<EntryType>()?;

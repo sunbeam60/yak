@@ -2,7 +2,7 @@
 
 import pytest
 from pathlib import Path
-import yak
+import libyak as yak
 
 
 class TestYakLifecycle:

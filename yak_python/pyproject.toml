@@ -5,10 +5,10 @@ build-backend = "maturin"
 [project]
 name = "libyak"
 version = "0.10.0"
-description = "Python bindings for Yak — yet another kontainer. A layered, embeddable file-in-file storage system."
+description = "Python bindings for Yak. Yak is a modern container file library, useful for quickly building your own binary file formats. A file system in a file, focused on performance and ease of use."
 requires-python = ">=3.10"
-license = {text = "MIT OR Apache-2.0"}
-authors = [{name = "Bjorn Toft Madsen", email = "bjorn@toftmadsen.org"}]
+license = { text = "MIT OR Apache-2.0" }
+authors = [{ name = "Bjorn Toft Madsen", email = "bjorn@toftmadsen.org" }]
 keywords = ["filesystem", "storage", "embedded", "container", "streams"]
 classifiers = [
     "Development Status :: 4 - Beta",

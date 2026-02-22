@@ -3,7 +3,7 @@
 import time
 import threading
 import pytest
-import yak
+import libyak as yak
 
 
 NUM_THREADS = 40

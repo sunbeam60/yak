@@ -1,7 +1,7 @@
 """Tests for optional AES-XTS encryption at L2."""
 
 import pytest
-import yak
+import libyak as yak
 
 
 class TestEncryptionBasic:

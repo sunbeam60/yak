@@ -6,7 +6,7 @@ linking with small test data.
 """
 
 import pytest
-import yak
+import libyak as yak
 
 
 BLOCK_SHIFT = 6       # 64-byte blocks

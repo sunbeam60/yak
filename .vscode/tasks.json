@@ -40,7 +40,7 @@
                 "cwd": "${workspaceFolder}",
                 "env": {
                     "PATH": "${env:PATH};C:/Users/bjorn/.cargo/bin",
-                    "VIRTUAL_ENV": "${workspaceFolder}/.venv"
+                    "VIRTUAL_ENV": "${workspaceFolder}/yak_python/.venv"
                 }
             },
             "problemMatcher": [
@@ -116,7 +116,7 @@
                 "cwd": "${workspaceFolder}",
                 "env": {
                     "PATH": "${env:PATH};C:/Users/bjorn/.cargo/bin",
-                    "VIRTUAL_ENV": "${workspaceFolder}/.venv"
+                    "VIRTUAL_ENV": "${workspaceFolder}/yak_python/.venv"
                 }
             },
             "problemMatcher": [
@@ -173,8 +173,8 @@
             "options": {
                 "cwd": "${workspaceFolder}/yak_python",
                 "env": {
-                    "PATH": "${env:PATH};${workspaceFolder}/.venv/Scripts;${workspaceFolder}/.venv/bin;C:/Users/bjorn/.cargo/bin",
-                    "VIRTUAL_ENV": "${workspaceFolder}/.venv"
+                    "PATH": "${env:PATH};${workspaceFolder}/yak_python/.venv/Scripts;${workspaceFolder}/yak_python/.venv/bin;C:/Users/bjorn/.cargo/bin",
+                    "VIRTUAL_ENV": "${workspaceFolder}/yak_python/.venv"
                 }
             },
             "problemMatcher": [
@@ -192,13 +192,13 @@
             "command": "bash",
             "args": [
                 "-c",
-                "'${workspaceFolder}/.venv/bin/python' -m pytest tests/ -v"
+                "'${workspaceFolder}/yak_python/.venv/bin/python' -m pytest tests/ -v"
             ],
             "windows": {
                 "command": "powershell",
                 "args": [
                     "-Command",
-                    "& '${workspaceFolder}/.venv/Scripts/python.exe' -m pytest tests/ -v"
+                    "& '${workspaceFolder}/yak_python/.venv/Scripts/python.exe' -m pytest tests/ -v"
                 ]
             },
             "options": {
@@ -267,7 +267,7 @@
                 "cwd": "${workspaceFolder}",
                 "env": {
                     "PATH": "${env:PATH};C:/Users/bjorn/.cargo/bin",
-                    "VIRTUAL_ENV": "${workspaceFolder}/.venv"
+                    "VIRTUAL_ENV": "${workspaceFolder}/yak_python/.venv"
                 }
             },
             "problemMatcher": [

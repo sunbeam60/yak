@@ -75,8 +75,8 @@ jobs:
         with:
           python-version: "3.12"
       - name: Create virtualenv and install tools
-        run: python -m venv .venv && .venv/bin/pip install maturin pytest
+        run: python -m venv yak_python/.venv && yak_python/.venv/bin/pip install maturin pytest
       - name: Build and install Python bindings
-        run: cd yak_python && ../.venv/bin/maturin develop --release
+        run: cd yak_python && .venv/bin/maturin develop --release
       - name: Run Python tests
-        run: .venv/bin/pytest yak_pytest/ -v --burn-seconds=3
+        run: yak_python/.venv/bin/pytest yak_pytest/ -v --burn-seconds=3

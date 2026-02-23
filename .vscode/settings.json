@@ -5,7 +5,7 @@
     "rust-analyzer.cargo.allTargets": true,
 
     // Python settings
-    "python.defaultInterpreterPath": "./yak_pytest/.venv/bin/python",
+    "python.defaultInterpreterPath": "./yak_python/.venv/bin/python",
     "python.testing.pytestEnabled": true,
     "python.testing.pytestArgs": [
         "tests",

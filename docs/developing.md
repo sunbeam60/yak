@@ -19,11 +19,12 @@
 ## First-time setup
 
 The workspace includes a PyO3 crate (`yak_python`) which needs a Python interpreter at
-build time. A virtual environment (./.venv) must be configred at the project root so 
-that PyO3, maturin and the test harness all share the same Python. 
+build time. A virtual environment lives inside `yak_python/.venv` so that PyO3, maturin
+and the test harness all share the same Python.
 
 ```bash
-# 1. Create a virtual environment at the project root
+# 1. Create a virtual environment inside yak_python
+cd yak_python
 python3 -m venv .venv            # macOS / Linux
 # or
 python -m venv .venv             # Windows
@@ -37,6 +38,7 @@ source .venv/bin/activate        # macOS / Linux
 pip install maturin pytest
 
 # 4. Build the Rust workspace (PyO3 finds Python via VIRTUAL_ENV)
+cd ..
 cargo build
 
 # 5. Build and install the native Python module into the venv
@@ -46,11 +48,11 @@ maturin develop --release
 
 ## Day-to-day workflow
 
-Activate the venv before working (or ensure `VIRTUAL_ENV` points at `.venv`):
+Activate the venv before working (or ensure `VIRTUAL_ENV` points at `yak_python/.venv`):
 
 ```bash
-source .venv/bin/activate        # macOS / Linux
-.venv\Scripts\activate           # Windows
+source yak_python/.venv/bin/activate        # macOS / Linux
+yak_python\.venv\Scripts\activate           # Windows
 ```
 
 After making changes to `yak` or `yak_python`, rebuild the Python module before
@@ -69,7 +71,7 @@ cd yak_pytest && python -m pytest tests/ -v
 ## Quality checks
 
 A git pre-push hook runs `fmt` and `clippy` across the full workspace (including
-`yak_python`). The hook auto-detects `.venv` so PyO3 can find Python. You can also
+`yak_python`). The hook auto-detects `yak_python/.venv` so PyO3 can find Python. You can also
 run the checks manually:
 
 ```bash

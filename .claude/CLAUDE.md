@@ -76,5 +76,5 @@ Yak uses the `aes` crate (0.8+) for AES-XTS block encryption at L2. Hardware acc
   software AES implementation. All aarch64 targets must have this flag in `.cargo/config.toml`.
 - See https://docs.rs/aes/0.8.4/aes/ for the list of configuration flags.
 
-## Building Pything bindings with Maturin
-Maturin is set up via the .venv. Build the PyO3 with that, rather than attempting to locate it manually.3
+## Building Python bindings with Maturin
+Maturin is set up via the .venv in yak_python/. Build the PyO3 with that, rather than attempting to locate it manually.

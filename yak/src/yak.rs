@@ -314,6 +314,69 @@ fn serialize_table_and_footer(slots: &[(u32, u32)], name_table_offset: u32) -> V
     buf
 }
 
+/// Search for a name in a directory stream buffer (already fully in memory).
+/// Returns Some(stream_id) if found, None otherwise.
+/// The buffer must contain the complete directory stream bytes.
+fn find_name_in_buffer(buf: &[u8], name: &str, biw: usize) -> Result<Option<u64>, YakError> {
+    if buf.is_empty() {
+        return Ok(None);
+    }
+    match find_entry_in_buffer(buf, name, biw)? {
+        Some(found) => Ok(Some(found.id)),
+        None => Ok(None),
+    }
+}
+
+/// Search for a name in a directory stream buffer, returning full entry info.
+/// Used by mutation methods that need slot_idx, offset, and entry_size for compaction.
+fn find_entry_in_buffer(
+    buf: &[u8],
+    name: &str,
+    biw: usize,
+) -> Result<Option<FoundEntry>, YakError> {
+    if buf.is_empty() {
+        return Ok(None);
+    }
+    let stream_len = buf.len();
+    if stream_len < FOOTER_SIZE {
+        return Err(YakError::IoError(
+            "directory stream too small for footer".to_string(),
+        ));
+    }
+
+    let footer_start = stream_len - FOOTER_SIZE;
+    let name_table_offset =
+        u32::from_le_bytes(buf[footer_start..footer_start + 4].try_into().unwrap());
+    let entry_count = entry_count_from_footer(stream_len, name_table_offset);
+    let nto = name_table_offset as usize;
+    let table_end = nto + entry_count as usize * NAME_TABLE_SLOT_SIZE;
+    let name_table = &buf[nto..table_end];
+
+    let name_bytes = name.as_bytes();
+    let target_hash = fnv1a_hash(name_bytes);
+    let range = find_hash_range(name_table, entry_count, target_hash);
+    let header_size = biw + 2; // id bytes + name_len u16
+
+    for slot_idx in range {
+        let offset = slot_offset(name_table, slot_idx) as usize;
+        let name_len = u16::from_le_bytes([buf[offset + biw], buf[offset + biw + 1]]) as usize;
+        if name_len == name_bytes.len() {
+            let name_start = offset + header_size;
+            if &buf[name_start..name_start + name_len] == name_bytes {
+                let mut id_bytes = [0u8; 8];
+                id_bytes[..biw].copy_from_slice(&buf[offset..offset + biw]);
+                return Ok(Some(FoundEntry {
+                    slot_idx,
+                    offset: offset as u32,
+                    id: u64::from_le_bytes(id_bytes),
+                    entry_size: header_size + name_len,
+                }));
+            }
+        }
+    }
+    Ok(None)
+}
+
 // ---------------------------------------------------------------------------
 // Path utilities
 // ---------------------------------------------------------------------------
@@ -365,6 +428,10 @@ struct OpenStreamInfo<H: Copy> {
 struct YakState<H: Copy> {
     next_handle_id: u64,
     open_streams: HashMap<u64, OpenStreamInfo<H>>,
+    /// Cache of raw directory stream bytes, keyed by stream ID.
+    /// Populated on first access, updated on mutation, never evicted.
+    /// Directory streams are typically small (a few KB), so memory is bounded.
+    dir_cache: HashMap<u64, Vec<u8>>,
 }
 
 /// Represents an open Yak file. Generic over the L3 stream layer.
@@ -462,6 +529,7 @@ impl<L3: StreamLayer> Yak<L3> {
             state: Mutex::new(YakState {
                 next_handle_id: 0,
                 open_streams: HashMap::new(),
+                dir_cache: HashMap::new(),
             }),
         })
     }
@@ -490,6 +558,7 @@ impl<L3: StreamLayer> Yak<L3> {
             state: Mutex::new(YakState {
                 next_handle_id: 0,
                 open_streams: HashMap::new(),
+                dir_cache: HashMap::new(),
             }),
         })
     }
@@ -786,8 +855,13 @@ impl<L3: StreamLayer> Yak<L3> {
             .layer3
             .open_stream_blocking(parent_id, OpenMode::Write)?;
 
-        let result =
-            self.add_entry_to_dir_handle(&parent_handle, &dir_entry_name, new_dir_id, path);
+        let result = self.add_entry_to_dir_handle(
+            parent_id,
+            &parent_handle,
+            &dir_entry_name,
+            new_dir_id,
+            path,
+        );
         if result.is_err() {
             self.layer3.close_stream(parent_handle)?;
             // Clean up the stream we just created
@@ -842,10 +916,11 @@ impl<L3: StreamLayer> Yak<L3> {
         }
 
         // Remove entry from parent using in-place compaction
-        self.remove_entry_from_dir_handle(&parent_handle, &dir_entry_name, path)?;
+        self.remove_entry_from_dir_handle(parent_id, &parent_handle, &dir_entry_name, path)?;
         self.layer3.close_stream(parent_handle)?;
 
-        // Delete the directory stream
+        // Delete the directory stream and its cache entry
+        self.invalidate_dir_cache(dir_stream_id);
         self.layer3.delete_stream(dir_stream_id)?;
         Ok(())
     }
@@ -859,9 +934,9 @@ impl<L3: StreamLayer> Yak<L3> {
             self.resolve_dir_stream_id(path)?
         };
 
-        let handle = self.layer3.open_stream_blocking(dir_id, OpenMode::Read)?;
-        let entries = self.read_entries_from_handle(&handle)?;
-        self.layer3.close_stream(handle)?;
+        let buf = self.get_dir_content(dir_id)?;
+        let biw = self.layer3.block_index_width();
+        let entries = parse_entries(&buf, biw)?;
 
         let mut result: Vec<DirEntry> = entries
             .iter()
@@ -909,20 +984,34 @@ impl<L3: StreamLayer> Yak<L3> {
                 .layer3
                 .open_stream_blocking(old_parent_id, OpenMode::Write)?;
 
-            let stream_id =
-                match self.remove_entry_from_dir_handle(&handle, &old_dir_name, old_path) {
-                    Ok(id) => id,
-                    Err(e) => {
-                        self.layer3.close_stream(handle)?;
-                        return Err(e);
-                    }
-                };
+            let stream_id = match self.remove_entry_from_dir_handle(
+                old_parent_id,
+                &handle,
+                &old_dir_name,
+                old_path,
+            ) {
+                Ok(id) => id,
+                Err(e) => {
+                    self.layer3.close_stream(handle)?;
+                    return Err(e);
+                }
+            };
 
-            if let Err(e) =
-                self.add_entry_to_dir_handle(&handle, &new_dir_name, stream_id, new_path)
-            {
+            if let Err(e) = self.add_entry_to_dir_handle(
+                old_parent_id,
+                &handle,
+                &new_dir_name,
+                stream_id,
+                new_path,
+            ) {
                 // Re-add the old entry to restore consistency
-                let _ = self.add_entry_to_dir_handle(&handle, &old_dir_name, stream_id, old_path);
+                let _ = self.add_entry_to_dir_handle(
+                    old_parent_id,
+                    &handle,
+                    &old_dir_name,
+                    stream_id,
+                    old_path,
+                );
                 self.layer3.close_stream(handle)?;
                 return Err(e);
             }
@@ -932,30 +1021,43 @@ impl<L3: StreamLayer> Yak<L3> {
             let old_handle = self
                 .layer3
                 .open_stream_blocking(old_parent_id, OpenMode::Write)?;
-            let stream_id =
-                match self.remove_entry_from_dir_handle(&old_handle, &old_dir_name, old_path) {
-                    Ok(id) => id,
-                    Err(e) => {
-                        self.layer3.close_stream(old_handle)?;
-                        return Err(e);
-                    }
-                };
+            let stream_id = match self.remove_entry_from_dir_handle(
+                old_parent_id,
+                &old_handle,
+                &old_dir_name,
+                old_path,
+            ) {
+                Ok(id) => id,
+                Err(e) => {
+                    self.layer3.close_stream(old_handle)?;
+                    return Err(e);
+                }
+            };
             self.layer3.close_stream(old_handle)?;
 
             // Add to new parent
             let new_handle = self
                 .layer3
                 .open_stream_blocking(new_parent_id, OpenMode::Write)?;
-            if let Err(e) =
-                self.add_entry_to_dir_handle(&new_handle, &new_dir_name, stream_id, new_path)
-            {
+            if let Err(e) = self.add_entry_to_dir_handle(
+                new_parent_id,
+                &new_handle,
+                &new_dir_name,
+                stream_id,
+                new_path,
+            ) {
                 self.layer3.close_stream(new_handle)?;
                 // Re-add to old parent to restore consistency
                 let old_handle = self
                     .layer3
                     .open_stream_blocking(old_parent_id, OpenMode::Write)?;
-                let _ =
-                    self.add_entry_to_dir_handle(&old_handle, &old_dir_name, stream_id, old_path);
+                let _ = self.add_entry_to_dir_handle(
+                    old_parent_id,
+                    &old_handle,
+                    &old_dir_name,
+                    stream_id,
+                    old_path,
+                );
                 self.layer3.close_stream(old_handle)?;
                 return Err(e);
             }
@@ -994,7 +1096,8 @@ impl<L3: StreamLayer> Yak<L3> {
             .open_stream_blocking(parent_id, OpenMode::Write)?;
 
         // Add entry (checks for duplicates via name table binary search)
-        let result = self.add_entry_to_dir_handle(&parent_handle, leaf, new_stream_id, path);
+        let result =
+            self.add_entry_to_dir_handle(parent_id, &parent_handle, leaf, new_stream_id, path);
         if result.is_err() {
             self.layer3.close_stream(parent_handle)?;
             let _ = self.layer3.delete_stream(new_stream_id);
@@ -1124,7 +1227,7 @@ impl<L3: StreamLayer> Yak<L3> {
         }
 
         // Remove entry from parent using in-place compaction
-        self.remove_entry_from_dir_handle(&parent_handle, leaf, path)?;
+        self.remove_entry_from_dir_handle(parent_id, &parent_handle, leaf, path)?;
         self.layer3.close_stream(parent_handle)?;
 
         // Delete the stream in L3
@@ -1172,17 +1275,27 @@ impl<L3: StreamLayer> Yak<L3> {
                 .layer3
                 .open_stream_blocking(old_parent_id, OpenMode::Write)?;
 
-            let removed_id = match self.remove_entry_from_dir_handle(&handle, old_leaf, old_path) {
-                Ok(id) => id,
-                Err(e) => {
-                    self.layer3.close_stream(handle)?;
-                    return Err(e);
-                }
-            };
+            let removed_id =
+                match self.remove_entry_from_dir_handle(old_parent_id, &handle, old_leaf, old_path)
+                {
+                    Ok(id) => id,
+                    Err(e) => {
+                        self.layer3.close_stream(handle)?;
+                        return Err(e);
+                    }
+                };
 
-            if let Err(e) = self.add_entry_to_dir_handle(&handle, new_leaf, removed_id, new_path) {
+            if let Err(e) =
+                self.add_entry_to_dir_handle(old_parent_id, &handle, new_leaf, removed_id, new_path)
+            {
                 // Restore old entry
-                let _ = self.add_entry_to_dir_handle(&handle, old_leaf, removed_id, old_path);
+                let _ = self.add_entry_to_dir_handle(
+                    old_parent_id,
+                    &handle,
+                    old_leaf,
+                    removed_id,
+                    old_path,
+                );
                 self.layer3.close_stream(handle)?;
                 return Err(e);
             }
@@ -1192,28 +1305,42 @@ impl<L3: StreamLayer> Yak<L3> {
             let old_handle = self
                 .layer3
                 .open_stream_blocking(old_parent_id, OpenMode::Write)?;
-            let removed_id =
-                match self.remove_entry_from_dir_handle(&old_handle, old_leaf, old_path) {
-                    Ok(id) => id,
-                    Err(e) => {
-                        self.layer3.close_stream(old_handle)?;
-                        return Err(e);
-                    }
-                };
+            let removed_id = match self.remove_entry_from_dir_handle(
+                old_parent_id,
+                &old_handle,
+                old_leaf,
+                old_path,
+            ) {
+                Ok(id) => id,
+                Err(e) => {
+                    self.layer3.close_stream(old_handle)?;
+                    return Err(e);
+                }
+            };
             self.layer3.close_stream(old_handle)?;
 
             let new_handle = self
                 .layer3
                 .open_stream_blocking(new_parent_id, OpenMode::Write)?;
-            if let Err(e) =
-                self.add_entry_to_dir_handle(&new_handle, new_leaf, removed_id, new_path)
-            {
+            if let Err(e) = self.add_entry_to_dir_handle(
+                new_parent_id,
+                &new_handle,
+                new_leaf,
+                removed_id,
+                new_path,
+            ) {
                 self.layer3.close_stream(new_handle)?;
                 // Restore old entry
                 let old_handle = self
                     .layer3
                     .open_stream_blocking(old_parent_id, OpenMode::Write)?;
-                let _ = self.add_entry_to_dir_handle(&old_handle, old_leaf, removed_id, old_path);
+                let _ = self.add_entry_to_dir_handle(
+                    old_parent_id,
+                    &old_handle,
+                    old_leaf,
+                    removed_id,
+                    old_path,
+                );
                 self.layer3.close_stream(old_handle)?;
                 return Err(e);
             }
@@ -1407,6 +1534,46 @@ impl<L3: StreamLayer> Yak<L3> {
     // Internal helpers
     // -------------------------------------------------------------------
 
+    /// Get directory stream content, using the in-process cache if available.
+    /// On cache miss, opens the stream via L3, reads it in full, caches, and returns.
+    fn get_dir_content(&self, dir_stream_id: u64) -> Result<Vec<u8>, YakError> {
+        // Fast path: check cache under lock
+        {
+            let state = self.state.lock().unwrap();
+            if let Some(cached) = state.dir_cache.get(&dir_stream_id) {
+                return Ok(cached.clone());
+            }
+        }
+
+        // Cache miss: read from L3
+        let handle = self
+            .layer3
+            .open_stream_blocking(dir_stream_id, OpenMode::Read)?;
+        let len = self.layer3.stream_length(&handle)?;
+        let buf = if len == 0 {
+            Vec::new()
+        } else {
+            let mut buf = vec![0u8; len as usize];
+            self.layer3.read(&handle, 0, &mut buf)?;
+            buf
+        };
+        self.layer3.close_stream(handle)?;
+
+        // Populate cache
+        {
+            let mut state = self.state.lock().unwrap();
+            state.dir_cache.insert(dir_stream_id, buf.clone());
+        }
+
+        Ok(buf)
+    }
+
+    /// Remove a directory from the cache (e.g. when the directory is mutated or deleted).
+    fn invalidate_dir_cache(&self, dir_stream_id: u64) {
+        let mut state = self.state.lock().unwrap();
+        state.dir_cache.remove(&dir_stream_id);
+    }
+
     /// Walk directory streams to resolve a directory path to its stream ID.
     /// Returns root_dir_stream_id for empty path.
     fn resolve_dir_stream_id(&self, path: &str) -> Result<u64, YakError> {
@@ -1439,22 +1606,11 @@ impl<L3: StreamLayer> Yak<L3> {
 
     /// Look up a single entry by name in a directory stream.
     /// O(log n) via binary search on the name table.
-    /// Reads only footer + name table + candidate entries (not full stream).
-    /// Opens and closes the directory stream handle internally.
+    /// Uses the in-process directory cache to avoid L3 I/O on repeated lookups.
     fn find_entry_in_dir(&self, dir_stream_id: u64, name: &str) -> Result<Option<u64>, YakError> {
-        let handle = self
-            .layer3
-            .open_stream_blocking(dir_stream_id, OpenMode::Read)?;
-        let len = self.layer3.stream_length(&handle)?;
-        if len == 0 {
-            self.layer3.close_stream(handle)?;
-            return Ok(None);
-        }
-
+        let buf = self.get_dir_content(dir_stream_id)?;
         let biw = self.layer3.block_index_width() as usize;
-        let result = self.find_name_in_handle(&handle, len, name, biw);
-        self.layer3.close_stream(handle)?;
-        result
+        find_name_in_buffer(&buf, name, biw)
     }
 
     /// Search for a name in an open directory stream using the name table.
@@ -1540,8 +1696,10 @@ impl<L3: StreamLayer> Yak<L3> {
     /// Add an entry to a directory stream that is already open for writing.
     /// Checks for duplicates (both `entry_name` and the dir/stream alternative).
     /// On success the entry has been written; the caller must still close the handle.
+    /// Invalidates the directory cache for `dir_stream_id` on success.
     fn add_entry_to_dir_handle(
         &self,
+        dir_stream_id: u64,
         handle: &L3::Handle,
         entry_name: &str,
         entry_id: u64,
@@ -1566,6 +1724,7 @@ impl<L3: StreamLayer> Yak<L3> {
             };
             let buf = build_directory_stream(&[entry], biw);
             self.layer3.write(handle, 0, &buf)?;
+            self.invalidate_dir_cache(dir_stream_id);
             return Ok(());
         }
 
@@ -1605,14 +1764,17 @@ impl<L3: StreamLayer> Yak<L3> {
         self.layer3
             .write(handle, name_table_offset as u64, &write_buf)?;
 
+        self.invalidate_dir_cache(dir_stream_id);
         Ok(())
     }
 
     /// Remove an entry from a directory stream using in-place compaction.
     /// Returns the stream ID of the removed entry.
     /// The caller must still close the handle.
+    /// Invalidates the directory cache for `dir_stream_id` on success.
     fn remove_entry_from_dir_handle(
         &self,
+        dir_stream_id: u64,
         handle: &L3::Handle,
         entry_name: &str,
         error_path: &str,
@@ -1678,6 +1840,7 @@ impl<L3: StreamLayer> Yak<L3> {
             self.layer3.truncate(handle, new_len)?;
         }
 
+        self.invalidate_dir_cache(dir_stream_id);
         Ok(found_id)
     }
 }

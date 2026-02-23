@@ -21,6 +21,13 @@ const FOOTER_SIZE: usize = 4;
 /// Size of the copy buffer used when compacting entry data on delete.
 const COMPACT_COPY_BUF_SIZE: usize = 64 * 1024;
 
+/// Maximum directory stream size for the single-read fast path.
+/// Directory streams up to this size are read in one L3 call and searched
+/// entirely in memory, avoiding per-field round-trips through the read stack.
+/// At 512 KiB this comfortably covers directories with tens of thousands of
+/// entries (see architecture docs for the arithmetic).
+const MAX_DIR_STREAM_BUFFER: u64 = 512 * 1024;
+
 /// FNV-1a hash of a byte slice, producing a 32-bit hash.
 /// Used to accelerate directory entry lookups by comparing a cheap integer
 /// before falling back to a full name comparison.
@@ -1459,6 +1466,10 @@ impl<L3: StreamLayer> Yak<L3> {
 
     /// Search for a name in an open directory stream using the name table.
     /// Returns Some(id) if found, None otherwise.
+    ///
+    /// For streams up to MAX_DIR_STREAM_BUFFER bytes the entire directory is
+    /// read in a single L3 call and searched in memory — no further I/O.
+    /// Larger streams fall back to the multi-read path.
     fn find_name_in_handle(
         &self,
         handle: &L3::Handle,
@@ -1469,9 +1480,56 @@ impl<L3: StreamLayer> Yak<L3> {
         if stream_len == 0 {
             return Ok(None);
         }
+
+        if stream_len <= MAX_DIR_STREAM_BUFFER {
+            return self.find_name_in_buffer(handle, stream_len, name, biw);
+        }
+
+        // Fallback: multi-read path for very large directories.
         let (name_table, entry_count, _) = self.read_name_table(handle, stream_len)?;
         let found = self.find_entry_in_name_table(handle, &name_table, entry_count, name, biw)?;
         Ok(found.map(|e| e.id))
+    }
+
+    /// Fast path: read the entire directory stream once, then search in memory.
+    fn find_name_in_buffer(
+        &self,
+        handle: &L3::Handle,
+        stream_len: u64,
+        name: &str,
+        biw: usize,
+    ) -> Result<Option<u64>, YakError> {
+        let len = stream_len as usize;
+        let mut buf = vec![0u8; len];
+        self.layer3.read(handle, 0, &mut buf)?;
+
+        // Footer: last 4 bytes → name_table_offset
+        let name_table_offset = u32::from_le_bytes(
+            buf[len - FOOTER_SIZE..len].try_into().unwrap(),
+        ) as usize;
+        let entry_count =
+            entry_count_from_footer(len, name_table_offset as u32);
+        let name_table = &buf[name_table_offset..len - FOOTER_SIZE];
+
+        // Binary search the name table for matching hashes
+        let name_bytes = name.as_bytes();
+        let target_hash = fnv1a_hash(name_bytes);
+        let range = find_hash_range(name_table, entry_count, target_hash);
+        let header_size = biw + 2;
+
+        for slot_idx in range {
+            let offset = slot_offset(name_table, slot_idx) as usize;
+            let name_len =
+                u16::from_le_bytes([buf[offset + biw], buf[offset + biw + 1]]) as usize;
+            if name_len == name_bytes.len()
+                && buf[offset + header_size..offset + header_size + name_len] == *name_bytes
+            {
+                let mut id_bytes = [0u8; 8];
+                id_bytes[..biw].copy_from_slice(&buf[offset..offset + biw]);
+                return Ok(Some(u64::from_le_bytes(id_bytes)));
+            }
+        }
+        Ok(None)
     }
 
     /// Read footer + name table from an open directory stream.

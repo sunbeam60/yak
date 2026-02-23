@@ -432,6 +432,10 @@ struct YakState<H: Copy> {
     /// Populated on first access, updated on mutation, never evicted.
     /// Directory streams are typically small (a few KB), so memory is bounded.
     dir_cache: HashMap<u64, Vec<u8>>,
+    /// Generation counter per directory stream, bumped on each invalidation.
+    /// Prevents a slow cache-miss reader from overwriting a newer invalidation
+    /// with stale data it read before the mutation occurred.
+    dir_cache_gen: HashMap<u64, u64>,
 }
 
 /// Represents an open Yak file. Generic over the L3 stream layer.
@@ -530,6 +534,7 @@ impl<L3: StreamLayer> Yak<L3> {
                 next_handle_id: 0,
                 open_streams: HashMap::new(),
                 dir_cache: HashMap::new(),
+                dir_cache_gen: HashMap::new(),
             }),
         })
     }
@@ -559,6 +564,7 @@ impl<L3: StreamLayer> Yak<L3> {
                 next_handle_id: 0,
                 open_streams: HashMap::new(),
                 dir_cache: HashMap::new(),
+                dir_cache_gen: HashMap::new(),
             }),
         })
     }
@@ -1537,15 +1543,21 @@ impl<L3: StreamLayer> Yak<L3> {
     /// Get directory stream content, using the in-process cache if available.
     /// On cache miss, opens the stream via L3, reads it in full, caches, and returns.
     fn get_dir_content(&self, dir_stream_id: u64) -> Result<Vec<u8>, YakError> {
-        // Fast path: check cache under lock
+        // Fast path: check cache under lock, snapshot generation on miss
+        let gen_at_read;
         {
             let state = self.state.lock().unwrap();
             if let Some(cached) = state.dir_cache.get(&dir_stream_id) {
                 return Ok(cached.clone());
             }
+            gen_at_read = state
+                .dir_cache_gen
+                .get(&dir_stream_id)
+                .copied()
+                .unwrap_or(0);
         }
 
-        // Cache miss: read from L3
+        // Cache miss: read from L3 (mutex is NOT held, so mutations can happen)
         let handle = self
             .layer3
             .open_stream_blocking(dir_stream_id, OpenMode::Read)?;
@@ -1559,19 +1571,31 @@ impl<L3: StreamLayer> Yak<L3> {
         };
         self.layer3.close_stream(handle)?;
 
-        // Populate cache
+        // Populate cache only if no invalidation occurred while we were reading.
+        // If the generation was bumped, another thread mutated this directory
+        // and our data is potentially stale -- discard it.
         {
             let mut state = self.state.lock().unwrap();
-            state.dir_cache.insert(dir_stream_id, buf.clone());
+            let current_gen = state
+                .dir_cache_gen
+                .get(&dir_stream_id)
+                .copied()
+                .unwrap_or(0);
+            if current_gen == gen_at_read {
+                state.dir_cache.insert(dir_stream_id, buf.clone());
+            }
         }
 
         Ok(buf)
     }
 
     /// Remove a directory from the cache (e.g. when the directory is mutated or deleted).
+    /// Bumps the generation counter so any in-flight cache-miss readers know their
+    /// data is stale and won't overwrite the invalidation.
     fn invalidate_dir_cache(&self, dir_stream_id: u64) {
         let mut state = self.state.lock().unwrap();
         state.dir_cache.remove(&dir_stream_id);
+        *state.dir_cache_gen.entry(dir_stream_id).or_insert(0) += 1;
     }
 
     /// Walk directory streams to resolve a directory path to its stream ID.

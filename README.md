@@ -9,9 +9,9 @@
 # Yak - Yet Another Kontainer
 Yak is a library that helps you to easily build your own binary file formats. 
 
-Yak is a bit like the [Compound File Binary File](https://en.wikipedia.org/wiki/Compound_File_Binary_Format), but without the legacy. 
+Yak is a file system, inside a file.
 
-Yak is a file system, inside a file:
+Yak is a bit like the [Compound File Binary Format](https://en.wikipedia.org/wiki/Compound_File_Binary_Format), but without the legacy. 
 
 * A Yak file can have many streams.
 * Organise streams into Yak directories - stream names cannot clash inside the same directory.
@@ -61,7 +61,7 @@ Yak is implemented in Rust and [published on crates.io](https://crates.io/crates
 * Any language that can use C libraries (dynamic or static), such as Objective-C, Zig, D, Lua & LuaJIT, C#, Haskell, Node.js etc.
 
 ## Ready to go
-Yak is reasonably well optimized and pulls a number of tricks to balance these desired features:
+Yak is [reasonably well optimized](https://github.com/sunbeam60/yak/blob/master/docs/performance.md) and pulls a number of tricks to balance these desired features:
 * A simple, name-based filing system.
 * Automatic space management - even after you've written a stream and closed it, you can reopen the same stream much later and write more stuff to it.
 * Fast seeking within streams, without holding lots of extra data - the underlying pyramid data structure wastes very little space and is still very efficient.
@@ -118,6 +118,8 @@ Scenarios:
   single-stream    Write + read one 64MB stream (contiguous I/O test)
   warm-read        Write then read 2750x10KB streams (same instance, warm cache)
   overwrite        Write 10MB then 5000 overwrites (compress/decompress stress)
+  dir-lookup       Open 1000 streams by name in a 10000-entry directory
+  cache-pressure   Random reads under cache-invalidation pressure (threaded)
   all              Run all scenarios in sequence
 
 Options:
@@ -132,7 +134,7 @@ Options:
                    n = normal, e = encrypted, c = compressed, b = both
                    Examples: --case nc (normal + compressed)
                              --case c  (compressed only)
-```
+```                             
 
 ## Yak is not ...
 * A database - Yak thinks in binary only and doesn't care or know what you write to your streams.
@@ -140,16 +142,16 @@ Options:
 * An archive format - To optimize for speed, random seeks within streams and mutability of streams, Yak will not achieve the same compression ratio as a modern archive.
 
 ## ... but Yak could be
+* How you get started writing data to a file, until you've got that perfect, custom solution
 * How you save your app's data
-* How you load your game's assets
+* How you pack and load your game's assets
 * How you compactly receive a bunch of streaming data
 * How you rewire that other library's file-spew into a single location
-* How you get started writing data to a file, until you've got that perfect, custom solution
 * How you handle a number of threads writing to the same file, at the same time
-* An alternative to [rust-cfb](https://github.com/mdsteele/rust-cfb)
+* A [higher performance](https://github.com/sunbeam60/yak/blob/master/docs/performance.md) alternative to [rust-cfb](https://github.com/mdsteele/rust-cfb)
 
 ## Want to know more about how Yak works?
-Read the [Architecture Overview](https://github.com/sunbeam60/yak/blob/master/docs/architecture.md)
+Read the [Architecture Overview](https://github.com/sunbeam60/yak/blob/master/docs/architecture.md).
 
 ## Quick Start
 
@@ -177,8 +179,9 @@ python -m pytest tests/ -v --burn-seconds=1
 ```
 yak/             - Core Rust library (L4 + L3 + L2 traits and implementations)
 yak_c/           - C FFI wrapper for language interop
-yak_pytest/      - Python bindings and test suite
 yak_cl/          - Command-line tool
+yak_python/      - PyO3 Python bindings (published as libyak on PyPI)
+yak_pytest/      - Python test suite
 docs/            - Architecture and design documentation
 graphics/        - Yak logo
 ```
@@ -187,3 +190,6 @@ graphics/        - Yak logo
 Yak includes a couple of supporting debugging layers to simply development of your own file format, should you choose to fork.
 - `YakBlockFileBacked = Yak<StreamsFromBlocks<BlocksFromFiles>>` -- L2 mock (numbered `.block` files)
 - `YakFileBacked = Yak<StreamsFromFiles>` -- L3 mock (numbered `.stream` files)
+
+## Convenience utility
+For users of [Total Commander](https://www.ghisler.com/), a [WCX packer plugin is available](https://github.com/sunbeam60/yak-tc) to operate on Yak files.

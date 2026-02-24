@@ -3,7 +3,6 @@
     "rust-analyzer.cargo.features": "all",
     "rust-analyzer.check.command": "clippy",
     "rust-analyzer.cargo.allTargets": true,
-
     // Python settings
     "python.defaultInterpreterPath": "./yak_python/.venv/bin/python",
     "python.testing.pytestEnabled": true,
@@ -12,12 +11,10 @@
         "-v"
     ],
     "python.testing.cwd": "${workspaceFolder}/yak_pytest",
-
     // File associations
     "files.associations": {
         "*.yak": "plaintext"
     },
-
     // File exclusions (keep workspace clean)
     "files.exclude": {
         "**/.pytest_cache": true,
@@ -26,14 +23,12 @@
         "**/target/debug/build": true,
         "**/target/debug/incremental": true
     },
-
     // Search exclusions
     "search.exclude": {
         "**/target": true,
         "**/.pytest_cache": true,
         "**/__pycache__": true
     },
-
     // Editor settings
     "editor.formatOnSave": true,
     "[rust]": {

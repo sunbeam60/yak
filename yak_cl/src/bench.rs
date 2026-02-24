@@ -152,7 +152,7 @@ fn print_bench_usage() {
     eprintln!("  single-stream    Write + read one 64MB stream (contiguous I/O test)");
     eprintln!("  warm-read        Write then read 2750x10KB streams (same instance, warm cache)");
     eprintln!("  overwrite        Write 10MB then 5000 overwrites (compress/decompress stress)");
-    eprintln!("  dir-lookup       Open 1000 streams by name in a 10000-entry directory");
+    eprintln!("  dir-lookup       Open 4000 streams by name in a 4000-entry directory");
     eprintln!("  cache-pressure   Random reads under cache-invalidation pressure (threaded)");
     eprintln!("  all              Run all scenarios in sequence");
     eprintln!();

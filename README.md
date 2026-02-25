@@ -17,7 +17,7 @@ Yak is a bit like the [Compound File Binary Format](https://en.wikipedia.org/wik
 * Organise streams into Yak directories - stream names cannot clash inside the same directory.
 * Treat streams like you would files - write to them, read from them, truncate them, delete them, move them (inside the Yak file).
 * Streams can grow or shrink inside the Yak file - Yak will figure out how to organise it efficiently.
-* Seek in streams with O(log n) efficiency due to Yak's pyramid storage structure.
+* Random access seeking in streams with O(log n) efficiency due to Yak's pyramid storage structure.
 * Streams can be optionally compressed - Yak handles this transparently, compressing and decompressing as you read and write.
 * Yak files can be optionally encrypted - Yak handles this transparently too, encrypting and decrypting as you read and write.
 

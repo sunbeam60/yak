@@ -4,6 +4,7 @@ use aes::Aes256;
 use aes_kw::Kek;
 use argon2::Argon2;
 use rand::RngExt;
+use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 use xts_mode::{get_tweak_default, Xts128};
 
@@ -199,36 +200,56 @@ pub(crate) fn decrypt_block(cipher: &BlockCipher, block_index: u64, data: &mut [
     cipher.cipher.decrypt_sector(data, tweak);
 }
 
-/// Encrypt a contiguous run of blocks in place. Each block_size chunk gets
-/// its own tweak derived from `first_block_index + i`.
+/// Encrypt a contiguous run of blocks in place using Rayon parallelism.
+/// Each block_size chunk gets its own tweak derived from `first_block_index + i`.
+/// Work is partitioned into one chunk per Rayon thread, with sequential block
+/// processing within each chunk. This avoids Rayon's adaptive splitting from
+/// underestimating the benefit of parallelism for fast per-block AES-NI work.
 pub(crate) fn encrypt_blocks(
     cipher: &BlockCipher,
     data: &mut [u8],
     block_size: usize,
     first_block_index: u64,
 ) {
-    cipher.cipher.encrypt_area(
-        data,
-        block_size,
-        first_block_index as u128,
-        get_tweak_default,
-    );
+    let block_count = data.len() / block_size;
+    let blocks_per_thread = block_count.div_ceil(rayon::current_num_threads());
+    let bytes_per_chunk = blocks_per_thread * block_size;
+
+    data.par_chunks_mut(bytes_per_chunk)
+        .enumerate()
+        .for_each(|(chunk_idx, thread_chunk)| {
+            let start_block = first_block_index + (chunk_idx * blocks_per_thread) as u64;
+            for (i, block) in thread_chunk.chunks_mut(block_size).enumerate() {
+                let tweak = get_tweak_default((start_block + i as u64) as u128);
+                cipher.cipher.encrypt_sector(block, tweak);
+            }
+        });
 }
 
-/// Decrypt a contiguous run of blocks in place. Each block_size chunk gets
-/// its own tweak derived from `first_block_index + i`.
+/// Decrypt a contiguous run of blocks in place using Rayon parallelism.
+/// Each block_size chunk gets its own tweak derived from `first_block_index + i`.
+/// Work is partitioned into one chunk per Rayon thread, with sequential block
+/// processing within each chunk. This avoids Rayon's adaptive splitting from
+/// underestimating the benefit of parallelism for fast per-block AES-NI work.
 pub(crate) fn decrypt_blocks(
     cipher: &BlockCipher,
     data: &mut [u8],
     block_size: usize,
     first_block_index: u64,
 ) {
-    cipher.cipher.decrypt_area(
-        data,
-        block_size,
-        first_block_index as u128,
-        get_tweak_default,
-    );
+    let block_count = data.len() / block_size;
+    let blocks_per_thread = block_count.div_ceil(rayon::current_num_threads());
+    let bytes_per_chunk = blocks_per_thread * block_size;
+
+    data.par_chunks_mut(bytes_per_chunk)
+        .enumerate()
+        .for_each(|(chunk_idx, thread_chunk)| {
+            let start_block = first_block_index + (chunk_idx * blocks_per_thread) as u64;
+            for (i, block) in thread_chunk.chunks_mut(block_size).enumerate() {
+                let tweak = get_tweak_default((start_block + i as u64) as u128);
+                cipher.cipher.decrypt_sector(block, tweak);
+            }
+        });
 }
 
 // ---------------------------------------------------------------------------

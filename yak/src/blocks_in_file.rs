@@ -3,6 +3,7 @@ use std::num::NonZeroUsize;
 use std::sync::Mutex;
 
 use lru::LruCache;
+use rayon::prelude::*;
 use thread_local::ThreadLocal;
 
 use crate::block_layer::{BlockLayer, CacheMode};
@@ -501,10 +502,16 @@ impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlockLayer
         // zero from set_len — guaranteed on Linux, macOS, and Windows)
         if free_list_count > 0 {
             if let Some(cipher) = &self.cipher {
-                // Encrypted: encrypt zeros per-block (each gets its own tweak)
-                for &block_id in &result[..free_list_count] {
-                    let mut zeros = vec![0u8; block_size];
-                    encryption::encrypt_block(cipher, block_id, &mut zeros);
+                // Encrypted: encrypt zeros in parallel, then write sequentially to L1
+                let encrypted_zeros: Vec<Vec<u8>> = result[..free_list_count]
+                    .par_iter()
+                    .map(|&block_id| {
+                        let mut zeros = vec![0u8; block_size];
+                        encryption::encrypt_block(cipher, block_id, &mut zeros);
+                        zeros
+                    })
+                    .collect();
+                for (&block_id, zeros) in result[..free_list_count].iter().zip(encrypted_zeros) {
                     self.layer1.write(self.block_offset(block_id), &zeros)?;
                 }
             } else {
@@ -580,23 +587,31 @@ impl<L1: FileLayer, const CACHE_BUDGET_BYTES: usize> BlockLayer
 
         // Chain: indices[0] → indices[1] → … → indices[n-1] → old free_list_head
         if let Some(cipher) = &self.cipher {
-            // Encrypted: zero-fill + pointer per block, encrypt, write full blocks.
+            // Encrypted: build plaintext chain, encrypt in parallel, write sequentially.
             // Securely zeroes old data in deallocated blocks.
             let block_size = self.block_size();
+            let mut blocks: Vec<(u64, Vec<u8>)> = Vec::with_capacity(indices.len());
             for i in 0..indices.len() - 1 {
                 let mut block = vec![0u8; block_size];
                 let next = indices[i + 1].to_le_bytes();
                 block[..biw].copy_from_slice(&next[..biw]);
-                encryption::encrypt_block(cipher, indices[i], &mut block);
-                self.layer1.write(self.block_offset(indices[i]), &block)?;
+                blocks.push((indices[i], block));
             }
             // Last freed block points to the previous head
-            let mut block = vec![0u8; block_size];
+            let mut last_block = vec![0u8; block_size];
             let head_bytes = state.free_list_head.to_le_bytes();
-            block[..biw].copy_from_slice(&head_bytes[..biw]);
-            let last_idx = *indices.last().unwrap();
-            encryption::encrypt_block(cipher, last_idx, &mut block);
-            self.layer1.write(self.block_offset(last_idx), &block)?;
+            last_block[..biw].copy_from_slice(&head_bytes[..biw]);
+            blocks.push((*indices.last().unwrap(), last_block));
+
+            // Encrypt all blocks in parallel
+            blocks.par_iter_mut().for_each(|(block_id, block)| {
+                encryption::encrypt_block(cipher, *block_id, block);
+            });
+
+            // Write sequentially to L1
+            for (block_id, block) in &blocks {
+                self.layer1.write(self.block_offset(*block_id), block)?;
+            }
         } else {
             for i in 0..indices.len() - 1 {
                 let next = indices[i + 1].to_le_bytes();

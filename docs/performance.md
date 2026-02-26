@@ -21,7 +21,7 @@ yak-cfb-compare all --repeat 3
 ```
 
 ## Results
-Yak is **7 times** more performant than rust-cfb.
+Yak is **7 times** more performant than rust-cfb, in uncompressed & unencrypted mode. rust-cfb does not support compression and encryption so this cannot be tested.
 
 ```mermaid
 xychart-beta

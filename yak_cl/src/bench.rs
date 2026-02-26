@@ -945,13 +945,11 @@ fn run_dir_lookup(bss: u8, biw: u8, cbss: u8, password: Option<&[u8]>) -> Result
 
     // Phase 1: populate directory with 10,000 empty streams (not timed)
     let sfs = create_bench_yak(BENCH_FILE, biw, bss, cbss, password)?;
-    eprint!("    populating {} entries...", total_entries);
     for i in 0..total_entries {
         let name = format!("entry_{:05}.dat", i);
         let handle = create_bench_stream(&sfs, &name, cbss)?;
         sfs.close_stream(handle).map_err(err)?;
     }
-    eprintln!(" done");
     sfs.close().map_err(err)?;
 
     // Phase 2: reopen read-only, then open 1,000 streams by name (timed)
@@ -1020,11 +1018,6 @@ fn run_cache_pressure(
     const CHURN_WRITE_SIZE: usize = 4096;
 
     // Phase 1: populate large streams (not timed)
-    eprint!(
-        "    populating {} x {}MB streams...",
-        LARGE_STREAMS,
-        STREAM_SIZE / (1024 * 1024)
-    );
     {
         let sfs = create_bench_yak(BENCH_FILE, biw, bss, cbss, password)?;
         let buf = make_buffer(STREAM_SIZE);
@@ -1036,7 +1029,6 @@ fn run_cache_pressure(
         }
         sfs.close().map_err(err)?;
     }
-    eprintln!(" done");
 
     // Phase 2: concurrent I/O + churn (timed)
     let sfs = Arc::new(open_bench_yak(BENCH_FILE, OpenMode::Write, password)?);
@@ -1133,16 +1125,6 @@ fn run_cache_pressure(
     }
 
     let total_reads = io_count * READS_PER_THREAD;
-    let invalidations_per_thread = (READS_PER_THREAD - 1) / INVALIDATION_INTERVAL;
-    let total_churn = churn_ops.load(Ordering::Relaxed);
-    eprintln!(
-        "    I/O: {} threads x {} reads, invalidation every {} reads ({} cache wipes/thread)",
-        io_count, READS_PER_THREAD, INVALIDATION_INTERVAL, invalidations_per_thread
-    );
-    eprintln!(
-        "    Churn: {} threads, {} create/write/close/delete cycles",
-        churn_count, total_churn
-    );
     eprintln!(
         "    elapsed: {:.0} ms  ({:.1} reads/s)",
         elapsed_ms,

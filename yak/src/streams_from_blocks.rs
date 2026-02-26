@@ -1347,14 +1347,9 @@ fn decompress_cblock_data<L2: BlockLayer>(
         i += run_len;
     }
 
-    // Decompress
-    let decompressed = lz4_flex::decompress_size_prepended(compressed_buf)
+    // Decompress directly into out_buf (always a full logical block)
+    lz4_flex::block::decompress_into(compressed_buf, out_buf)
         .map_err(|e| YakError::IoError(format!("lz4 decompression failed: {}", e)))?;
-
-    // Copy into out_buf, zero-padding if the valid extent is smaller than the buffer
-    let dec_len = decompressed.len();
-    out_buf[..dec_len].copy_from_slice(&decompressed);
-    out_buf[dec_len..].fill(0);
     Ok(())
 }
 
@@ -1408,8 +1403,8 @@ fn compress_cblock_data<L2: BlockLayer>(
     let block_size = layer2.block_size();
     let biw_sz = block_index_width as usize;
 
-    // Compress the data
-    let compressed = lz4_flex::compress_prepend_size(data);
+    // Compress the data (no size prefix — decompressed size is always the logical block size)
+    let compressed = lz4_flex::compress(data);
     let new_compressed_len = compressed.len();
     let new_block_count = new_compressed_len.div_ceil(block_size);
     let old_block_count = old_redir.data_blocks.len();

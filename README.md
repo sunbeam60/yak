@@ -69,7 +69,7 @@ Yak is [reasonably well optimized](https://github.com/sunbeam60/yak/blob/master/
 * Thread safety - multiple threads can write to multiple streams at the same time.
 * Endian aware - if you need a Yak file to move between little endian and big endian systems, it can.
 * Transparent, fast compression - using LZ4, any data written to a stream gets automatically compressed and any data read gets automatically decompressed.
-* Transparent, fast encryption - using AES-XTS with hardware based encryption/decryption (where hardware is available).
+* Transparent, fast encryption - using multi-threaded AES-XTS with hardware based encryption/decryption (where hardware is available).
 
 ... but due to the architecture of Yak, you can optionally write a new layer that rethinks how streams are linked together from blocks, how blocks are handled and how streams are addressed. By default, Yak is ready to go, but it can also be a toolbox for you to do something custom. Yak includes a broad test suite (~200 tests) that'll help you stress-test anything custom you write.
 

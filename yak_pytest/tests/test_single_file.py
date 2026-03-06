@@ -225,9 +225,9 @@ class TestBlockParameters:
         f.close_stream(h)
         f.close()
 
-    @pytest.mark.parametrize("bss", [6, 9, 12, 16])
+    @pytest.mark.parametrize("bss", [9, 12, 16])
     def test_varying_block_size_shift(self, tmp_path, bss):
-        """Yak works with different block_size_shift values (64B to 64KB blocks)."""
+        """Yak works with different block_size_shift values (512B to 64KB blocks)."""
         yak_path = str(tmp_path / f"test_bss{bss}.yak")
         # cbss must be >= bss; use bss + 3 to ensure validity for large block sizes
         cbss = max(bss + 3, 15)

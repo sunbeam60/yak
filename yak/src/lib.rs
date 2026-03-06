@@ -21,9 +21,9 @@ pub use yak::{CreateOptions, DirEntry, EntryType, OpenMode, StreamHandle, Yak, Y
 
 /// Opaque token identifying a header section slot.
 ///
-/// Each layer stores its own slot ID and uses it to read/write its header
-/// section independently. Slot IDs are issued by L1 and passed through
-/// upper layers via `header_slot_for_upper(index)`.
+/// Used by L2 and L3 to route upper-layer header read/write requests.
+/// In `BlocksInFile`, slots map to regions within block 0 (the superblock).
+/// In mock implementations, slots map to their own internal registries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HeaderSlotId(pub(crate) u8);
 
@@ -114,19 +114,19 @@ mod tests {
         let _ = std::fs::remove_file(&path); // clean up from previous run
         let path_str = path.to_str().unwrap();
 
-        // block_size=64, block_index_width=4, fan_out=16
+        // block_size=512, block_index_width=4, fan_out=128
+        // depth 2 needs > 128 data blocks, so > 65536 bytes
         let yk = YakDefault::create(
             path_str,
             CreateOptions {
-                block_size_shift: 6,
-                compressed_block_size_shift: 9,
+                block_size_shift: 9,
                 ..Default::default()
             },
         )
         .unwrap();
         let sh = yk.create_stream("big.bin", false).unwrap();
 
-        // 1025 bytes requires 17 data blocks -> depth 2
+        // 100025 bytes = ~196 data blocks at 512B -> depth 2
         let len = 100025usize;
         let data: Vec<u8> = (0..len).map(|i| (i & 0xFF) as u8).collect();
         yk.write(&sh, &data).unwrap();

@@ -230,13 +230,13 @@ class TestEncryptionMultiblock:
         f.close()
 
     def test_encrypted_small_blocks(self, tmp_path):
-        """Encryption with small blocks (bss=4, 16 bytes — minimum for AES-XTS)."""
+        """Encryption with small blocks (bss=9, 512 bytes — minimum for superblock)."""
         yak_path = str(tmp_path / "enc_small.yak")
         password = b"small-pw"
 
-        # bss=4 → 16-byte blocks (minimum for XTS), biw=2
+        # bss=9 → 512-byte blocks (minimum), biw=2
         f = yak.Yak.create(
-            yak_path, block_index_width=2, block_size_shift=4, password=password
+            yak_path, block_index_width=2, block_size_shift=9, password=password
         )
         data = b"sixteen bytes!!" + b"\x00"  # exactly 16 bytes
         sh = f.create_stream("tiny.bin")
@@ -251,7 +251,7 @@ class TestEncryptionMultiblock:
         f.close_stream(sh)
         f.close()
 
-    @pytest.mark.parametrize("biw,bss", [(2, 6), (4, 6), (4, 12), (2, 12)])
+    @pytest.mark.parametrize("biw,bss", [(2, 9), (4, 9), (4, 12), (2, 12)])
     def test_encrypted_varying_params(self, tmp_path, biw, bss):
         """Encryption works across different biw and bss combinations."""
         yak_path = str(tmp_path / f"enc_{biw}_{bss}.yak")

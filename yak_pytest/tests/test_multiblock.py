@@ -1,18 +1,18 @@
 """Phase 8: Multi-block stream tests.
 
-Uses small block sizes (block_size_shift=6 -> 64-byte blocks,
-block_index_width=4 -> fan_out=16) to exercise the pyramid block
-linking with small test data.
+Uses small block sizes (block_size_shift=9 -> 512-byte blocks,
+block_index_width=4 -> fan_out=128) to exercise the pyramid block
+linking with manageable test data.
 """
 
 import pytest
 import libyak as yak
 
 
-BLOCK_SHIFT = 6       # 64-byte blocks
+BLOCK_SHIFT = 9       # 512-byte blocks (minimum for superblock)
 BLOCK_SIZE = 1 << BLOCK_SHIFT
 BLOCK_INDEX_WIDTH = 4
-FAN_OUT = BLOCK_SIZE // BLOCK_INDEX_WIDTH  # 16
+FAN_OUT = BLOCK_SIZE // BLOCK_INDEX_WIDTH  # 128
 
 
 class TestMultiBlock:
@@ -28,7 +28,7 @@ class TestMultiBlock:
 
     def test_write_exactly_one_block(self, fs):
         """Write exactly one block of data (depth 0)."""
-        data = bytes(range(256))[:BLOCK_SIZE]  # 64 bytes
+        data = bytes([i & 0xFF for i in range(BLOCK_SIZE)])
         handle = fs.create_stream("data.bin")
         fs.write(handle, data)
         assert fs.stream_length(handle) == BLOCK_SIZE
@@ -49,21 +49,22 @@ class TestMultiBlock:
         fs.close_stream(handle)
 
     def test_write_spanning_multiple_blocks(self, fs):
-        """Write data spanning 4 blocks (depth 1, 200 bytes with 64-byte blocks)."""
-        data = bytes(range(256))[:200]  # 200 bytes -> ceil(200/64) = 4 data blocks
+        """Write data spanning multiple blocks (depth 1)."""
+        size = BLOCK_SIZE * 4  # exactly 4 data blocks
+        data = bytes([i & 0xFF for i in range(size)])
         handle = fs.create_stream("data.bin")
         fs.write(handle, data)
-        assert fs.stream_length(handle) == 200
+        assert fs.stream_length(handle) == size
         fs.seek(handle, 0)
-        result = fs.read(handle, 200)
+        result = fs.read(handle, size)
         assert result == data
         fs.close_stream(handle)
 
     def test_write_requiring_depth_2(self, fs):
         """Write data requiring depth 2 pyramid (>fan_out data blocks).
 
-        fan_out=16, block_size=64 -> depth 1 covers 16*64=1024 bytes.
-        Writing 1025 bytes requires 17 data blocks -> depth 2.
+        Depth 1 covers fan_out * block_size bytes.
+        Writing one more byte requires fan_out+1 data blocks -> depth 2.
         """
         size = FAN_OUT * BLOCK_SIZE + 1  # 1025 bytes
         data = bytes([i & 0xFF for i in range(size)])
@@ -356,15 +357,16 @@ class TestMultiBlockOverwrite:
     def test_write_past_end_extends(self, fs):
         """Seek to middle, write past end to extend the stream."""
         handle = fs.create_stream("data.bin")
-        fs.write(handle, b"A" * BLOCK_SIZE)  # 64 bytes (1 block)
+        fs.write(handle, b"A" * BLOCK_SIZE)  # 1 block
         assert fs.stream_length(handle) == BLOCK_SIZE
 
-        # Seek to byte 32, write 64 bytes (extends to 96 = 2 blocks)
-        fs.seek(handle, 32)
+        half = BLOCK_SIZE // 2
+        # Seek to halfway, write one full block (extends to 1.5 blocks)
+        fs.seek(handle, half)
         fs.write(handle, b"B" * BLOCK_SIZE)
-        assert fs.stream_length(handle) == 32 + BLOCK_SIZE  # = 96
+        assert fs.stream_length(handle) == half + BLOCK_SIZE
 
         fs.seek(handle, 0)
-        result = fs.read(handle, 96)
-        assert result == b"A" * 32 + b"B" * BLOCK_SIZE
+        result = fs.read(handle, half + BLOCK_SIZE)
+        assert result == b"A" * half + b"B" * BLOCK_SIZE
         fs.close_stream(handle)

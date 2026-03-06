@@ -195,17 +195,19 @@ pub trait BlockLayer: Send + Sync {
     /// Get the `HeaderSlotId` for the `index`-th upper layer section.
     ///
     /// Index 0 = first upper section (L3), index 1 = next (L4), etc.
-    /// Implemented as `self.l1.header_slot_for_upper(index + 1)` for the real L2.
+    /// In `BlocksInFile`, slots map to regions within block 0 (the superblock).
     fn header_slot_for_upper(&self, index: u8) -> HeaderSlotId;
 
-    /// Write a header section by slot ID (pass-through to L1).
+    /// Write a header section by slot ID.
     ///
     /// `data` is the section payload: `identifier[6] + version[1] + payload`.
+    /// In `BlocksInFile`, this writes to block 0 (the superblock).
     fn write_header_slot(&self, slot: HeaderSlotId, data: &[u8]) -> Result<(), YakError>;
 
-    /// Read a header section by slot ID (pass-through to L1).
+    /// Read a header section by slot ID.
     ///
-    /// Returns the section payload (without the 2-byte length prefix).
+    /// Returns the section payload.
+    /// In `BlocksInFile`, this reads from the in-memory block 0 cache.
     fn read_header_slot(&self, slot: HeaderSlotId) -> Result<Vec<u8>, YakError>;
 
     /// Clear the calling thread's per-thread block cache.

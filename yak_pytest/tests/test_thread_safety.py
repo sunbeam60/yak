@@ -29,10 +29,10 @@ class TestStreamLifecycleStress:
         All threads share a single "arena" directory, maximising contention
         on the directory stream write-lock (L4 uses open_stream_blocking so
         threads queue up rather than failing).
-        Uses small blocks (64 bytes) to force multi-block growth quickly.
+        Uses small blocks (512 bytes) to force multi-block growth quickly.
         """
         yak_path = str(tmp_path / "lifecycle.yak")
-        f = yak.Yak.create(yak_path, block_index_width=4, block_size_shift=6)
+        f = yak.Yak.create(yak_path, block_index_width=4, block_size_shift=9)
 
         # Single shared directory -- all threads contend on the same
         # directory stream write-lock.
@@ -100,7 +100,7 @@ class TestStreamLifecycleStress:
         Streams stream.
         """
         yak_path = str(tmp_path / "accumulate.yak")
-        f = yak.Yak.create(yak_path, block_index_width=4, block_size_shift=6)
+        f = yak.Yak.create(yak_path, block_index_width=4, block_size_shift=9)
 
         # Each thread gets its own directory
         for i in range(NUM_LIFECYCLE_THREADS):

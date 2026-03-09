@@ -1,8 +1,8 @@
 """Phase 8: Multi-block stream tests.
 
 Uses small block sizes (block_size_shift=9 -> 512-byte blocks,
-block_index_width=4 -> fan_out=128) to exercise the pyramid block
-linking with manageable test data.
+fan_out=128) to exercise the pyramid block linking with manageable
+test data.
 """
 
 import pytest
@@ -11,8 +11,7 @@ import libyak as yak
 
 BLOCK_SHIFT = 9       # 512-byte blocks (minimum for superblock)
 BLOCK_SIZE = 1 << BLOCK_SHIFT
-BLOCK_INDEX_WIDTH = 4
-FAN_OUT = BLOCK_SIZE // BLOCK_INDEX_WIDTH  # 128
+FAN_OUT = BLOCK_SIZE // 4  # 128 (block indices are always 4 bytes)
 
 
 class TestMultiBlock:
@@ -21,8 +20,7 @@ class TestMultiBlock:
     @pytest.fixture
     def fs(self, tmp_path):
         yak_path = str(tmp_path / "test.yak")
-        f = yak.Yak.create(yak_path, block_index_width=BLOCK_INDEX_WIDTH,
-                           block_size_shift=BLOCK_SHIFT)
+        f = yak.Yak.create(yak_path, block_size_shift=BLOCK_SHIFT)
         yield f
         f.close()
 
@@ -156,8 +154,7 @@ class TestMultiBlockTruncate:
     @pytest.fixture
     def fs(self, tmp_path):
         yak_path = str(tmp_path / "test.yak")
-        f = yak.Yak.create(yak_path, block_index_width=BLOCK_INDEX_WIDTH,
-                           block_size_shift=BLOCK_SHIFT)
+        f = yak.Yak.create(yak_path, block_size_shift=BLOCK_SHIFT)
         yield f
         f.close()
 
@@ -241,8 +238,7 @@ class TestMultiBlockPersistence:
         data = bytes([i & 0xFF for i in range(200)])
 
         # Write
-        fs = yak.Yak.create(yak_path, block_index_width=BLOCK_INDEX_WIDTH,
-                            block_size_shift=BLOCK_SHIFT)
+        fs = yak.Yak.create(yak_path, block_size_shift=BLOCK_SHIFT)
         handle = fs.create_stream("data.bin")
         fs.write(handle, data)
         fs.close_stream(handle)
@@ -264,8 +260,7 @@ class TestMultiBlockPersistence:
         data = bytes([i & 0xFF for i in range(size)])
 
         # Write
-        fs = yak.Yak.create(yak_path, block_index_width=BLOCK_INDEX_WIDTH,
-                            block_size_shift=BLOCK_SHIFT)
+        fs = yak.Yak.create(yak_path, block_size_shift=BLOCK_SHIFT)
         handle = fs.create_stream("big.bin")
         fs.write(handle, data)
         fs.close_stream(handle)
@@ -286,8 +281,7 @@ class TestMultiBlockPersistence:
         data_b = b"B" * 200
 
         # Write two streams
-        fs = yak.Yak.create(yak_path, block_index_width=BLOCK_INDEX_WIDTH,
-                            block_size_shift=BLOCK_SHIFT)
+        fs = yak.Yak.create(yak_path, block_size_shift=BLOCK_SHIFT)
         h1 = fs.create_stream("a.bin")
         fs.write(h1, data_a)
         fs.close_stream(h1)
@@ -313,8 +307,7 @@ class TestMultiBlockOverwrite:
     @pytest.fixture
     def fs(self, tmp_path):
         yak_path = str(tmp_path / "test.yak")
-        f = yak.Yak.create(yak_path, block_index_width=BLOCK_INDEX_WIDTH,
-                           block_size_shift=BLOCK_SHIFT)
+        f = yak.Yak.create(yak_path, block_size_shift=BLOCK_SHIFT)
         yield f
         f.close()
 

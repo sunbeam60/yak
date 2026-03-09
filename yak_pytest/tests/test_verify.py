@@ -67,11 +67,11 @@ class TestVerifyClean:
         f.close()
         assert issues == [], f"Expected no issues, got: {issues}"
 
-    @pytest.mark.parametrize("biw,bss", [(2, 9), (4, 9), (4, 12), (2, 12)])
-    def test_varying_block_params(self, tmp_path, biw, bss):
-        """Verify works with different biw and bss values."""
-        yak_path = str(tmp_path / f"test_{biw}_{bss}.yak")
-        f = yak.Yak.create(yak_path, block_index_width=biw, block_size_shift=bss)
+    @pytest.mark.parametrize("bss", [9, 12])
+    def test_varying_block_params(self, tmp_path, bss):
+        """Verify works with different bss values."""
+        yak_path = str(tmp_path / f"test_{bss}.yak")
+        f = yak.Yak.create(yak_path, block_size_shift=bss)
         sh = f.create_stream("data.bin")
         f.write(sh, b"X" * 500)
         f.close_stream(sh)
@@ -97,8 +97,8 @@ class TestVerifyClean:
     def test_multiblock_streams(self, tmp_path):
         """Verify works with streams spanning many blocks (pyramid depth > 0)."""
         yak_path = str(tmp_path / "test.yak")
-        # bss=9 -> 512-byte blocks, biw=4 -> fan_out=128
-        f = yak.Yak.create(yak_path, block_index_width=4, block_size_shift=9)
+        # bss=9 -> 512-byte blocks, fan_out=128
+        f = yak.Yak.create(yak_path, block_size_shift=9)
         sh = f.create_stream("big.bin")
         # 2000 bytes -> ~32 data blocks -> pyramid depth 2
         f.write(sh, b"X" * 2000)
@@ -140,7 +140,7 @@ class TestVerifyCorruption:
         """A free list that cycles is detected."""
         yak_path = str(tmp_path / "test.yak")
         # Use small blocks to make corruption easier to set up
-        f = yak.Yak.create(yak_path, block_index_width=4, block_size_shift=9)
+        f = yak.Yak.create(yak_path, block_size_shift=9)
         # Create and delete a stream to put blocks on the free list
         sh = f.create_stream("temp.txt")
         f.write(sh, b"X" * 2000)  # multiple blocks
@@ -148,10 +148,10 @@ class TestVerifyCorruption:
         f.delete_stream("temp.txt")
         f.close()
 
-        # New format: bootstrap header is magic(12) + bss(1) + biw(1) + encrypted(1) = 15
+        # New format: bootstrap header is magic(12) + bss(1) + encrypted(1)
         # Block 0 (superblock) starts at data_offset.
-        # Block 0 layout: "blk0"(4) + version(1) + free_list_head(8) + ...
-        # So free_list_head is at data_offset + 5.
+        # Block 0 layout: "blk0"(4) + version(1) + free_list_head(4) + slot_count(1)
+        # So free_list_head is at data_offset + 5, 4 bytes LE (u32).
         block_size = 1 << 9  # bss=9 -> 512 bytes
 
         with open(yak_path, "r+b") as raw:
@@ -159,18 +159,18 @@ class TestVerifyCorruption:
             raw.seek(10)
             data_offset = struct.unpack("<H", raw.read(2))[0]
 
-            # Read free_list_head from block 0
+            # Read free_list_head from block 0 (u32, 4 bytes)
             free_list_offset = data_offset + 5
             raw.seek(free_list_offset)
-            free_head_bytes = raw.read(8)
-            free_head = struct.unpack("<Q", free_head_bytes)[0]
+            free_head_bytes = raw.read(4)
+            free_head = struct.unpack("<I", free_head_bytes)[0]
 
-            if free_head != 0xFFFFFFFF:  # sentinel for biw=4
+            if free_head != 0xFFFFFFFF:  # sentinel for u32 block indices
                 # Make the first free block point to itself (cycle)
                 block_offset = data_offset + free_head * block_size
                 # Write the block's own ID as its next pointer (cycle!)
                 raw.seek(block_offset)
-                raw.write(struct.pack("<I", free_head))  # biw=4 -> 4 bytes
+                raw.write(struct.pack("<I", free_head))  # 4-byte block index
 
         f = yak.Yak.open(yak_path, yak.OpenMode.READ)
         issues = f.verify()

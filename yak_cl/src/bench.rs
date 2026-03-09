@@ -6,7 +6,7 @@ use std::time::Instant;
 use yak::{CreateOptions, OpenMode, StreamHandle, YakDefault as Yak};
 
 use crate::error::{CliError, CliResult};
-use crate::helpers::{DEFAULT_BLOCK_INDEX_WIDTH, DEFAULT_BLOCK_SIZE_SHIFT};
+use crate::helpers::DEFAULT_BLOCK_SIZE_SHIFT;
 
 const BENCH_FILE: &str = "_bench.yak";
 const DEFAULT_THREADS: usize = 4;
@@ -46,7 +46,6 @@ const DEFAULT_CBSS: u8 = 15;
 struct BenchArgs {
     scenario: String,
     bss: u8,
-    biw: u8,
     cbss: u8,
     threads: usize,
     cases: String,
@@ -60,7 +59,6 @@ fn parse_bench_args(args: &[String]) -> Result<BenchArgs, CliError> {
 
     let scenario = args[0].clone();
     let mut bss = DEFAULT_BLOCK_SIZE_SHIFT;
-    let mut biw = DEFAULT_BLOCK_INDEX_WIDTH;
     let mut cbss = DEFAULT_CBSS;
     let mut threads = DEFAULT_THREADS;
     let mut cases = String::from("necb");
@@ -74,13 +72,6 @@ fn parse_bench_args(args: &[String]) -> Result<BenchArgs, CliError> {
                     .get(i)
                     .and_then(|s| s.parse().ok())
                     .ok_or_else(|| CliError::new("--block-shift requires a numeric argument"))?;
-            }
-            "--index-width" => {
-                i += 1;
-                biw = args
-                    .get(i)
-                    .and_then(|s| s.parse().ok())
-                    .ok_or_else(|| CliError::new("--index-width requires a numeric argument"))?;
             }
             "--cbss" => {
                 i += 1;
@@ -125,7 +116,6 @@ fn parse_bench_args(args: &[String]) -> Result<BenchArgs, CliError> {
     Ok(BenchArgs {
         scenario,
         bss,
-        biw,
         cbss,
         threads,
         cases,
@@ -134,7 +124,7 @@ fn parse_bench_args(args: &[String]) -> Result<BenchArgs, CliError> {
 
 fn print_bench_usage() {
     eprintln!(
-        "Usage: yak bench <scenario> [--block-shift N] [--index-width N] [--cbss N] [--threads N] [--case CASES]"
+        "Usage: yak bench <scenario> [--block-shift N] [--cbss N] [--threads N] [--case CASES]"
     );
     eprintln!();
     eprintln!("Each scenario runs once per selected case (default: all four).");
@@ -159,8 +149,6 @@ fn print_bench_usage() {
     eprintln!("Options:");
     eprintln!("  --block-shift N  Block size as power of 2 (default: 12 = 4KB blocks)");
     eprintln!("                   Examples: 10 = 1KB, 12 = 4KB, 16 = 64KB");
-    eprintln!("  --index-width N  Block index size (default: 4 = 4B index / 32 bits)");
-    eprintln!("                   Examples: 2 = 2B index, 4 = 4B index, 8 = 8B index");
     eprintln!(
         "  --cbss N         Compressed block size shift for compression (default: 15 = 32KB)"
     );
@@ -181,45 +169,33 @@ pub fn cmd_bench(args: &[String]) -> CliResult {
 
     let c = &a.cases;
     match a.scenario.as_str() {
-        "large-write" => {
-            run_quad(a.cbss, c, |v, pw| run_large_write(a.bss, a.biw, v, pw)).map(|_| ())
-        }
-        "small-write" => {
-            run_quad(a.cbss, c, |v, pw| run_small_write(a.bss, a.biw, v, pw)).map(|_| ())
-        }
-        "large-read" => {
-            run_quad(a.cbss, c, |v, pw| run_large_read(a.bss, a.biw, v, pw)).map(|_| ())
-        }
-        "small-read" => {
-            run_quad(a.cbss, c, |v, pw| run_small_read(a.bss, a.biw, v, pw)).map(|_| ())
-        }
+        "large-write" => run_quad(a.cbss, c, |v, pw| run_large_write(a.bss, v, pw)).map(|_| ()),
+        "small-write" => run_quad(a.cbss, c, |v, pw| run_small_write(a.bss, v, pw)).map(|_| ()),
+        "large-read" => run_quad(a.cbss, c, |v, pw| run_large_read(a.bss, v, pw)).map(|_| ()),
+        "small-read" => run_quad(a.cbss, c, |v, pw| run_small_read(a.bss, v, pw)).map(|_| ()),
         "threaded-write" => run_quad(a.cbss, c, |v, pw| {
-            run_threaded_write(a.bss, a.biw, v, pw, a.threads)
+            run_threaded_write(a.bss, v, pw, a.threads)
         })
         .map(|_| ()),
         "threaded-read" => run_quad(a.cbss, c, |v, pw| {
-            run_threaded_read(a.bss, a.biw, v, pw, a.threads)
+            run_threaded_read(a.bss, v, pw, a.threads)
         })
         .map(|_| ()),
         "threaded-mixed" => run_quad(a.cbss, c, |v, pw| {
-            run_threaded_mixed(a.bss, a.biw, v, pw, a.threads)
+            run_threaded_mixed(a.bss, v, pw, a.threads)
         })
         .map(|_| ()),
-        "churn" => run_quad(a.cbss, c, |v, pw| run_churn(a.bss, a.biw, v, pw)).map(|_| ()),
-        "reuse" => run_quad(a.cbss, c, |v, pw| run_reuse(a.bss, a.biw, v, pw)).map(|_| ()),
-        "single-stream" => {
-            run_quad(a.cbss, c, |v, pw| run_single_stream(a.bss, a.biw, v, pw)).map(|_| ())
-        }
-        "warm-read" => run_quad(a.cbss, c, |v, pw| run_warm_read(a.bss, a.biw, v, pw)).map(|_| ()),
-        "overwrite" => run_quad(a.cbss, c, |v, pw| run_overwrite(a.bss, a.biw, v, pw)).map(|_| ()),
-        "dir-lookup" => {
-            run_quad(a.cbss, c, |v, pw| run_dir_lookup(a.bss, a.biw, v, pw)).map(|_| ())
-        }
+        "churn" => run_quad(a.cbss, c, |v, pw| run_churn(a.bss, v, pw)).map(|_| ()),
+        "reuse" => run_quad(a.cbss, c, |v, pw| run_reuse(a.bss, v, pw)).map(|_| ()),
+        "single-stream" => run_quad(a.cbss, c, |v, pw| run_single_stream(a.bss, v, pw)).map(|_| ()),
+        "warm-read" => run_quad(a.cbss, c, |v, pw| run_warm_read(a.bss, v, pw)).map(|_| ()),
+        "overwrite" => run_quad(a.cbss, c, |v, pw| run_overwrite(a.bss, v, pw)).map(|_| ()),
+        "dir-lookup" => run_quad(a.cbss, c, |v, pw| run_dir_lookup(a.bss, v, pw)).map(|_| ()),
         "cache-pressure" => run_quad(a.cbss, c, |v, pw| {
-            run_cache_pressure(a.bss, a.biw, v, pw, a.threads)
+            run_cache_pressure(a.bss, v, pw, a.threads)
         })
         .map(|_| ()),
-        "all" => run_all(a.bss, a.biw, a.cbss, a.threads, c),
+        "all" => run_all(a.bss, a.cbss, a.threads, c),
         other => {
             print_bench_usage();
             Err(CliError::new(format!("Unknown bench scenario: {}", other)))
@@ -244,7 +220,6 @@ fn err(e: impl std::fmt::Display) -> CliError {
 /// creation succeeds, but `create_bench_stream` won't create compressed streams.
 fn create_bench_yak(
     path: &str,
-    biw: u8,
     bss: u8,
     cbss: u8,
     password: Option<&[u8]>,
@@ -253,7 +228,6 @@ fn create_bench_yak(
     Yak::create(
         path,
         CreateOptions {
-            block_index_width: biw,
             block_size_shift: bss,
             compressed_block_size_shift: effective_cbss,
             password,
@@ -330,9 +304,9 @@ fn run_quad(
 // ---------------------------------------------------------------------------
 
 /// Write 5 streams of 30MB each.
-fn run_large_write(bss: u8, biw: u8, cbss: u8, password: Option<&[u8]>) -> Result<f64, CliError> {
+fn run_large_write(bss: u8, cbss: u8, password: Option<&[u8]>) -> Result<f64, CliError> {
     let _guard = CleanupGuard { path: BENCH_FILE };
-    let sfs = create_bench_yak(BENCH_FILE, biw, bss, cbss, password)?;
+    let sfs = create_bench_yak(BENCH_FILE, bss, cbss, password)?;
     let buf = make_buffer(30 * 1024 * 1024);
 
     let t0 = Instant::now();
@@ -350,9 +324,9 @@ fn run_large_write(bss: u8, biw: u8, cbss: u8, password: Option<&[u8]>) -> Resul
 }
 
 /// Write 180 streams of 10KB each.
-fn run_small_write(bss: u8, biw: u8, cbss: u8, password: Option<&[u8]>) -> Result<f64, CliError> {
+fn run_small_write(bss: u8, cbss: u8, password: Option<&[u8]>) -> Result<f64, CliError> {
     let _guard = CleanupGuard { path: BENCH_FILE };
-    let sfs = create_bench_yak(BENCH_FILE, biw, bss, cbss, password)?;
+    let sfs = create_bench_yak(BENCH_FILE, bss, cbss, password)?;
     let buf = make_buffer(10 * 1024);
 
     let t0 = Instant::now();
@@ -372,13 +346,12 @@ fn run_small_write(bss: u8, biw: u8, cbss: u8, password: Option<&[u8]>) -> Resul
 /// T threads, each writing a partition of 125 streams (100KB each).
 fn run_threaded_write(
     bss: u8,
-    biw: u8,
     cbss: u8,
     password: Option<&[u8]>,
     threads: usize,
 ) -> Result<f64, CliError> {
     let _guard = CleanupGuard { path: BENCH_FILE };
-    let sfs = Arc::new(create_bench_yak(BENCH_FILE, biw, bss, cbss, password)?);
+    let sfs = Arc::new(create_bench_yak(BENCH_FILE, bss, cbss, password)?);
     let buf = Arc::new(make_buffer(100 * 1024));
 
     let total_streams = 125usize;
@@ -436,7 +409,6 @@ fn run_threaded_write(
 /// Populate streams, then T threads each read all streams.
 fn run_threaded_read(
     bss: u8,
-    biw: u8,
     cbss: u8,
     password: Option<&[u8]>,
     threads: usize,
@@ -448,7 +420,7 @@ fn run_threaded_read(
 
     // Phase 1: populate (single-threaded)
     {
-        let sfs = create_bench_yak(BENCH_FILE, biw, bss, cbss, password)?;
+        let sfs = create_bench_yak(BENCH_FILE, bss, cbss, password)?;
         let buf = make_buffer(stream_size);
         for i in 0..stream_count {
             let name = format!("stream_{:04}.bin", i);
@@ -509,7 +481,7 @@ fn run_threaded_read(
 }
 
 /// Populate 17x10MB + 17x20MB streams, then read them all back (510MB total).
-fn run_large_read(bss: u8, biw: u8, cbss: u8, password: Option<&[u8]>) -> Result<f64, CliError> {
+fn run_large_read(bss: u8, cbss: u8, password: Option<&[u8]>) -> Result<f64, CliError> {
     let _guard = CleanupGuard { path: BENCH_FILE };
 
     let size_10mb = 10 * 1024 * 1024usize;
@@ -518,7 +490,7 @@ fn run_large_read(bss: u8, biw: u8, cbss: u8, password: Option<&[u8]>) -> Result
 
     // Phase 1: populate
     {
-        let sfs = create_bench_yak(BENCH_FILE, biw, bss, cbss, password)?;
+        let sfs = create_bench_yak(BENCH_FILE, bss, cbss, password)?;
 
         let buf_10 = make_buffer(size_10mb);
         for i in 0..streams_per_tier {
@@ -568,7 +540,7 @@ fn run_large_read(bss: u8, biw: u8, cbss: u8, password: Option<&[u8]>) -> Result
 }
 
 /// Populate 2750 streams of 10KB, then read them all back.
-fn run_small_read(bss: u8, biw: u8, cbss: u8, password: Option<&[u8]>) -> Result<f64, CliError> {
+fn run_small_read(bss: u8, cbss: u8, password: Option<&[u8]>) -> Result<f64, CliError> {
     let _guard = CleanupGuard { path: BENCH_FILE };
 
     let stream_count = 2750usize;
@@ -576,7 +548,7 @@ fn run_small_read(bss: u8, biw: u8, cbss: u8, password: Option<&[u8]>) -> Result
 
     // Phase 1: populate
     {
-        let sfs = create_bench_yak(BENCH_FILE, biw, bss, cbss, password)?;
+        let sfs = create_bench_yak(BENCH_FILE, bss, cbss, password)?;
         let buf = make_buffer(stream_size);
         for i in 0..stream_count {
             let name = format!("stream_{:04}.bin", i);
@@ -607,9 +579,9 @@ fn run_small_read(bss: u8, biw: u8, cbss: u8, password: Option<&[u8]>) -> Result
 }
 
 /// Write 20 streams of 512KB then delete them all, repeated 5 times.
-fn run_churn(bss: u8, biw: u8, cbss: u8, password: Option<&[u8]>) -> Result<f64, CliError> {
+fn run_churn(bss: u8, cbss: u8, password: Option<&[u8]>) -> Result<f64, CliError> {
     let _guard = CleanupGuard { path: BENCH_FILE };
-    let sfs = create_bench_yak(BENCH_FILE, biw, bss, cbss, password)?;
+    let sfs = create_bench_yak(BENCH_FILE, bss, cbss, password)?;
     let buf = make_buffer(512 * 1024);
     let n = 20usize;
 
@@ -638,9 +610,9 @@ fn run_churn(bss: u8, biw: u8, cbss: u8, password: Option<&[u8]>) -> Result<f64,
 
 /// Write streams, read them (baseline), delete all, re-write into recycled
 /// blocks, then read again. Compares "fresh" vs "reused-block" read throughput.
-fn run_reuse(bss: u8, biw: u8, cbss: u8, password: Option<&[u8]>) -> Result<f64, CliError> {
+fn run_reuse(bss: u8, cbss: u8, password: Option<&[u8]>) -> Result<f64, CliError> {
     let _guard = CleanupGuard { path: BENCH_FILE };
-    let sfs = create_bench_yak(BENCH_FILE, biw, bss, cbss, password)?;
+    let sfs = create_bench_yak(BENCH_FILE, bss, cbss, password)?;
     let stream_size = 512 * 1024usize;
     let n = 50usize;
     let buf = make_buffer(stream_size);
@@ -708,7 +680,6 @@ fn run_reuse(bss: u8, biw: u8, cbss: u8, password: Option<&[u8]>) -> Result<f64,
 /// Populate 60 streams, then T/2 threads read while T/2 threads write concurrently.
 fn run_threaded_mixed(
     bss: u8,
-    biw: u8,
     cbss: u8,
     password: Option<&[u8]>,
     threads: usize,
@@ -721,7 +692,7 @@ fn run_threaded_mixed(
 
     // Phase 1: populate streams for readers (single-threaded)
     {
-        let sfs = create_bench_yak(BENCH_FILE, biw, bss, cbss, password)?;
+        let sfs = create_bench_yak(BENCH_FILE, bss, cbss, password)?;
         let buf = make_buffer(stream_size);
         for i in 0..stream_count {
             let name = format!("read_{:04}.bin", i);
@@ -809,14 +780,14 @@ fn run_threaded_mixed(
 
 /// Write one large stream then read it back. Times write and read separately.
 /// Designed to measure contiguous block I/O performance.
-fn run_single_stream(bss: u8, biw: u8, cbss: u8, password: Option<&[u8]>) -> Result<f64, CliError> {
+fn run_single_stream(bss: u8, cbss: u8, password: Option<&[u8]>) -> Result<f64, CliError> {
     let _guard = CleanupGuard { path: BENCH_FILE };
 
     let stream_size = 64 * 1024 * 1024usize; // 64 MB
     let buf = make_buffer(stream_size);
 
     // Phase 1: write
-    let sfs = create_bench_yak(BENCH_FILE, biw, bss, cbss, password)?;
+    let sfs = create_bench_yak(BENCH_FILE, bss, cbss, password)?;
     let handle = create_bench_stream(&sfs, "big.bin", cbss)?;
 
     let t_write = Instant::now();
@@ -857,13 +828,13 @@ fn run_single_stream(bss: u8, biw: u8, cbss: u8, password: Option<&[u8]>) -> Res
 
 /// Write 2750 streams of 10KB, then read them all back using the same Yak instance.
 /// This tests the benefit of warm block caches across many open/read/close cycles.
-fn run_warm_read(bss: u8, biw: u8, cbss: u8, password: Option<&[u8]>) -> Result<f64, CliError> {
+fn run_warm_read(bss: u8, cbss: u8, password: Option<&[u8]>) -> Result<f64, CliError> {
     let _guard = CleanupGuard { path: BENCH_FILE };
 
     let stream_count = 2750usize;
     let stream_size = 10 * 1024usize;
 
-    let sfs = create_bench_yak(BENCH_FILE, biw, bss, cbss, password)?;
+    let sfs = create_bench_yak(BENCH_FILE, bss, cbss, password)?;
     let buf = make_buffer(stream_size);
 
     // Phase 1: populate (not timed)
@@ -895,14 +866,14 @@ fn run_warm_read(bss: u8, biw: u8, cbss: u8, password: Option<&[u8]>) -> Result<
 /// Stresses the compress/decompress cycle for compressed streams, since every
 /// overwrite requires decompressing a compressed block, modifying it, and
 /// recompressing.
-fn run_overwrite(bss: u8, biw: u8, cbss: u8, password: Option<&[u8]>) -> Result<f64, CliError> {
+fn run_overwrite(bss: u8, cbss: u8, password: Option<&[u8]>) -> Result<f64, CliError> {
     let _guard = CleanupGuard { path: BENCH_FILE };
 
     let stream_size = 10 * 1024 * 1024usize; // 10 MB
     let write_count = 5000usize;
     let write_size = 4 * 1024usize; // 4 KB per overwrite
 
-    let sfs = create_bench_yak(BENCH_FILE, biw, bss, cbss, password)?;
+    let sfs = create_bench_yak(BENCH_FILE, bss, cbss, password)?;
     let initial_buf = make_buffer(stream_size);
     let write_buf = make_buffer(write_size);
 
@@ -937,14 +908,14 @@ fn run_overwrite(bss: u8, biw: u8, cbss: u8, password: Option<&[u8]>) -> Result<
 
 /// Create 10,000 streams in one directory, then time opening 1,000 by name.
 /// Measures directory name-lookup performance (linear scan cost).
-fn run_dir_lookup(bss: u8, biw: u8, cbss: u8, password: Option<&[u8]>) -> Result<f64, CliError> {
+fn run_dir_lookup(bss: u8, cbss: u8, password: Option<&[u8]>) -> Result<f64, CliError> {
     let _guard = CleanupGuard { path: BENCH_FILE };
 
     let total_entries = 4_000usize;
     let lookups = 4_000usize;
 
     // Phase 1: populate directory with 10,000 empty streams (not timed)
-    let sfs = create_bench_yak(BENCH_FILE, biw, bss, cbss, password)?;
+    let sfs = create_bench_yak(BENCH_FILE, bss, cbss, password)?;
     for i in 0..total_entries {
         let name = format!("entry_{:05}.dat", i);
         let handle = create_bench_stream(&sfs, &name, cbss)?;
@@ -994,7 +965,6 @@ fn run_dir_lookup(bss: u8, biw: u8, cbss: u8, password: Option<&[u8]>) -> Result
 /// same benchmark should run faster.
 fn run_cache_pressure(
     bss: u8,
-    biw: u8,
     cbss: u8,
     password: Option<&[u8]>,
     threads: usize,
@@ -1002,7 +972,7 @@ fn run_cache_pressure(
     let _guard = CleanupGuard { path: BENCH_FILE };
 
     // 10 large streams, each 8MB — deep enough for a multi-level pyramid
-    // at default params (biw=4, bss=12 → fan-out 1024, depth 2 at 2048 blocks)
+    // at default params (bss=12 → fan-out 1024, depth 2 at 2048 blocks)
     const LARGE_STREAMS: usize = 10;
     const STREAM_SIZE: usize = 8 * 1024 * 1024;
 
@@ -1019,7 +989,7 @@ fn run_cache_pressure(
 
     // Phase 1: populate large streams (not timed)
     {
-        let sfs = create_bench_yak(BENCH_FILE, biw, bss, cbss, password)?;
+        let sfs = create_bench_yak(BENCH_FILE, bss, cbss, password)?;
         let buf = make_buffer(STREAM_SIZE);
         for i in 0..LARGE_STREAMS {
             let name = format!("large_{:04}.bin", i);
@@ -1160,7 +1130,7 @@ macro_rules! bench_scenario {
 }
 
 /// Run all scenarios in sequence and print aggregate totals.
-fn run_all(bss: u8, biw: u8, cbss: u8, threads: usize, cases: &str) -> CliResult {
+fn run_all(bss: u8, cbss: u8, threads: usize, cases: &str) -> CliResult {
     let mut total_normal = 0.0f64;
     let mut total_comp = 0.0f64;
     let mut total_enc = 0.0f64;
@@ -1174,7 +1144,7 @@ fn run_all(bss: u8, biw: u8, cbss: u8, threads: usize, cases: &str) -> CliResult
         total_comp_enc,
         cbss,
         cases,
-        |v, pw| { run_large_write(bss, biw, v, pw) }
+        |v, pw| { run_large_write(bss, v, pw) }
     );
     bench_scenario!(
         "small-write",
@@ -1184,7 +1154,7 @@ fn run_all(bss: u8, biw: u8, cbss: u8, threads: usize, cases: &str) -> CliResult
         total_comp_enc,
         cbss,
         cases,
-        |v, pw| { run_small_write(bss, biw, v, pw) }
+        |v, pw| { run_small_write(bss, v, pw) }
     );
     bench_scenario!(
         "large-read",
@@ -1194,7 +1164,7 @@ fn run_all(bss: u8, biw: u8, cbss: u8, threads: usize, cases: &str) -> CliResult
         total_comp_enc,
         cbss,
         cases,
-        |v, pw| { run_large_read(bss, biw, v, pw) }
+        |v, pw| { run_large_read(bss, v, pw) }
     );
     bench_scenario!(
         "small-read",
@@ -1204,7 +1174,7 @@ fn run_all(bss: u8, biw: u8, cbss: u8, threads: usize, cases: &str) -> CliResult
         total_comp_enc,
         cbss,
         cases,
-        |v, pw| { run_small_read(bss, biw, v, pw) }
+        |v, pw| { run_small_read(bss, v, pw) }
     );
     bench_scenario!(
         "threaded-write",
@@ -1214,7 +1184,7 @@ fn run_all(bss: u8, biw: u8, cbss: u8, threads: usize, cases: &str) -> CliResult
         total_comp_enc,
         cbss,
         cases,
-        |v, pw| { run_threaded_write(bss, biw, v, pw, threads) }
+        |v, pw| { run_threaded_write(bss, v, pw, threads) }
     );
     bench_scenario!(
         "threaded-read",
@@ -1224,7 +1194,7 @@ fn run_all(bss: u8, biw: u8, cbss: u8, threads: usize, cases: &str) -> CliResult
         total_comp_enc,
         cbss,
         cases,
-        |v, pw| { run_threaded_read(bss, biw, v, pw, threads) }
+        |v, pw| { run_threaded_read(bss, v, pw, threads) }
     );
     bench_scenario!(
         "threaded-mixed",
@@ -1234,7 +1204,7 @@ fn run_all(bss: u8, biw: u8, cbss: u8, threads: usize, cases: &str) -> CliResult
         total_comp_enc,
         cbss,
         cases,
-        |v, pw| { run_threaded_mixed(bss, biw, v, pw, threads) }
+        |v, pw| { run_threaded_mixed(bss, v, pw, threads) }
     );
     bench_scenario!(
         "churn",
@@ -1244,7 +1214,7 @@ fn run_all(bss: u8, biw: u8, cbss: u8, threads: usize, cases: &str) -> CliResult
         total_comp_enc,
         cbss,
         cases,
-        |v, pw| { run_churn(bss, biw, v, pw) }
+        |v, pw| { run_churn(bss, v, pw) }
     );
     bench_scenario!(
         "reuse",
@@ -1254,7 +1224,7 @@ fn run_all(bss: u8, biw: u8, cbss: u8, threads: usize, cases: &str) -> CliResult
         total_comp_enc,
         cbss,
         cases,
-        |v, pw| { run_reuse(bss, biw, v, pw) }
+        |v, pw| { run_reuse(bss, v, pw) }
     );
     bench_scenario!(
         "single-stream",
@@ -1264,7 +1234,7 @@ fn run_all(bss: u8, biw: u8, cbss: u8, threads: usize, cases: &str) -> CliResult
         total_comp_enc,
         cbss,
         cases,
-        |v, pw| { run_single_stream(bss, biw, v, pw) }
+        |v, pw| { run_single_stream(bss, v, pw) }
     );
     bench_scenario!(
         "warm-read",
@@ -1274,7 +1244,7 @@ fn run_all(bss: u8, biw: u8, cbss: u8, threads: usize, cases: &str) -> CliResult
         total_comp_enc,
         cbss,
         cases,
-        |v, pw| { run_warm_read(bss, biw, v, pw) }
+        |v, pw| { run_warm_read(bss, v, pw) }
     );
     bench_scenario!(
         "overwrite",
@@ -1284,7 +1254,7 @@ fn run_all(bss: u8, biw: u8, cbss: u8, threads: usize, cases: &str) -> CliResult
         total_comp_enc,
         cbss,
         cases,
-        |v, pw| { run_overwrite(bss, biw, v, pw) }
+        |v, pw| { run_overwrite(bss, v, pw) }
     );
     bench_scenario!(
         "dir-lookup",
@@ -1294,7 +1264,7 @@ fn run_all(bss: u8, biw: u8, cbss: u8, threads: usize, cases: &str) -> CliResult
         total_comp_enc,
         cbss,
         cases,
-        |v, pw| { run_dir_lookup(bss, biw, v, pw) }
+        |v, pw| { run_dir_lookup(bss, v, pw) }
     );
     bench_scenario!(
         "cache-pressure",
@@ -1304,7 +1274,7 @@ fn run_all(bss: u8, biw: u8, cbss: u8, threads: usize, cases: &str) -> CliResult
         total_comp_enc,
         cbss,
         cases,
-        |v, pw| { run_cache_pressure(bss, biw, v, pw, threads) }
+        |v, pw| { run_cache_pressure(bss, v, pw, threads) }
     );
 
     // Build summary line showing only the cases that were run

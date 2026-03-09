@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use crate::{HeaderSlotId, OpenMode, YakError};
+use crate::{AdminSlotId, OpenMode, YakError};
 
 /// Controls which cache layer a block read/write should use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,32 +13,33 @@ pub enum CacheMode {
     Shared,
 }
 
+/// Block indices are always 4 bytes (u32) on disk and in memory.
+/// Maximum addressable blocks: 2^32 - 1 (sentinel reserved).
+/// Max file size depends on block size: 1KB→4TB, 4KB→16TB, 32KB→128TB.
+pub const BLOCK_INDEX_SENTINEL: u32 = u32::MAX;
+
 /// L2 trait: Block storage abstraction.
 ///
 /// Provides numbered fixed-size block management to L3. L2 implementations
-/// handle block allocation, deallocation, reading, writing, and header
+/// handle block allocation, deallocation, reading, writing, and admin slot
 /// storage.
 ///
 /// All methods take `&self` (not `&mut self`) so that a single L2 instance
 /// can be safely shared across threads. Implementations use interior
 /// mutability (e.g. `Mutex`) to protect bookkeeping state.
 ///
-/// `block_size_shift` is the power-of-2 exponent for block size.
-/// `block_index_width` is the number of bytes used for block indices on disk.
+/// Block indices are always `u32`. Byte sizes and offsets are `u64`.
 pub trait BlockLayer: Send + Sync {
     /// Create a new L2 storage at the given path.
     ///
     /// `block_size_shift` is the power-of-2 exponent for block size
     /// (e.g. 12 -> 4096 bytes).
-    /// `block_index_width` is the number of bytes used for block indices
-    /// on disk (e.g. 2, 4, or 8).
     /// `slot_sizes` accumulates payload sizes (NOT including the
     /// 2-byte length prefix) as they flow down through the layer chain.
     /// L2 push_front's its own payload size and passes the deque down to L1.
     fn create(
         path: &str,
         block_size_shift: u8,
-        block_index_width: u8,
         slot_sizes: VecDeque<u16>,
         password: Option<&[u8]>,
     ) -> Result<Self, YakError>
@@ -63,20 +64,16 @@ pub trait BlockLayer: Send + Sync {
     /// Block size as a power of 2 (e.g. 12 -> 4096 bytes).
     fn block_size_shift(&self) -> u8;
 
-    /// The number of bytes used for block indices on disk.
-    fn block_index_width(&self) -> u8;
-
     /// Allocate a new block. Returns the block index.
     /// The block contents are zeroed.
-    /// Fails if the next block index would exceed the maximum representable
-    /// value for `block_index_width` (see Index Overflow Protection).
-    fn allocate_block(&self) -> Result<u64, YakError>;
+    /// Fails if the next block index would exceed `BLOCK_INDEX_SENTINEL`.
+    fn allocate_block(&self) -> Result<u32, YakError>;
 
     /// Allocate multiple blocks at once. Returns a vector of block indices.
     /// All block contents are zeroed. The default implementation calls
     /// `allocate_block` in a loop; implementations may override to batch
     /// file growth and header persistence for better performance.
-    fn allocate_blocks(&self, count: u64) -> Result<Vec<u64>, YakError> {
+    fn allocate_blocks(&self, count: u32) -> Result<Vec<u32>, YakError> {
         let mut result = Vec::with_capacity(count as usize);
         for _ in 0..count {
             result.push(self.allocate_block()?);
@@ -85,13 +82,13 @@ pub trait BlockLayer: Send + Sync {
     }
 
     /// Deallocate a block, returning it for future reuse.
-    fn deallocate_block(&self, index: u64) -> Result<(), YakError>;
+    fn deallocate_block(&self, index: u32) -> Result<(), YakError>;
 
     /// Deallocate multiple blocks at once, returning them for future reuse.
     /// The default implementation calls `deallocate_block` in a loop.
     /// `BlocksInFile` overrides this to sort indices and write the free-list
     /// chain in block order with a single header persist.
-    fn deallocate_blocks(&self, indices: &mut Vec<u64>) -> Result<(), YakError> {
+    fn deallocate_blocks(&self, indices: &mut Vec<u32>) -> Result<(), YakError> {
         for &index in indices.iter() {
             self.deallocate_block(index)?;
         }
@@ -104,7 +101,7 @@ pub trait BlockLayer: Send + Sync {
     /// Returns the number of bytes actually read.
     fn read_block(
         &self,
-        index: u64,
+        index: u32,
         offset: usize,
         buf: &mut [u8],
         cache: CacheMode,
@@ -116,7 +113,7 @@ pub trait BlockLayer: Send + Sync {
     /// Returns the number of bytes actually written.
     fn write_block(
         &self,
-        index: u64,
+        index: u32,
         offset: usize,
         buf: &[u8],
         cache: CacheMode,
@@ -134,7 +131,7 @@ pub trait BlockLayer: Send + Sync {
     /// `BlocksInFile` overrides this with a single L1 read.
     fn read_contiguous_blocks(
         &self,
-        start_index: u64,
+        start_index: u32,
         offset: usize,
         buf: &mut [u8],
     ) -> Result<usize, YakError> {
@@ -169,7 +166,7 @@ pub trait BlockLayer: Send + Sync {
     /// `BlocksInFile` overrides this with a single L1 write.
     fn write_contiguous_blocks(
         &self,
-        start_index: u64,
+        start_index: u32,
         offset: usize,
         buf: &[u8],
     ) -> Result<usize, YakError> {
@@ -192,23 +189,23 @@ pub trait BlockLayer: Send + Sync {
         Ok(bytes_written)
     }
 
-    /// Get the `HeaderSlotId` for the `index`-th upper layer section.
+    /// Get the `AdminSlotId` for the `index`-th upper layer's admin data.
     ///
-    /// Index 0 = first upper section (L3), index 1 = next (L4), etc.
+    /// Index 0 = first upper layer (L3), index 1 = next (L4), etc.
     /// In `BlocksInFile`, slots map to regions within block 0 (the superblock).
-    fn header_slot_for_upper(&self, index: u8) -> HeaderSlotId;
+    fn admin_slot_for_upper(&self, index: u8) -> AdminSlotId;
 
-    /// Write a header section by slot ID.
+    /// Write mutable admin data by slot ID.
     ///
-    /// `data` is the section payload: `identifier[6] + version[1] + payload`.
+    /// `data` is the slot payload: `identifier[6] + version[1] + payload`.
     /// In `BlocksInFile`, this writes to block 0 (the superblock).
-    fn write_header_slot(&self, slot: HeaderSlotId, data: &[u8]) -> Result<(), YakError>;
+    fn write_admin_slot(&self, slot: AdminSlotId, data: &[u8]) -> Result<(), YakError>;
 
-    /// Read a header section by slot ID.
+    /// Read mutable admin data by slot ID.
     ///
-    /// Returns the section payload.
+    /// Returns the slot payload.
     /// In `BlocksInFile`, this reads from the in-memory block 0 cache.
-    fn read_header_slot(&self, slot: HeaderSlotId) -> Result<Vec<u8>, YakError>;
+    fn read_admin_slot(&self, slot: AdminSlotId) -> Result<Vec<u8>, YakError>;
 
     /// Clear the calling thread's per-thread block cache.
     ///
@@ -222,7 +219,7 @@ pub trait BlockLayer: Send + Sync {
     /// with no overlaps, no orphans, and no free-list cycles.
     /// Returns a list of issues found (including any L1 issues).
     /// Default implementation returns empty (no checks).
-    fn verify(&self, claimed_blocks: &[u64]) -> Result<Vec<String>, YakError> {
+    fn verify(&self, claimed_blocks: &[u32]) -> Result<Vec<String>, YakError> {
         let _ = claimed_blocks;
         Ok(Vec::new())
     }

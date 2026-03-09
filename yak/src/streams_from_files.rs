@@ -5,16 +5,16 @@ use std::path::{Path, PathBuf};
 use std::sync::{Condvar, Mutex};
 
 use crate::stream_layer::StreamLayer;
-use crate::{HeaderSlotId, OpenMode, YakError};
+use crate::{AdminSlotId, OpenMode, YakError};
 
 /// L3 mock identifier in the header section.
 const L3_MOCK_IDENTIFIER: &[u8; 6] = b"strfil";
 
 /// L3 mock header version.
-const L3_MOCK_VERSION: u8 = 0;
+const L3_MOCK_VERSION: u8 = 1;
 
-/// L3 mock payload size: "strfil"(6) + version(1) + next_stream_id(8) = 15 bytes.
-const L3_MOCK_PAYLOAD_SIZE: u16 = 15;
+/// L3 mock payload size: "strfil"(6) + version(1) + next_stream_id(4) = 11 bytes.
+const L3_MOCK_PAYLOAD_SIZE: u16 = 11;
 
 /// Size of the magic prefix: "yakyakyak"(9) + version(1) + total_header_length(2).
 const MAGIC_SIZE: usize = 12;
@@ -40,7 +40,7 @@ struct LockState {
 
 /// Metadata for an open stream handle (no stored fs::File).
 struct HandleInfo {
-    stream_id: u64,
+    stream_id: u32,
     mode: OpenMode,
     /// Tracked reservation (in-memory only, no real pre-allocation for mock).
     reserved: u64,
@@ -48,9 +48,9 @@ struct HandleInfo {
 
 /// Bookkeeping state protected by a Mutex.
 struct StreamsState {
-    next_stream_id: u64,
+    next_stream_id: u32,
     next_handle_id: u64,
-    locks: HashMap<u64, LockState>,
+    locks: HashMap<u32, LockState>,
     open_handles: HashMap<u64, HandleInfo>,
 }
 
@@ -58,7 +58,7 @@ struct StreamsState {
 ///
 /// When created, makes a directory at the given path. Each stream is stored
 /// as `{id}.stream` inside this directory. A `meta` file tracks the next
-/// available stream ID along with `block_index_width` and `block_size_shift`.
+/// available stream ID along with `block_size_shift`.
 /// A `header` file stores the Yak header with slot registry.
 ///
 /// Thread-safe: all bookkeeping state is behind a `Mutex`. File I/O uses
@@ -69,7 +69,6 @@ struct StreamsState {
 /// testing tool, even after `StreamsFromBlocks` is implemented.
 pub struct StreamsFromFiles {
     root: PathBuf,
-    block_index_width: u8,
     block_size_shift: u8,
     state: Mutex<StreamsState>,
     lock_released: Condvar,
@@ -77,7 +76,7 @@ pub struct StreamsFromFiles {
 }
 
 impl StreamsFromFiles {
-    fn stream_path(&self, id: u64) -> PathBuf {
+    fn stream_path(&self, id: u32) -> PathBuf {
         self.root.join(format!("{}.stream", id))
     }
 
@@ -89,17 +88,16 @@ impl StreamsFromFiles {
         self.root.join("header")
     }
 
-    /// Meta format: | block_index_width: u8 | block_size_shift: u8 | next_stream_id: u64 |
-    fn persist_meta(&self, next_id: u64) -> Result<(), YakError> {
-        let mut buf = Vec::with_capacity(10);
-        buf.push(self.block_index_width);
+    /// Meta format: | block_size_shift: u8 | next_stream_id: u32 |
+    fn persist_meta(&self, next_id: u32) -> Result<(), YakError> {
+        let mut buf = Vec::with_capacity(5);
         buf.push(self.block_size_shift);
         buf.extend_from_slice(&next_id.to_le_bytes());
         fs::write(self.meta_path(), buf)
             .map_err(|e| YakError::IoError(format!("failed to write meta: {}", e)))
     }
 
-    fn acquire_lock(&self, id: u64, mode: OpenMode, blocking: bool) -> Result<(), YakError> {
+    fn acquire_lock(&self, id: u32, mode: OpenMode, blocking: bool) -> Result<(), YakError> {
         let mut state = self.state.lock().unwrap();
         loop {
             let lock = state.locks.entry(id).or_default();
@@ -131,7 +129,7 @@ impl StreamsFromFiles {
         }
     }
 
-    fn release_lock(&self, id: u64, mode: OpenMode) {
+    fn release_lock(&self, id: u32, mode: OpenMode) {
         let mut state = self.state.lock().unwrap();
         if let Some(lock) = state.locks.get_mut(&id) {
             match mode {
@@ -148,7 +146,7 @@ impl StreamsFromFiles {
 
     fn open_stream_inner(
         &self,
-        id: u64,
+        id: u32,
         mode: OpenMode,
         blocking: bool,
     ) -> Result<FileStreamHandle, YakError> {
@@ -174,23 +172,20 @@ impl StreamsFromFiles {
         Ok(FileStreamHandle(handle_id))
     }
 
-    fn read_meta(root: &Path) -> Result<(u8, u8, u64), YakError> {
+    fn read_meta(root: &Path) -> Result<(u8, u32), YakError> {
         let bytes = fs::read(root.join("meta"))
             .map_err(|e| YakError::IoError(format!("failed to read meta: {}", e)))?;
-        if bytes.len() < 10 {
+        if bytes.len() < 5 {
             return Err(YakError::IoError("meta file too short".to_string()));
         }
-        let block_index_width = bytes[0];
-        let block_size_shift = bytes[1];
-        let next_stream_id = u64::from_le_bytes([
-            bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7], bytes[8], bytes[9],
-        ]);
-        Ok((block_index_width, block_size_shift, next_stream_id))
+        let block_size_shift = bytes[0];
+        let next_stream_id = u32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
+        Ok((block_size_shift, next_stream_id))
     }
 
     /// Serialize the L3 mock header (no length prefix).
-    /// Format: | "strfil": [u8;6] | version: u8 | next_stream_id: u64 |
-    fn serialize_header(next_stream_id: u64) -> Vec<u8> {
+    /// Format: | "strfil": [u8;6] | version: u8 | next_stream_id: u32 |
+    fn serialize_header(next_stream_id: u32) -> Vec<u8> {
         let mut buf = Vec::with_capacity(L3_MOCK_PAYLOAD_SIZE as usize);
         buf.extend_from_slice(L3_MOCK_IDENTIFIER);
         buf.push(L3_MOCK_VERSION);
@@ -204,7 +199,6 @@ impl StreamLayer for StreamsFromFiles {
 
     fn create(
         path: &str,
-        block_index_width: u8,
         block_size_shift: u8,
         _compressed_block_size_shift: u8,
         mut slot_sizes: VecDeque<u16>,
@@ -250,7 +244,6 @@ impl StreamLayer for StreamsFromFiles {
 
         let instance = StreamsFromFiles {
             root,
-            block_index_width,
             block_size_shift,
             state: Mutex::new(StreamsState {
                 next_stream_id: 0,
@@ -264,7 +257,7 @@ impl StreamLayer for StreamsFromFiles {
 
         // Write L3 payload into slot 0
         let l3_payload = Self::serialize_header(0);
-        instance.write_header_slot(HeaderSlotId(0), &l3_payload)?;
+        instance.write_admin_slot(AdminSlotId(0), &l3_payload)?;
 
         instance.persist_meta(0)?;
 
@@ -276,7 +269,7 @@ impl StreamLayer for StreamsFromFiles {
         if !root.is_dir() {
             return Err(YakError::NotFound(root.display().to_string()));
         }
-        let (block_index_width, block_size_shift, next_stream_id) = Self::read_meta(&root)?;
+        let (block_size_shift, next_stream_id) = Self::read_meta(&root)?;
 
         // Read header file and rebuild slot registry
         let header_data = fs::read(root.join("header"))
@@ -317,7 +310,6 @@ impl StreamLayer for StreamsFromFiles {
 
         Ok(StreamsFromFiles {
             root,
-            block_index_width,
             block_size_shift,
             state: Mutex::new(StreamsState {
                 next_stream_id,
@@ -330,10 +322,6 @@ impl StreamLayer for StreamsFromFiles {
         })
     }
 
-    fn block_index_width(&self) -> u8 {
-        self.block_index_width
-    }
-
     fn block_size_shift(&self) -> u8 {
         self.block_size_shift
     }
@@ -342,7 +330,7 @@ impl StreamLayer for StreamsFromFiles {
         0 // File-backed mock does not support compression
     }
 
-    fn create_stream(&self, _compressed: bool) -> Result<u64, YakError> {
+    fn create_stream(&self, _compressed: bool) -> Result<u32, YakError> {
         let mut state = self.state.lock().unwrap();
         let id = state.next_stream_id;
         let stream_path = self.stream_path(id);
@@ -357,13 +345,13 @@ impl StreamLayer for StreamsFromFiles {
         Ok(id)
     }
 
-    fn stream_exists(&self, id: u64) -> bool {
+    fn stream_exists(&self, id: u32) -> bool {
         self.stream_path(id).exists()
     }
 
-    fn stream_count(&self) -> Result<u64, YakError> {
+    fn stream_count(&self) -> Result<u32, YakError> {
         let state = self.state.lock().unwrap();
-        let mut count = 0u64;
+        let mut count = 0u32;
         for id in 0..state.next_stream_id {
             if self.stream_path(id).exists() {
                 count += 1;
@@ -372,7 +360,7 @@ impl StreamLayer for StreamsFromFiles {
         Ok(count)
     }
 
-    fn stream_ids(&self) -> Result<Vec<u64>, YakError> {
+    fn stream_ids(&self) -> Result<Vec<u32>, YakError> {
         let state = self.state.lock().unwrap();
         let mut ids = Vec::new();
         for id in 0..state.next_stream_id {
@@ -383,11 +371,11 @@ impl StreamLayer for StreamsFromFiles {
         Ok(ids)
     }
 
-    fn open_stream(&self, id: u64, mode: OpenMode) -> Result<Self::Handle, YakError> {
+    fn open_stream(&self, id: u32, mode: OpenMode) -> Result<Self::Handle, YakError> {
         self.open_stream_inner(id, mode, false)
     }
 
-    fn open_stream_blocking(&self, id: u64, mode: OpenMode) -> Result<Self::Handle, YakError> {
+    fn open_stream_blocking(&self, id: u32, mode: OpenMode) -> Result<Self::Handle, YakError> {
         self.open_stream_inner(id, mode, true)
     }
 
@@ -404,7 +392,7 @@ impl StreamLayer for StreamsFromFiles {
         Ok(())
     }
 
-    fn delete_stream(&self, id: u64) -> Result<(), YakError> {
+    fn delete_stream(&self, id: u32) -> Result<(), YakError> {
         let path = self.stream_path(id);
         if !path.exists() {
             return Err(YakError::NotFound(format!("stream {}", id)));
@@ -550,12 +538,12 @@ impl StreamLayer for StreamsFromFiles {
         Ok(info.reserved)
     }
 
-    fn header_slot_for_upper(&self, index: u8) -> HeaderSlotId {
+    fn admin_slot_for_upper(&self, index: u8) -> AdminSlotId {
         // Slot 0 = L3's own section, so upper layer index 0 → slot 1 (L4), etc.
-        HeaderSlotId(index + 1)
+        AdminSlotId(index + 1)
     }
 
-    fn write_header_slot(&self, slot: HeaderSlotId, data: &[u8]) -> Result<(), YakError> {
+    fn write_admin_slot(&self, slot: AdminSlotId, data: &[u8]) -> Result<(), YakError> {
         let idx = slot.0 as usize;
         if idx >= self.slots.len() {
             return Err(YakError::IoError(format!(
@@ -590,7 +578,7 @@ impl StreamLayer for StreamsFromFiles {
         Ok(())
     }
 
-    fn read_header_slot(&self, slot: HeaderSlotId) -> Result<Vec<u8>, YakError> {
+    fn read_admin_slot(&self, slot: AdminSlotId) -> Result<Vec<u8>, YakError> {
         let idx = slot.0 as usize;
         if idx >= self.slots.len() {
             return Err(YakError::IoError(format!(
@@ -611,7 +599,7 @@ impl StreamLayer for StreamsFromFiles {
         Ok(buf)
     }
 
-    fn verify(&self, claimed_streams: &[u64]) -> Result<Vec<String>, YakError> {
+    fn verify(&self, claimed_streams: &[u32]) -> Result<Vec<String>, YakError> {
         let mut issues = Vec::new();
 
         // Collect existing .stream files on disk
@@ -626,7 +614,7 @@ impl StreamLayer for StreamsFromFiles {
             }
         }
 
-        let claimed_set: std::collections::HashSet<u64> = claimed_streams.iter().cloned().collect();
+        let claimed_set: std::collections::HashSet<u32> = claimed_streams.iter().cloned().collect();
 
         // Streams on disk but not claimed by L4
         for &id in &disk_streams {

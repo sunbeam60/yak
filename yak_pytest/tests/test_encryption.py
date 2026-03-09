@@ -234,9 +234,9 @@ class TestEncryptionMultiblock:
         yak_path = str(tmp_path / "enc_small.yak")
         password = b"small-pw"
 
-        # bss=9 → 512-byte blocks (minimum), biw=2
+        # bss=9 → 512-byte blocks (minimum)
         f = yak.Yak.create(
-            yak_path, block_index_width=2, block_size_shift=9, password=password
+            yak_path, block_size_shift=9, password=password
         )
         data = b"sixteen bytes!!" + b"\x00"  # exactly 16 bytes
         sh = f.create_stream("tiny.bin")
@@ -251,16 +251,15 @@ class TestEncryptionMultiblock:
         f.close_stream(sh)
         f.close()
 
-    @pytest.mark.parametrize("biw,bss", [(2, 9), (4, 9), (4, 12), (2, 12)])
-    def test_encrypted_varying_params(self, tmp_path, biw, bss):
-        """Encryption works across different biw and bss combinations."""
-        yak_path = str(tmp_path / f"enc_{biw}_{bss}.yak")
+    @pytest.mark.parametrize("bss", [9, 12])
+    def test_encrypted_varying_params(self, tmp_path, bss):
+        """Encryption works across different bss values."""
+        yak_path = str(tmp_path / f"enc_{bss}.yak")
         password = b"param-pw"
         data = b"X" * 500
 
         f = yak.Yak.create(
             yak_path,
-            block_index_width=biw,
             block_size_shift=bss,
             password=password,
         )

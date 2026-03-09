@@ -72,11 +72,7 @@ fn cstr_to_str<'a>(ptr: *const c_char) -> Option<&'a str> {
 /// # Safety
 /// `path` must be a valid, null-terminated UTF-8 string.
 #[no_mangle]
-pub unsafe extern "C" fn yak_create(
-    path: *const c_char,
-    block_index_width: u8,
-    block_size_shift: u8,
-) -> *mut YakFile {
+pub unsafe extern "C" fn yak_create(path: *const c_char, block_size_shift: u8) -> *mut YakFile {
     let path = match cstr_to_str(path) {
         Some(s) => s,
         None => return std::ptr::null_mut(),
@@ -84,7 +80,6 @@ pub unsafe extern "C" fn yak_create(
     match YakInner::create(
         path,
         CreateOptions {
-            block_index_width,
             block_size_shift,
             ..Default::default()
         },
@@ -105,7 +100,6 @@ pub unsafe extern "C" fn yak_create(
 #[no_mangle]
 pub unsafe extern "C" fn yak_create_with_cbss(
     path: *const c_char,
-    block_index_width: u8,
     block_size_shift: u8,
     compressed_block_size_shift: u8,
 ) -> *mut YakFile {
@@ -116,7 +110,6 @@ pub unsafe extern "C" fn yak_create_with_cbss(
     match YakInner::create(
         path,
         CreateOptions {
-            block_index_width,
             block_size_shift,
             compressed_block_size_shift,
             ..Default::default()
@@ -165,7 +158,6 @@ pub unsafe extern "C" fn yak_open(path: *const c_char, mode: c_int) -> *mut YakF
 #[no_mangle]
 pub unsafe extern "C" fn yak_create_encrypted(
     path: *const c_char,
-    block_index_width: u8,
     block_size_shift: u8,
     password: *const c_char,
 ) -> *mut YakFile {
@@ -180,7 +172,6 @@ pub unsafe extern "C" fn yak_create_encrypted(
     match YakInner::create(
         path,
         CreateOptions {
-            block_index_width,
             block_size_shift,
             password: Some(password.as_bytes()),
             ..Default::default()

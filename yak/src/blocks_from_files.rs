@@ -4,17 +4,17 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use crate::block_layer::{BlockLayer, CacheMode};
-use crate::{HeaderSlotId, OpenMode, YakError};
+use crate::block_layer::{BlockLayer, CacheMode, BLOCK_INDEX_SENTINEL};
+use crate::{AdminSlotId, OpenMode, YakError};
 
 /// L2 mock identifier in the header section.
 const L2_MOCK_IDENTIFIER: &[u8; 6] = b"blkfil";
 
 /// L2 mock header version.
-const L2_MOCK_VERSION: u8 = 0;
+const L2_MOCK_VERSION: u8 = 1;
 
-/// L2 mock payload size: "blkfil"(6) + version(1) + bss(1) + biw(1) = 9 bytes.
-const L2_MOCK_PAYLOAD_SIZE: u16 = 9;
+/// L2 mock payload size: "blkfil"(6) + version(1) + bss(1) = 8 bytes.
+const L2_MOCK_PAYLOAD_SIZE: u16 = 8;
 
 /// Size of the magic prefix: "yakyakyak"(9) + version(1) + total_header_length(2).
 const MAGIC_SIZE: usize = 12;
@@ -29,7 +29,7 @@ struct SlotInfo {
 
 /// Bookkeeping state protected by a Mutex.
 struct BlocksState {
-    next_block_id: u64,
+    next_block_id: u32,
 }
 
 /// L2 mock implementation that stores each block as a numbered file on disk.
@@ -45,13 +45,12 @@ struct BlocksState {
 pub struct BlocksFromFiles {
     root: PathBuf,
     block_size_shift: u8,
-    block_index_width: u8,
     state: Mutex<BlocksState>,
     slots: Vec<SlotInfo>,
 }
 
 impl BlocksFromFiles {
-    fn block_path(&self, index: u64) -> PathBuf {
+    fn block_path(&self, index: u32) -> PathBuf {
         self.root.join(format!("{}.block", index))
     }
 
@@ -63,43 +62,28 @@ impl BlocksFromFiles {
         self.root.join("header")
     }
 
-    /// Meta format: | next_block_id: u64 | (8 bytes, little-endian)
-    fn persist_meta(&self, next_block_id: u64) -> Result<(), YakError> {
+    /// Meta format: | next_block_id: u32 | (4 bytes, little-endian)
+    fn persist_meta(&self, next_block_id: u32) -> Result<(), YakError> {
         fs::write(self.meta_path(), next_block_id.to_le_bytes())
             .map_err(|e| YakError::IoError(format!("failed to write meta: {}", e)))
     }
 
-    fn read_meta(root: &Path) -> Result<u64, YakError> {
+    fn read_meta(root: &Path) -> Result<u32, YakError> {
         let bytes = fs::read(root.join("meta"))
             .map_err(|e| YakError::IoError(format!("failed to read meta: {}", e)))?;
-        if bytes.len() < 8 {
+        if bytes.len() < 4 {
             return Err(YakError::IoError("meta file too short".to_string()));
         }
-        Ok(u64::from_le_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-        ]))
-    }
-
-    /// Sentinel value for the configured block_index_width.
-    /// All 0xFF bytes in `block_index_width` bytes. This value is reserved
-    /// and must never be allocated.
-    fn sentinel(&self) -> u64 {
-        let w = self.block_index_width as u32;
-        if w >= 8 {
-            u64::MAX
-        } else {
-            (1u64 << (w * 8)) - 1
-        }
+        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
 
     /// Serialize the L2 mock header (no length prefix).
-    /// Format: | "blkfil": [u8;6] | version: u8 | bss: u8 | biw: u8 |
-    fn serialize_header(block_size_shift: u8, block_index_width: u8) -> Vec<u8> {
+    /// Format: | "blkfil": [u8;6] | version: u8 | bss: u8 |
+    fn serialize_header(block_size_shift: u8) -> Vec<u8> {
         let mut buf = Vec::with_capacity(L2_MOCK_PAYLOAD_SIZE as usize);
         buf.extend_from_slice(L2_MOCK_IDENTIFIER);
         buf.push(L2_MOCK_VERSION);
         buf.push(block_size_shift);
-        buf.push(block_index_width);
         buf
     }
 }
@@ -108,7 +92,6 @@ impl BlockLayer for BlocksFromFiles {
     fn create(
         path: &str,
         block_size_shift: u8,
-        block_index_width: u8,
         mut slot_sizes: VecDeque<u16>,
         _password: Option<&[u8]>,
     ) -> Result<Self, YakError> {
@@ -153,14 +136,13 @@ impl BlockLayer for BlocksFromFiles {
         let instance = BlocksFromFiles {
             root,
             block_size_shift,
-            block_index_width,
             state: Mutex::new(BlocksState { next_block_id: 0 }),
             slots,
         };
 
         // Write L2 payload into slot 0
-        let l2_payload = Self::serialize_header(block_size_shift, block_index_width);
-        instance.write_header_slot(HeaderSlotId(0), &l2_payload)?;
+        let l2_payload = Self::serialize_header(block_size_shift);
+        instance.write_admin_slot(AdminSlotId(0), &l2_payload)?;
 
         instance.persist_meta(0)?;
 
@@ -234,16 +216,14 @@ impl BlockLayer for BlocksFromFiles {
             )));
         }
 
-        // payload[6] = version (skip), payload[7] = bss, payload[8] = biw
+        // payload[6] = version (skip), payload[7] = bss
         let block_size_shift = l2_payload[7];
-        let block_index_width = l2_payload[8];
 
         let next_block_id = Self::read_meta(&root)?;
 
         Ok(BlocksFromFiles {
             root,
             block_size_shift,
-            block_index_width,
             state: Mutex::new(BlocksState { next_block_id }),
             slots,
         })
@@ -257,21 +237,15 @@ impl BlockLayer for BlocksFromFiles {
         self.block_size_shift
     }
 
-    fn block_index_width(&self) -> u8 {
-        self.block_index_width
-    }
-
-    fn allocate_block(&self) -> Result<u64, YakError> {
+    fn allocate_block(&self) -> Result<u32, YakError> {
         let mut state = self.state.lock().unwrap();
         let id = state.next_block_id;
 
         // Index overflow protection
-        if id >= self.sentinel() {
+        if id == BLOCK_INDEX_SENTINEL {
             return Err(YakError::IoError(format!(
-                "block index overflow: next block {} >= sentinel {} for block_index_width={}",
+                "block index overflow: next block {} is sentinel",
                 id,
-                self.sentinel(),
-                self.block_index_width
             )));
         }
 
@@ -282,14 +256,12 @@ impl BlockLayer for BlocksFromFiles {
             .map_err(|e| YakError::IoError(format!("failed to create block {}: {}", id, e)))?;
 
         state.next_block_id += 1;
-        // Persist before releasing the mutex, so other threads cannot observe
-        // the updated in-memory state until the metadata is written.
         self.persist_meta(state.next_block_id)?;
         drop(state);
         Ok(id)
     }
 
-    fn deallocate_block(&self, index: u64) -> Result<(), YakError> {
+    fn deallocate_block(&self, index: u32) -> Result<(), YakError> {
         let path = self.block_path(index);
         if !path.exists() {
             return Err(YakError::NotFound(format!("block {}", index)));
@@ -301,17 +273,15 @@ impl BlockLayer for BlocksFromFiles {
 
     fn read_block(
         &self,
-        index: u64,
+        index: u32,
         offset: usize,
         buf: &mut [u8],
         _cache: CacheMode,
     ) -> Result<usize, YakError> {
-        if index >= self.sentinel() {
+        if index == BLOCK_INDEX_SENTINEL {
             return Err(YakError::IoError(format!(
-                "read_block: block index {} is >= sentinel {} (block_index_width={})",
+                "read_block: block index {} is sentinel",
                 index,
-                self.sentinel(),
-                self.block_index_width
             )));
         }
         let block_size = self.block_size();
@@ -337,7 +307,7 @@ impl BlockLayer for BlocksFromFiles {
 
     fn write_block(
         &self,
-        index: u64,
+        index: u32,
         offset: usize,
         buf: &[u8],
         _cache: CacheMode,
@@ -366,12 +336,12 @@ impl BlockLayer for BlocksFromFiles {
         Ok(n)
     }
 
-    fn header_slot_for_upper(&self, index: u8) -> HeaderSlotId {
+    fn admin_slot_for_upper(&self, index: u8) -> AdminSlotId {
         // Slot 0 = L2's own section, so upper layer index 0 → slot 1 (L3), etc.
-        HeaderSlotId(index + 1)
+        AdminSlotId(index + 1)
     }
 
-    fn write_header_slot(&self, slot: HeaderSlotId, data: &[u8]) -> Result<(), YakError> {
+    fn write_admin_slot(&self, slot: AdminSlotId, data: &[u8]) -> Result<(), YakError> {
         let idx = slot.0 as usize;
         if idx >= self.slots.len() {
             return Err(YakError::IoError(format!(
@@ -406,7 +376,7 @@ impl BlockLayer for BlocksFromFiles {
         Ok(())
     }
 
-    fn read_header_slot(&self, slot: HeaderSlotId) -> Result<Vec<u8>, YakError> {
+    fn read_admin_slot(&self, slot: AdminSlotId) -> Result<Vec<u8>, YakError> {
         let idx = slot.0 as usize;
         if idx >= self.slots.len() {
             return Err(YakError::IoError(format!(
@@ -427,7 +397,7 @@ impl BlockLayer for BlocksFromFiles {
         Ok(buf)
     }
 
-    fn verify(&self, claimed_blocks: &[u64]) -> Result<Vec<String>, YakError> {
+    fn verify(&self, claimed_blocks: &[u32]) -> Result<Vec<String>, YakError> {
         let mut issues = Vec::new();
 
         // Collect existing .block files on disk
@@ -442,7 +412,7 @@ impl BlockLayer for BlocksFromFiles {
             }
         }
 
-        let claimed_set: std::collections::HashSet<u64> = claimed_blocks.iter().cloned().collect();
+        let claimed_set: std::collections::HashSet<u32> = claimed_blocks.iter().cloned().collect();
 
         // Blocks on disk but not claimed
         for &id in &disk_blocks {

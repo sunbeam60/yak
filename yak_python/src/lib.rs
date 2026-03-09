@@ -114,11 +114,10 @@ impl Yak {
     /// If `compressed_block_size_shift` is None, uses the default (15 = 32 KB).
     /// If `password` is provided, the file is encrypted with AES-XTS.
     #[staticmethod]
-    #[pyo3(signature = (path, block_index_width=4, block_size_shift=12, compressed_block_size_shift=None, password=None))]
+    #[pyo3(signature = (path, block_size_shift=12, compressed_block_size_shift=None, password=None))]
     fn create(
         py: Python<'_>,
         path: &str,
-        block_index_width: u8,
         block_size_shift: u8,
         compressed_block_size_shift: Option<u8>,
         password: Option<&[u8]>,
@@ -132,7 +131,6 @@ impl Yak {
                 YakDefault::create(
                     &path,
                     CreateOptions {
-                        block_index_width,
                         block_size_shift,
                         compressed_block_size_shift: cbss,
                         password: pw.as_deref(),

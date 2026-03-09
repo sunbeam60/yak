@@ -169,16 +169,16 @@ class TestReserve:
         issues = fs.verify()
         assert issues == []
 
-    @pytest.mark.parametrize("biw,bss", [
-        (2, 9),   # block_index_width=2, block_size=512
-        (3, 10),  # block_index_width=3, block_size=1024
-        (4, 12),  # block_index_width=4, block_size=4096
+    @pytest.mark.parametrize("bss", [
+        9,   # block_size=512
+        10,  # block_size=1024
+        12,  # block_size=4096
     ])
-    def test_reserve_parametrized_block_params(self, tmp_path, biw, bss):
-        """Reserve works across different block parameter combos."""
+    def test_reserve_parametrized_block_params(self, tmp_path, bss):
+        """Reserve works across different block size values."""
         block_size = 1 << bss
-        yak_path = str(tmp_path / f"test_{biw}_{bss}.yak")
-        fs = yak.Yak.create(yak_path, block_index_width=biw, block_size_shift=bss)
+        yak_path = str(tmp_path / f"test_{bss}.yak")
+        fs = yak.Yak.create(yak_path, block_size_shift=bss)
 
         handle = fs.create_stream("data.bin")
         reserve_bytes = block_size * 3  # 3 blocks

@@ -4,13 +4,17 @@ use std::sync::Mutex;
 
 use crate::stream_layer::StreamLayer;
 
-/// L4 payload size: "filing"(6) + version(1) + root_dir_stream_id(8) = 15 bytes.
-const L4_PAYLOAD_SIZE: u16 = 15;
+/// L4 payload size: "filing"(6) + version(1) + root_dir_stream_id(4) = 11 bytes.
+const L4_PAYLOAD_SIZE: u16 = 11;
 
 /// Current L4 format version. Bumped when the on-disk directory entry format changes.
 /// Version 2: sorted name table with O(log n) binary search lookup.
 /// Version 3: footer shrunk from 8 to 4 bytes (entry_count derived from name_table_offset).
-const L4_FORMAT_VERSION: u8 = 3;
+/// Version 4: stream IDs shrunk from u64 to u32 (block indices are always 4 bytes).
+const L4_FORMAT_VERSION: u8 = 4;
+
+/// Size of a stream/directory ID in directory entries: always 4 bytes (u32).
+const ENTRY_ID_SIZE: usize = 4;
 
 /// Size of one name table slot: hash (u32) + offset (u32) = 8 bytes.
 const NAME_TABLE_SLOT_SIZE: usize = 8;
@@ -94,6 +98,8 @@ pub enum OpenMode {
 }
 
 /// Opaque handle to an open stream.
+///
+/// The inner value is an L4-internal counter, not a stream ID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StreamHandle(u64);
 
@@ -113,20 +119,18 @@ impl StreamHandle {
 
 /// An entry inside a directory stream.
 struct StreamEntry {
-    id: u64,
+    id: u32,
     name: String,
 }
 
 /// Serialize a single entry's data region bytes (no name table or footer).
-/// Format: | id: biw bytes | name_len: u16 | name: [u8] |
-fn serialize_entry_data(entry: &StreamEntry, block_index_width: u8) -> Vec<u8> {
-    let biw = block_index_width as usize;
+/// Format: | id: u32 LE | name_len: u16 | name: [u8] |
+fn serialize_entry_data(entry: &StreamEntry) -> Vec<u8> {
     let name_bytes = entry.name.as_bytes();
     let name_len = name_bytes.len() as u16;
-    let total = biw + 2 + name_bytes.len();
+    let total = ENTRY_ID_SIZE + 2 + name_bytes.len();
     let mut buf = Vec::with_capacity(total);
-    let id_bytes = entry.id.to_le_bytes();
-    buf.extend_from_slice(&id_bytes[..biw]);
+    buf.extend_from_slice(&entry.id.to_le_bytes());
     buf.extend_from_slice(&name_len.to_le_bytes());
     buf.extend_from_slice(name_bytes);
     buf
@@ -134,7 +138,7 @@ fn serialize_entry_data(entry: &StreamEntry, block_index_width: u8) -> Vec<u8> {
 
 /// Build a complete directory stream (entry data + name table + footer).
 /// Returns empty Vec for an empty entry list (empty directory = zero-length stream).
-fn build_directory_stream(entries: &[StreamEntry], block_index_width: u8) -> Vec<u8> {
+fn build_directory_stream(entries: &[StreamEntry]) -> Vec<u8> {
     if entries.is_empty() {
         return Vec::new();
     }
@@ -145,7 +149,7 @@ fn build_directory_stream(entries: &[StreamEntry], block_index_width: u8) -> Vec
     for entry in entries {
         let offset = entry_data.len() as u32;
         let hash = fnv1a_hash(entry.name.as_bytes());
-        entry_data.extend_from_slice(&serialize_entry_data(entry, block_index_width));
+        entry_data.extend_from_slice(&serialize_entry_data(entry));
         slots.push((hash, offset));
     }
 
@@ -182,16 +186,15 @@ fn parse_footer(data: &[u8]) -> Result<u32, YakError> {
 
 /// Parse all entries from a complete directory stream buffer.
 /// Reads the footer to find name_table_offset, then scans the entry data region.
-fn parse_entries(data: &[u8], block_index_width: u8) -> Result<Vec<StreamEntry>, YakError> {
+fn parse_entries(data: &[u8]) -> Result<Vec<StreamEntry>, YakError> {
     if data.is_empty() {
         return Ok(Vec::new());
     }
     let name_table_offset = parse_footer(data)?;
     let nto = name_table_offset as usize;
-    let biw = block_index_width as usize;
     let entry_count = entry_count_from_footer(data.len(), name_table_offset);
-    // Minimum entry size: biw (id) + 2 (name_len) + 0 (empty name not valid, but parsing allows it)
-    let min_entry_size = biw + 2;
+    // Minimum entry size: ENTRY_ID_SIZE (id) + 2 (name_len)
+    let min_entry_size = ENTRY_ID_SIZE + 2;
 
     let mut entries = Vec::with_capacity(entry_count as usize);
     let mut pos = 0;
@@ -201,18 +204,17 @@ fn parse_entries(data: &[u8], block_index_width: u8) -> Result<Vec<StreamEntry>,
                 "truncated entry in directory stream".to_string(),
             ));
         }
-        let mut id_bytes = [0u8; 8];
-        id_bytes[..biw].copy_from_slice(&data[pos..pos + biw]);
-        let id = u64::from_le_bytes(id_bytes);
+        let id = u32::from_le_bytes(data[pos..pos + ENTRY_ID_SIZE].try_into().unwrap());
 
-        let name_len = u16::from_le_bytes([data[pos + biw], data[pos + biw + 1]]) as usize;
-        let name_end = pos + biw + 2 + name_len;
+        let name_len =
+            u16::from_le_bytes([data[pos + ENTRY_ID_SIZE], data[pos + ENTRY_ID_SIZE + 1]]) as usize;
+        let name_end = pos + ENTRY_ID_SIZE + 2 + name_len;
         if name_end > nto {
             return Err(YakError::IoError(
                 "truncated entry name in directory stream".to_string(),
             ));
         }
-        let name = std::str::from_utf8(&data[pos + biw + 2..name_end])
+        let name = std::str::from_utf8(&data[pos + ENTRY_ID_SIZE + 2..name_end])
             .map_err(|e| YakError::IoError(format!("invalid UTF-8 in entry name: {}", e)))?
             .to_string();
         entries.push(StreamEntry { id, name });
@@ -285,7 +287,7 @@ fn slot_offset(name_table: &[u8], slot_index: usize) -> u32 {
 struct FoundEntry {
     slot_idx: usize,
     offset: u32,
-    id: u64,
+    id: u32,
     entry_size: usize,
 }
 
@@ -317,11 +319,11 @@ fn serialize_table_and_footer(slots: &[(u32, u32)], name_table_offset: u32) -> V
 /// Search for a name in a directory stream buffer (already fully in memory).
 /// Returns Some(stream_id) if found, None otherwise.
 /// The buffer must contain the complete directory stream bytes.
-fn find_name_in_buffer(buf: &[u8], name: &str, biw: usize) -> Result<Option<u64>, YakError> {
+fn find_name_in_buffer(buf: &[u8], name: &str) -> Result<Option<u32>, YakError> {
     if buf.is_empty() {
         return Ok(None);
     }
-    match find_entry_in_buffer(buf, name, biw)? {
+    match find_entry_in_buffer(buf, name)? {
         Some(found) => Ok(Some(found.id)),
         None => Ok(None),
     }
@@ -329,11 +331,7 @@ fn find_name_in_buffer(buf: &[u8], name: &str, biw: usize) -> Result<Option<u64>
 
 /// Search for a name in a directory stream buffer, returning full entry info.
 /// Used by mutation methods that need slot_idx, offset, and entry_size for compaction.
-fn find_entry_in_buffer(
-    buf: &[u8],
-    name: &str,
-    biw: usize,
-) -> Result<Option<FoundEntry>, YakError> {
+fn find_entry_in_buffer(buf: &[u8], name: &str) -> Result<Option<FoundEntry>, YakError> {
     if buf.is_empty() {
         return Ok(None);
     }
@@ -355,21 +353,24 @@ fn find_entry_in_buffer(
     let name_bytes = name.as_bytes();
     let target_hash = fnv1a_hash(name_bytes);
     let range = find_hash_range(name_table, entry_count, target_hash);
-    let header_size = biw + 2; // id bytes + name_len u16
+    /// Entry header: u32 id + u16 name_len
+    const HEADER_SIZE: usize = ENTRY_ID_SIZE + 2;
 
     for slot_idx in range {
         let offset = slot_offset(name_table, slot_idx) as usize;
-        let name_len = u16::from_le_bytes([buf[offset + biw], buf[offset + biw + 1]]) as usize;
+        let name_len =
+            u16::from_le_bytes([buf[offset + ENTRY_ID_SIZE], buf[offset + ENTRY_ID_SIZE + 1]])
+                as usize;
         if name_len == name_bytes.len() {
-            let name_start = offset + header_size;
+            let name_start = offset + HEADER_SIZE;
             if &buf[name_start..name_start + name_len] == name_bytes {
-                let mut id_bytes = [0u8; 8];
-                id_bytes[..biw].copy_from_slice(&buf[offset..offset + biw]);
+                let id =
+                    u32::from_le_bytes(buf[offset..offset + ENTRY_ID_SIZE].try_into().unwrap());
                 return Ok(Some(FoundEntry {
                     slot_idx,
                     offset: offset as u32,
-                    id: u64::from_le_bytes(id_bytes),
-                    entry_size: header_size + name_len,
+                    id,
+                    entry_size: HEADER_SIZE + name_len,
                 }));
             }
         }
@@ -418,7 +419,7 @@ fn split_parent_leaf(path: &str) -> (&str, &str) {
 /// Internal state for an open stream at the L4 level.
 struct OpenStreamInfo<H: Copy> {
     _path: String,
-    stream_id: u64,
+    stream_id: u32,
     l3_handle: H,
     position: u64,
     mode: OpenMode,
@@ -431,11 +432,11 @@ struct YakState<H: Copy> {
     /// Cache of raw directory stream bytes, keyed by stream ID.
     /// Populated on first access, updated on mutation, never evicted.
     /// Directory streams are typically small (a few KB), so memory is bounded.
-    dir_cache: HashMap<u64, Vec<u8>>,
+    dir_cache: HashMap<u32, Vec<u8>>,
     /// Generation counter per directory stream, bumped on each invalidation.
     /// Prevents a slow cache-miss reader from overwriting a newer invalidation
     /// with stale data it read before the mutation occurred.
-    dir_cache_gen: HashMap<u64, u64>,
+    dir_cache_gen: HashMap<u32, u64>,
 }
 
 /// Represents an open Yak file. Generic over the L3 stream layer.
@@ -444,18 +445,16 @@ struct YakState<H: Copy> {
 /// a `Mutex`. All public methods take `&self`.
 pub struct Yak<L3: StreamLayer> {
     layer3: L3,
-    root_dir_stream_id: u64,
+    root_dir_stream_id: u32,
     mode: OpenMode,
     state: Mutex<YakState<L3::Handle>>,
 }
 
 /// Options for creating a new Yak file.
 ///
-/// Defaults: 4-byte block indices, 4 KB blocks (shift 12),
-/// 32 KB compressed blocks (shift 15), no encryption.
+/// Defaults: 4 KB blocks (shift 12), 32 KB compressed blocks (shift 15),
+/// no encryption. Block indices are always 4 bytes (u32).
 pub struct CreateOptions<'a> {
-    /// Number of bytes used for block indices on disk (e.g. 2, 4, or 8).
-    pub block_index_width: u8,
     /// Power-of-2 exponent for block size (e.g. 12 → 4096 bytes).
     pub block_size_shift: u8,
     /// Power-of-2 exponent for compressed block size (e.g. 15 → 32768 bytes).
@@ -469,7 +468,6 @@ pub struct CreateOptions<'a> {
 impl Default for CreateOptions<'_> {
     fn default() -> Self {
         Self {
-            block_index_width: 4,
             block_size_shift: 12,
             compressed_block_size_shift: 15,
             password: None,
@@ -496,7 +494,6 @@ impl<L3: StreamLayer> Yak<L3> {
         }
         Self::create_inner(
             path,
-            opts.block_index_width,
             opts.block_size_shift,
             opts.compressed_block_size_shift,
             opts.password,
@@ -505,7 +502,6 @@ impl<L3: StreamLayer> Yak<L3> {
 
     fn create_inner(
         path: &str,
-        block_index_width: u8,
         block_size_shift: u8,
         compressed_block_size_shift: u8,
         password: Option<&[u8]>,
@@ -513,7 +509,6 @@ impl<L3: StreamLayer> Yak<L3> {
         // Pass L4 payload size down through the layer chain so L1 can calculate data_offset
         let layer3 = L3::create(
             path,
-            block_index_width,
             block_size_shift,
             compressed_block_size_shift,
             VecDeque::from([L4_PAYLOAD_SIZE]),
@@ -522,9 +517,9 @@ impl<L3: StreamLayer> Yak<L3> {
         let root_id = layer3.create_stream(false)?;
 
         // Write L4 header payload via slot
-        let l4_slot = layer3.header_slot_for_upper(0);
+        let l4_slot = layer3.admin_slot_for_upper(0);
         let l4_payload = serialize_header(root_id);
-        layer3.write_header_slot(l4_slot, &l4_payload)?;
+        layer3.write_admin_slot(l4_slot, &l4_payload)?;
 
         Ok(Yak {
             layer3,
@@ -552,8 +547,8 @@ impl<L3: StreamLayer> Yak<L3> {
         let layer3 = L3::open(path, mode, password)?;
 
         // Read L4 header payload via slot
-        let l4_slot = layer3.header_slot_for_upper(0);
-        let l4_data = layer3.read_header_slot(l4_slot)?;
+        let l4_slot = layer3.admin_slot_for_upper(0);
+        let l4_data = layer3.read_admin_slot(l4_slot)?;
         let root_id = deserialize_header(&l4_data)?;
 
         Ok(Yak {
@@ -654,8 +649,8 @@ impl<L3: StreamLayer> Yak<L3> {
     /// Adds both directory stream IDs and data stream IDs.
     fn collect_stream_ids_recursive(
         &self,
-        dir_stream_id: u64,
-        stream_ids: &mut Vec<u64>,
+        dir_stream_id: u32,
+        stream_ids: &mut Vec<u32>,
         issues: &mut Vec<String>,
     ) -> Result<(), YakError> {
         // Include this directory stream itself
@@ -700,11 +695,6 @@ impl<L3: StreamLayer> Yak<L3> {
         }
 
         Ok(())
-    }
-
-    /// The number of bytes used for block indices on disk.
-    pub fn block_index_width(&self) -> u8 {
-        self.layer3.block_index_width()
     }
 
     /// Block size as a power of 2 (e.g. 12 → 4096 bytes).
@@ -752,7 +742,6 @@ impl<L3: StreamLayer> Yak<L3> {
         let source = Self::open_inner(path, OpenMode::Write, password)?;
 
         let opts = CreateOptions {
-            block_index_width: source.block_index_width(),
             block_size_shift: source.block_size_shift(),
             compressed_block_size_shift: source.compressed_block_size_shift(),
             password,
@@ -899,15 +888,13 @@ impl<L3: StreamLayer> Yak<L3> {
 
         // Find the directory entry to get its stream ID
         let len = self.layer3.stream_length(&parent_handle)?;
-        let biw = self.layer3.block_index_width() as usize;
-        let dir_stream_id =
-            match self.find_name_in_handle(&parent_handle, len, &dir_entry_name, biw)? {
-                Some(id) => id,
-                None => {
-                    self.layer3.close_stream(parent_handle)?;
-                    return Err(YakError::NotFound(path.to_string()));
-                }
-            };
+        let dir_stream_id = match self.find_name_in_handle(&parent_handle, len, &dir_entry_name)? {
+            Some(id) => id,
+            None => {
+                self.layer3.close_stream(parent_handle)?;
+                return Err(YakError::NotFound(path.to_string()));
+            }
+        };
 
         // Check that directory is empty (blocking)
         let child_handle = self
@@ -941,8 +928,7 @@ impl<L3: StreamLayer> Yak<L3> {
         };
 
         let buf = self.get_dir_content(dir_id)?;
-        let biw = self.layer3.block_index_width();
-        let entries = parse_entries(&buf, biw)?;
+        let entries = parse_entries(&buf)?;
 
         let mut result: Vec<DirEntry> = entries
             .iter()
@@ -1206,9 +1192,8 @@ impl<L3: StreamLayer> Yak<L3> {
             .open_stream_blocking(parent_id, OpenMode::Write)?;
 
         // Find the entry first so we can check the open-streams lock
-        let biw = self.layer3.block_index_width() as usize;
         let len = self.layer3.stream_length(&parent_handle)?;
-        let stream_id = match self.find_name_in_handle(&parent_handle, len, leaf, biw)? {
+        let stream_id = match self.find_name_in_handle(&parent_handle, len, leaf)? {
             Some(id) => id,
             None => {
                 self.layer3.close_stream(parent_handle)?;
@@ -1542,7 +1527,7 @@ impl<L3: StreamLayer> Yak<L3> {
 
     /// Get directory stream content, using the in-process cache if available.
     /// On cache miss, opens the stream via L3, reads it in full, caches, and returns.
-    fn get_dir_content(&self, dir_stream_id: u64) -> Result<Vec<u8>, YakError> {
+    fn get_dir_content(&self, dir_stream_id: u32) -> Result<Vec<u8>, YakError> {
         // Fast path: check cache under lock, snapshot generation on miss
         let gen_at_read;
         {
@@ -1592,7 +1577,7 @@ impl<L3: StreamLayer> Yak<L3> {
     /// Remove a directory from the cache (e.g. when the directory is mutated or deleted).
     /// Bumps the generation counter so any in-flight cache-miss readers know their
     /// data is stale and won't overwrite the invalidation.
-    fn invalidate_dir_cache(&self, dir_stream_id: u64) {
+    fn invalidate_dir_cache(&self, dir_stream_id: u32) {
         let mut state = self.state.lock().unwrap();
         state.dir_cache.remove(&dir_stream_id);
         *state.dir_cache_gen.entry(dir_stream_id).or_insert(0) += 1;
@@ -1600,7 +1585,7 @@ impl<L3: StreamLayer> Yak<L3> {
 
     /// Walk directory streams to resolve a directory path to its stream ID.
     /// Returns root_dir_stream_id for empty path.
-    fn resolve_dir_stream_id(&self, path: &str) -> Result<u64, YakError> {
+    fn resolve_dir_stream_id(&self, path: &str) -> Result<u32, YakError> {
         if path.is_empty() {
             return Ok(self.root_dir_stream_id);
         }
@@ -1625,16 +1610,15 @@ impl<L3: StreamLayer> Yak<L3> {
         }
         let mut buf = vec![0u8; len as usize];
         self.layer3.read(handle, 0, &mut buf)?;
-        parse_entries(&buf, self.layer3.block_index_width())
+        parse_entries(&buf)
     }
 
     /// Look up a single entry by name in a directory stream.
     /// O(log n) via binary search on the name table.
     /// Uses the in-process directory cache to avoid L3 I/O on repeated lookups.
-    fn find_entry_in_dir(&self, dir_stream_id: u64, name: &str) -> Result<Option<u64>, YakError> {
+    fn find_entry_in_dir(&self, dir_stream_id: u32, name: &str) -> Result<Option<u32>, YakError> {
         let buf = self.get_dir_content(dir_stream_id)?;
-        let biw = self.layer3.block_index_width() as usize;
-        find_name_in_buffer(&buf, name, biw)
+        find_name_in_buffer(&buf, name)
     }
 
     /// Search for a name in an open directory stream using the name table.
@@ -1644,13 +1628,12 @@ impl<L3: StreamLayer> Yak<L3> {
         handle: &L3::Handle,
         stream_len: u64,
         name: &str,
-        biw: usize,
-    ) -> Result<Option<u64>, YakError> {
+    ) -> Result<Option<u32>, YakError> {
         if stream_len == 0 {
             return Ok(None);
         }
         let (name_table, entry_count, _) = self.read_name_table(handle, stream_len)?;
-        let found = self.find_entry_in_name_table(handle, &name_table, entry_count, name, biw)?;
+        let found = self.find_entry_in_name_table(handle, &name_table, entry_count, name)?;
         Ok(found.map(|e| e.id))
     }
 
@@ -1682,34 +1665,35 @@ impl<L3: StreamLayer> Yak<L3> {
         name_table: &[u8],
         entry_count: u32,
         name: &str,
-        biw: usize,
     ) -> Result<Option<FoundEntry>, YakError> {
         let name_bytes = name.as_bytes();
         let target_hash = fnv1a_hash(name_bytes);
         let range = find_hash_range(name_table, entry_count, target_hash);
-        let header_size = biw + 2;
+        /// Entry header: u32 id + u16 name_len
+        const HEADER_SIZE: usize = ENTRY_ID_SIZE + 2;
 
         for slot_idx in range {
             let offset = slot_offset(name_table, slot_idx);
-            let mut header_buf = vec![0u8; header_size];
+            let mut header_buf = [0u8; HEADER_SIZE];
             self.layer3.read(handle, offset as u64, &mut header_buf)?;
 
-            let name_len = u16::from_le_bytes([header_buf[biw], header_buf[biw + 1]]) as usize;
+            let name_len =
+                u16::from_le_bytes([header_buf[ENTRY_ID_SIZE], header_buf[ENTRY_ID_SIZE + 1]])
+                    as usize;
             if name_len == name_bytes.len() {
                 let mut name_buf = vec![0u8; name_len];
                 self.layer3.read(
                     handle,
-                    (offset as usize + header_size) as u64,
+                    (offset as usize + HEADER_SIZE) as u64,
                     &mut name_buf,
                 )?;
                 if name_buf == name_bytes {
-                    let mut id_bytes = [0u8; 8];
-                    id_bytes[..biw].copy_from_slice(&header_buf[..biw]);
+                    let id = u32::from_le_bytes(header_buf[..ENTRY_ID_SIZE].try_into().unwrap());
                     return Ok(Some(FoundEntry {
                         slot_idx,
                         offset,
-                        id: u64::from_le_bytes(id_bytes),
-                        entry_size: header_size + name_len,
+                        id,
+                        entry_size: HEADER_SIZE + name_len,
                     }));
                 }
             }
@@ -1723,14 +1707,12 @@ impl<L3: StreamLayer> Yak<L3> {
     /// Invalidates the directory cache for `dir_stream_id` on success.
     fn add_entry_to_dir_handle(
         &self,
-        dir_stream_id: u64,
+        dir_stream_id: u32,
         handle: &L3::Handle,
         entry_name: &str,
-        entry_id: u64,
+        entry_id: u32,
         error_path: &str,
     ) -> Result<(), YakError> {
-        let biw = self.layer3.block_index_width();
-        let biw_usize = biw as usize;
         let len = self.layer3.stream_length(handle)?;
 
         // Determine the alternative name for duplicate checking
@@ -1746,7 +1728,7 @@ impl<L3: StreamLayer> Yak<L3> {
                 id: entry_id,
                 name: entry_name.to_string(),
             };
-            let buf = build_directory_stream(&[entry], biw);
+            let buf = build_directory_stream(&[entry]);
             self.layer3.write(handle, 0, &buf)?;
             self.invalidate_dir_cache(dir_stream_id);
             return Ok(());
@@ -1757,7 +1739,7 @@ impl<L3: StreamLayer> Yak<L3> {
         // Check for duplicates against both the entry name and its alternative
         for check_name in [entry_name, alt_name.as_str()] {
             if self
-                .find_entry_in_name_table(handle, &name_table, entry_count, check_name, biw_usize)?
+                .find_entry_in_name_table(handle, &name_table, entry_count, check_name)?
                 .is_some()
             {
                 return Err(YakError::AlreadyExists(error_path.to_string()));
@@ -1769,7 +1751,7 @@ impl<L3: StreamLayer> Yak<L3> {
             id: entry_id,
             name: entry_name.to_string(),
         };
-        let entry_bytes = serialize_entry_data(&entry, biw);
+        let entry_bytes = serialize_entry_data(&entry);
 
         // Parse name table into slots and insert the new slot in sorted order
         let mut slots = parse_name_table_slots(&name_table, entry_count);
@@ -1798,12 +1780,11 @@ impl<L3: StreamLayer> Yak<L3> {
     /// Invalidates the directory cache for `dir_stream_id` on success.
     fn remove_entry_from_dir_handle(
         &self,
-        dir_stream_id: u64,
+        dir_stream_id: u32,
         handle: &L3::Handle,
         entry_name: &str,
         error_path: &str,
-    ) -> Result<u64, YakError> {
-        let biw = self.layer3.block_index_width() as usize;
+    ) -> Result<u32, YakError> {
         let len = self.layer3.stream_length(handle)?;
         if len == 0 {
             return Err(YakError::NotFound(error_path.to_string()));
@@ -1812,7 +1793,7 @@ impl<L3: StreamLayer> Yak<L3> {
         let (name_table, entry_count, name_table_offset) = self.read_name_table(handle, len)?;
 
         let found = self
-            .find_entry_in_name_table(handle, &name_table, entry_count, entry_name, biw)?
+            .find_entry_in_name_table(handle, &name_table, entry_count, entry_name)?
             .ok_or_else(|| YakError::NotFound(error_path.to_string()))?;
 
         let slot_idx = found.slot_idx;
@@ -1884,8 +1865,8 @@ impl<L3: StreamLayer> Drop for Yak<L3> {
 // ---------------------------------------------------------------------------
 
 /// Serialize the L4 header (no length prefix).
-/// Format: | "filing": [u8;6] | version: u8 | root_dir_stream_id: u64 |
-fn serialize_header(root_dir_stream_id: u64) -> Vec<u8> {
+/// Format: | "filing": [u8;6] | version: u8 | root_dir_stream_id: u32 LE |
+fn serialize_header(root_dir_stream_id: u32) -> Vec<u8> {
     let mut buf = Vec::with_capacity(L4_PAYLOAD_SIZE as usize);
     buf.extend_from_slice(b"filing");
     buf.push(L4_FORMAT_VERSION);
@@ -1894,8 +1875,8 @@ fn serialize_header(root_dir_stream_id: u64) -> Vec<u8> {
 }
 
 /// Deserialize the L4 header (no length prefix), returning root_dir_stream_id.
-/// Input: 15 bytes — identifier starts at byte 0.
-fn deserialize_header(data: &[u8]) -> Result<u64, YakError> {
+/// Input: 11 bytes — identifier starts at byte 0.
+fn deserialize_header(data: &[u8]) -> Result<u32, YakError> {
     if data.len() < L4_PAYLOAD_SIZE as usize {
         return Err(YakError::IoError(format!(
             "L4 payload too short: {} < {}",
@@ -1918,9 +1899,9 @@ fn deserialize_header(data: &[u8]) -> Result<u64, YakError> {
             version, L4_FORMAT_VERSION
         )));
     }
-    // payload[6] = version, payload[7..15] = root_dir_stream_id
-    let root_id = u64::from_le_bytes(
-        data[7..15]
+    // payload[7..11] = root_dir_stream_id (u32 LE)
+    let root_id = u32::from_le_bytes(
+        data[7..11]
             .try_into()
             .map_err(|_| YakError::IoError("failed to parse root_dir_stream_id".to_string()))?,
     );

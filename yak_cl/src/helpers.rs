@@ -4,8 +4,6 @@ use yak::{OpenMode, YakDefault as Yak, YakError};
 
 use crate::error::{CliError, CliResult};
 
-/// Default block index width: 4 bytes (32-bit block addresses)
-pub const DEFAULT_BLOCK_INDEX_WIDTH: u8 = 4;
 /// Default block size shift: 12 (2^12 = 4096-byte blocks)
 pub const DEFAULT_BLOCK_SIZE_SHIFT: u8 = 12;
 

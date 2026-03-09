@@ -6,7 +6,6 @@ import libyak as yak
 
 
 # Default parameters: 4KB blocks, 32KB compressed blocks
-BLOCK_INDEX_WIDTH = 4
 BLOCK_SIZE_SHIFT = 12  # 4096 bytes
 COMPRESSED_BLOCK_SIZE_SHIFT = 15  # 32768 bytes
 COMPRESSED_BLOCK_SIZE = 1 << COMPRESSED_BLOCK_SIZE_SHIFT
@@ -19,14 +18,14 @@ class TestCompressedLifecycle:
     def test_create_with_compression(self, tmp_path):
         """Create a Yak file with compression configured."""
         yak_path = str(tmp_path / "test.yak")
-        fs = yak.Yak.create(yak_path, BLOCK_INDEX_WIDTH, BLOCK_SIZE_SHIFT)
+        fs = yak.Yak.create(yak_path, BLOCK_SIZE_SHIFT)
         fs.close()
         assert os.path.exists(yak_path)
 
     def test_reopen_compressed_yak(self, tmp_path):
         """Create compressed Yak file, close, reopen."""
         yak_path = str(tmp_path / "test.yak")
-        fs = yak.Yak.create(yak_path, BLOCK_INDEX_WIDTH, BLOCK_SIZE_SHIFT)
+        fs = yak.Yak.create(yak_path, BLOCK_SIZE_SHIFT)
         fs.close()
         fs = yak.Yak.open(yak_path, yak.OpenMode.WRITE)
         fs.close()
@@ -38,7 +37,7 @@ class TestCompressedStreamIO:
     @pytest.fixture
     def fs(self, tmp_path):
         yak_path = str(tmp_path / "test.yak")
-        f = yak.Yak.create(yak_path, BLOCK_INDEX_WIDTH, BLOCK_SIZE_SHIFT)
+        f = yak.Yak.create(yak_path, BLOCK_SIZE_SHIFT)
         yield f
         f.close()
 
@@ -155,7 +154,7 @@ class TestCompressedPersistence:
         yak_path = str(tmp_path / "test.yak")
         data = b"persistent compressed data"
 
-        fs = yak.Yak.create(yak_path, BLOCK_INDEX_WIDTH, BLOCK_SIZE_SHIFT)
+        fs = yak.Yak.create(yak_path, BLOCK_SIZE_SHIFT)
         handle = fs.create_stream("data.bin", compressed=True)
         fs.write(handle, data)
         fs.close_stream(handle)
@@ -174,7 +173,7 @@ class TestCompressedPersistence:
         size = COMPRESSED_BLOCK_SIZE * 2 + 5000
         data = bytes(i & 0xFF for i in range(size))
 
-        fs = yak.Yak.create(yak_path, BLOCK_INDEX_WIDTH, BLOCK_SIZE_SHIFT)
+        fs = yak.Yak.create(yak_path, BLOCK_SIZE_SHIFT)
         handle = fs.create_stream("big.bin", compressed=True)
         fs.write(handle, data)
         fs.close_stream(handle)
@@ -197,7 +196,7 @@ class TestMixedStreams:
         plain_data = b"uncompressed content"
         comp_data = b"compressed content"
 
-        fs = yak.Yak.create(yak_path, BLOCK_INDEX_WIDTH, BLOCK_SIZE_SHIFT)
+        fs = yak.Yak.create(yak_path, BLOCK_SIZE_SHIFT)
 
         # Create uncompressed stream (normal create_stream)
         h_plain = fs.create_stream("plain.bin")
@@ -235,14 +234,14 @@ class TestCompressibility:
         size = COMPRESSED_BLOCK_SIZE * 4  # 128KB of zeros — highly compressible
 
         # Write compressed
-        fs = yak.Yak.create(comp_path, BLOCK_INDEX_WIDTH, BLOCK_SIZE_SHIFT)
+        fs = yak.Yak.create(comp_path, BLOCK_SIZE_SHIFT)
         handle = fs.create_stream("zeros.bin", compressed=True)
         fs.write(handle, b"\x00" * size)
         fs.close_stream(handle)
         fs.close()
 
         # Write uncompressed (same data)
-        fs = yak.Yak.create(plain_path, BLOCK_INDEX_WIDTH, BLOCK_SIZE_SHIFT)
+        fs = yak.Yak.create(plain_path, BLOCK_SIZE_SHIFT)
         handle = fs.create_stream("zeros.bin")
         fs.write(handle, b"\x00" * size)
         fs.close_stream(handle)
@@ -262,7 +261,7 @@ class TestCompressibility:
         random.seed(42)
         data = bytes(random.getrandbits(8) for _ in range(COMPRESSED_BLOCK_SIZE + 1000))
 
-        fs = yak.Yak.create(yak_path, BLOCK_INDEX_WIDTH, BLOCK_SIZE_SHIFT)
+        fs = yak.Yak.create(yak_path, BLOCK_SIZE_SHIFT)
         handle = fs.create_stream("random.bin", compressed=True)
         fs.write(handle, data)
         fs.close_stream(handle)
@@ -282,7 +281,7 @@ class TestCompressedTruncate:
     @pytest.fixture
     def fs(self, tmp_path):
         yak_path = str(tmp_path / "test.yak")
-        f = yak.Yak.create(yak_path, BLOCK_INDEX_WIDTH, BLOCK_SIZE_SHIFT)
+        f = yak.Yak.create(yak_path, BLOCK_SIZE_SHIFT)
         yield f
         f.close()
 
@@ -318,7 +317,7 @@ class TestCompressedDelete:
     @pytest.fixture
     def fs(self, tmp_path):
         yak_path = str(tmp_path / "test.yak")
-        f = yak.Yak.create(yak_path, BLOCK_INDEX_WIDTH, BLOCK_SIZE_SHIFT)
+        f = yak.Yak.create(yak_path, BLOCK_SIZE_SHIFT)
         yield f
         f.close()
 
@@ -354,7 +353,7 @@ class TestCompressedVerify:
     def test_verify_after_create(self, tmp_path):
         """Verify passes after creating compressed stream."""
         yak_path = str(tmp_path / "test.yak")
-        fs = yak.Yak.create(yak_path, BLOCK_INDEX_WIDTH, BLOCK_SIZE_SHIFT)
+        fs = yak.Yak.create(yak_path, BLOCK_SIZE_SHIFT)
         handle = fs.create_stream("data.bin", compressed=True)
         fs.write(handle, b"test data")
         fs.close_stream(handle)
@@ -365,7 +364,7 @@ class TestCompressedVerify:
     def test_verify_after_mixed_operations(self, tmp_path):
         """Verify passes after mixed compressed/uncompressed operations."""
         yak_path = str(tmp_path / "test.yak")
-        fs = yak.Yak.create(yak_path, BLOCK_INDEX_WIDTH, BLOCK_SIZE_SHIFT)
+        fs = yak.Yak.create(yak_path, BLOCK_SIZE_SHIFT)
 
         # Compressed stream
         h = fs.create_stream("comp.bin", compressed=True)
@@ -390,7 +389,7 @@ class TestCompressedVerify:
     def test_verify_after_reopen(self, tmp_path):
         """Verify passes after close/reopen."""
         yak_path = str(tmp_path / "test.yak")
-        fs = yak.Yak.create(yak_path, BLOCK_INDEX_WIDTH, BLOCK_SIZE_SHIFT)
+        fs = yak.Yak.create(yak_path, BLOCK_SIZE_SHIFT)
         h = fs.create_stream("data.bin", compressed=True)
         fs.write(h, b"persistent" * 1000)
         fs.close_stream(h)
@@ -408,7 +407,7 @@ class TestCompressedReadOnly:
     def test_write_fails_readonly(self, tmp_path):
         """Writing to compressed stream opened read-only fails."""
         yak_path = str(tmp_path / "test.yak")
-        fs = yak.Yak.create(yak_path, BLOCK_INDEX_WIDTH, BLOCK_SIZE_SHIFT)
+        fs = yak.Yak.create(yak_path, BLOCK_SIZE_SHIFT)
         h = fs.create_stream("data.bin", compressed=True)
         fs.write(h, b"data")
         fs.close_stream(h)
@@ -432,7 +431,7 @@ class TestCompressedLargeData:
         # Repeating pattern — highly compressible
         data = bytes(i & 0xFF for i in range(size))
 
-        fs = yak.Yak.create(yak_path, BLOCK_INDEX_WIDTH, BLOCK_SIZE_SHIFT)
+        fs = yak.Yak.create(yak_path, BLOCK_SIZE_SHIFT)
         handle = fs.create_stream("big.bin", compressed=True)
         fs.write(handle, data)
         fs.seek(handle, 0)
@@ -476,7 +475,7 @@ class TestCompressedParametrized:
         size = cbs * 3 + 500
         data = bytes(i & 0xFF for i in range(size))
 
-        fs = yak.Yak.create(yak_path, BLOCK_INDEX_WIDTH, bss, cbss)
+        fs = yak.Yak.create(yak_path, bss, cbss)
         handle = fs.create_stream("data.bin", compressed=True)
         fs.write(handle, data)
         fs.seek(handle, 0)

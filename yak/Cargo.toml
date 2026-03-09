@@ -30,3 +30,4 @@ aes-kw = "0.2"
 sha2 = "0.10"
 rand = "0.10"
 rayon = "1.10"
+zerocopy = { version = "0.8", features = ["derive"] }

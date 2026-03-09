@@ -204,26 +204,7 @@ class TestCloseFlushesHandles:
 
 
 class TestBlockParameters:
-    """Verify that different block_index_width and block_size_shift work."""
-
-    @pytest.mark.parametrize("biw", [2, 3, 4, 8])
-    def test_varying_block_index_width(self, tmp_path, biw):
-        """Yak works with different block_index_width values."""
-        yak_path = str(tmp_path / f"test_biw{biw}.yak")
-        f = yak.Yak.create(yak_path, block_index_width=biw, block_size_shift=9)
-        f.mkdir("data")
-        h = f.create_stream("data/test")
-        content = b"biw-test-" + bytes(range(256)) * 4
-        f.write(h, content)
-        f.close_stream(h)
-        f.close()
-
-        f = yak.Yak.open(yak_path, yak.OpenMode.WRITE)
-        h = f.open_stream("data/test", yak.OpenMode.READ)
-        readback = f.read(h, f.stream_length(h))
-        assert readback == content
-        f.close_stream(h)
-        f.close()
+    """Verify that different block_size_shift values work."""
 
     @pytest.mark.parametrize("bss", [9, 12, 16])
     def test_varying_block_size_shift(self, tmp_path, bss):
@@ -231,7 +212,7 @@ class TestBlockParameters:
         yak_path = str(tmp_path / f"test_bss{bss}.yak")
         # cbss must be >= bss; use bss + 3 to ensure validity for large block sizes
         cbss = max(bss + 3, 15)
-        f = yak.Yak.create(yak_path, block_index_width=4, block_size_shift=bss,
+        f = yak.Yak.create(yak_path, block_size_shift=bss,
                            compressed_block_size_shift=cbss)
         h = f.create_stream("test")
         # Write enough data to span a few blocks at the given block size

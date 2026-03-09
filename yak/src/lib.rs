@@ -19,13 +19,14 @@ pub use streams_from_blocks::StreamsFromBlocks;
 pub use streams_from_files::StreamsFromFiles;
 pub use yak::{CreateOptions, DirEntry, EntryType, OpenMode, StreamHandle, Yak, YakError};
 
-/// Opaque token identifying a header section slot.
+/// Opaque token identifying an admin data slot in the superblock.
 ///
-/// Used by L2 and L3 to route upper-layer header read/write requests.
-/// In `BlocksInFile`, slots map to regions within block 0 (the superblock).
-/// In mock implementations, slots map to their own internal registries.
+/// Used by L2 and L3 to route upper-layer read/write requests for
+/// mutable administrative data. In `BlocksInFile`, slots map to regions
+/// within block 0. In mock implementations, slots map to their own
+/// internal registries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct HeaderSlotId(pub(crate) u8);
+pub struct AdminSlotId(pub(crate) u8);
 
 /// Default Yak configuration: single-file Yak with default L1, L2, L3, L4 layers.
 pub type YakDefault = Yak<StreamsFromBlocks<BlocksInFile<FileOnDisk, DEFAULT_CACHE_BUDGET_BYTES>>>;
@@ -76,7 +77,7 @@ mod tests {
 
         // Test L3 directly via StreamsFromBlocks
         type L3 = StreamsFromBlocks<BlocksInFile<FileOnDisk, DEFAULT_CACHE_BUDGET_BYTES>>;
-        let l3 = L3::create(path_str, 4, 12, 0, std::collections::VecDeque::new(), None).unwrap();
+        let l3 = L3::create(path_str, 12, 0, std::collections::VecDeque::new(), None).unwrap();
 
         // Initially no streams
         assert_eq!(l3.stream_count().unwrap(), 0);
@@ -114,7 +115,7 @@ mod tests {
         let _ = std::fs::remove_file(&path); // clean up from previous run
         let path_str = path.to_str().unwrap();
 
-        // block_size=512, block_index_width=4, fan_out=128
+        // block_size=512, fan_out=128 (block_size / 4)
         // depth 2 needs > 128 data blocks, so > 65536 bytes
         let yk = YakDefault::create(
             path_str,
@@ -286,4 +287,5 @@ mod tests {
             yk.close().unwrap();
         }
     }
+
 }

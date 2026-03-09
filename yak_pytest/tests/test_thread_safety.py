@@ -32,7 +32,7 @@ class TestStreamLifecycleStress:
         Uses small blocks (512 bytes) to force multi-block growth quickly.
         """
         yak_path = str(tmp_path / "lifecycle.yak")
-        f = yak.Yak.create(yak_path, block_index_width=4, block_size_shift=9)
+        f = yak.Yak.create(yak_path, block_size_shift=9)
 
         # Single shared directory -- all threads contend on the same
         # directory stream write-lock.
@@ -100,7 +100,7 @@ class TestStreamLifecycleStress:
         Streams stream.
         """
         yak_path = str(tmp_path / "accumulate.yak")
-        f = yak.Yak.create(yak_path, block_index_width=4, block_size_shift=9)
+        f = yak.Yak.create(yak_path, block_size_shift=9)
 
         # Each thread gets its own directory
         for i in range(NUM_LIFECYCLE_THREADS):

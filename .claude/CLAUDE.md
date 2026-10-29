@@ -1,6 +1,10 @@
 # Yak
 
+## DO NOT WRITE CODE
+Currently, I am working SOLELY on the ./../docs/new_architecture.md file, using the code as a reference point while we author new_architecture.md together.
+
 ## Conventions
+- L0                = Layer 0
 - L1                = Layer 1
 - L2                = Layer 2
 - L3                = Layer 3
@@ -17,10 +21,22 @@ When a human is making suggestions and something seems more trouble than it's wo
 
 When a new, larger piece of work is to be undertaken, please create a worktree & a branch for the work so it can be separated and benchmarked in isolation, against what is currently in master.
 
-## Architecture
-Please read the [architecture](./../docs/architecture.md) for a comprehensive overview of Yak. This architecture must be respected - if it cannot, please stop, inform and ask for directions.
+Code readability and clean architecture matters to humans. Don't violate the architectural constraints for expedience.
 
-Whenever you are updating .md files, do not ever change ./../docs/architecture.md withot asking the user and explaining why you wish to change this file, what is wrong with the architecture and what you propose to change. Keep track of divergences from the defined architecture in [differences](./../docs/differences.md).
+## Rewriting for transactions
+Currently Yak is undergoing major changes as it prepares for 1.0.0 - which uses COW semantics to create high performance transactions. While we are operating on the existing code base, we are almost "back to square 1" in terms of evolving Yak. This means it's fine to change public APIs and we don't need to consider how the library supports old versions.
+
+## Architecture
+Please read the [old architecture](./../docs/architecture.md) for a comprehensive overview of the old structure of Yak.
+Please read the [new architecture](./../docs/new_architecture.md) for a comprehensive over of the new structure of Yak, which we are now developing.
+The code is in transition between the old and the new architecture. The desired end-state is one that conforms to the new architecture, which we evolve in steps together.
+
+If the new architecture creates difficult decisions or blurs the line between the layers, stop and ask for direction.
+
+While we evolve the architecture towards the new one, that supports transactions, do not ever change ./../docs/architecture.md. 
+Do not ever change ./../docs/new_architecture.md withot asking the user and explaining why you wish to change this file, what is wrong with the architecture and what you propose to change. 
+
+[Differences](./../docs/differences.md) keeps track of difference between the code and the old architecture. There's no need to update this at the minute, as the new architecture will diverge quite a bit.
 
 Duplication of code should be concerning when we write code. If duplicated code exists, and there's no performance penalty to extracting it into a function, we should consider doing so. In release mode, small functions are likely to be inlined by the compiler.
 
@@ -53,7 +69,7 @@ Whenever you make changes, they must be in sync across the five key projects:
 As far as possible, when planning features, help the author first plan out how this feature should be tested in the pytest library. If tests cannot be written in the Python API, due to lack of exposure of the necessary internals, Rust tests can be used instead. Only after tests have been planned and written, and failed, should we move to implementation and satisfy the tests. This won't always be possible, but whenever it is, this is the preferred method for development. Whenever large changes have been achieved, the full test suite in yak_pytest must pass too.
 
 ## Layers in Yak must be respected
-It is critical that the four layers in Yak are kept as decoupled as possible: L4 should only know about L3, L3 should only know about L2, L2 should only know about L1. If you find yourself writing code that ignores this architectural decoupling, stop, inform and ask for directions.
+It is critical that the five layers in Yak are kept as decoupled as possible: L4 should only know about L3, L3 should only know about L2, L2 should only know about L1, L1 should only know about L0. L0 knows nothing about Yak's file format. The code currently has four layers (no L0 yet); until it is split out, today's L1 covers both L1 and L0. If you find yourself writing code that ignores this architectural decoupling, stop, inform and ask for directions.
 
 ## Warnings are errors - keeping it clean
 If there's a cleaner/neater way to do something, please suggest it.

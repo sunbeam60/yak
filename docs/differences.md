@@ -42,6 +42,42 @@ The architecture previously described only 3 fields (size, top_block, reserved =
 
 ## Active divergences
 
+### Header layout completely restructured (v0.12.0)
+
+**Architecture says:** Each layer requests a "header slot" from L1. The layout is:
+```
+Magic: File magic header | header layout version | total layer header length
+L1: length | L1 identifier | L1 version
+L2: length | L2 identifier | L2 version | block size shift | block index width | free list head | encryption flag | [...]
+L3: length | L3 identifier | L3 version | Streams stream descriptor
+L4: length | L4 identifier | L4 version | root directory stream index
+```
+
+**Reality:** The file now has three distinct regions:
+1. **Immutable magic header** (12 bytes at offset 0): `"yakyakyak"` (9 bytes) | header format version (1 byte) | data_offset (u16)
+2. **Bootstrap section** (at offset 12): `block_size_shift` (1 byte) | `encrypted` flag (1 byte) | [encryption parameters if encrypted, 129 bytes]. This is written once at creation and never modified.
+3. **Block 0 (superblock)**: The first data block, containing all mutable metadata. Has its own magic (`"blk0"`), version byte, free list head (u32), and a slot system where upper layers (L3, L4) store their admin data.
+
+There are no longer per-layer header slots managed by L1. The mutable information that was in L2/L3/L4 headers now lives inside block 0 slots (encrypted along with all other blocks when encryption is enabled). The immutable header and bootstrap section are never encrypted.
+
+### Block index width removed — u32 everywhere (v0.12.0)
+
+**Architecture says:** Block index width is configurable (e.g. 4 = 32-bit indices) and stored in the L2 header.
+
+**Reality:** Block index width has been removed as a configurable option. All block indices are now always `u32`. The sentinel value is `u32::MAX` (0xFFFFFFFF). This simplification enables flat-packed zerocopy structures for admin data, removing the need for manual packing/unpacking at varying widths. `CreateOptions` no longer has a `block_index_width` field, and the L4 `Yak` struct no longer exposes `block_index_width()`.
+
+### Free list redesigned as trunk-and-extent system (v0.12.0)
+
+**Architecture says:** Free list is a linked list through blocks — the free list head in L2's header points to the first free block, and the first bytes of each free block contain the index of the next free block.
+
+**Reality:** The free list head is now a `u32` in the block 0 header, pointing to the first "trunk" block. Each trunk block contains: a `next_trunk` pointer (u32, or sentinel) followed by an array of `TrunkExtent` pairs (start: u32, length: u32), each representing a contiguous run of free blocks. Unused extent slots have `start == BLOCK_INDEX_SENTINEL`. This extent-based design allows contiguous runs to be tracked explicitly rather than requiring a chain through every individual free block.
+
+### L2 header table is outdated
+
+**Architecture says:** The L2 header table lists: Identifier (6) | Version (1) | Block size shift (1) | Block index width (1) | Free list head (8) | Encryption flag (1) | [...encryption fields...] | Total: 18/147 bytes.
+
+**Reality:** This table no longer matches the implementation. Block size shift and encrypted flag are now in the bootstrap section (not a layer header). Block index width no longer exists. Free list head is a u32 in block 0 (not a u64 in a header). Encryption parameters are in the bootstrap section. The entire concept of an "L2 header" with identifier/version is gone — replaced by the bootstrap + block 0 approach.
+
 ### L2 API is broader than documented
 
 **Architecture says:** L2's API should be restricted to: allocate a new block, write a buffer to a block, read a block to a buffer, and deallocate a used block.
@@ -77,7 +113,7 @@ The architecture discusses reserved capacity and compression conceptually but do
 **Architecture says:** L4 provides creating/renaming/deleting streams and directories, iterating, understanding length, reading, writing, positioning, and closing streams.
 
 **Reality:** The `Yak` struct also exposes:
-- `create(path, CreateOptions)` -- uses an options struct (with `block_index_width`, `block_size_shift`, `compressed_block_size_shift`, `password`) rather than individual parameters
+- `create(path, CreateOptions)` -- uses an options struct (with `block_size_shift`, `compressed_block_size_shift`, `password`) rather than individual parameters
 - `open_encrypted()` -- separate method for opening encrypted files with a password
 - `close(self)` -- file-level close that consumes self and flushes all open streams
 - `create_stream(path, compressed)` -- takes a `compressed: bool` parameter
@@ -85,7 +121,7 @@ The architecture discusses reserved capacity and compression conceptually but do
 - `is_encrypted()` -- query file encryption
 - `tell()` -- query current head position (complement to `seek()`)
 - `reserve()` / `stream_reserved()` -- pre-allocate and query stream capacity
-- `block_index_width()` / `block_size_shift()` / `compressed_block_size_shift()` -- query file configuration
+- `block_size_shift()` / `compressed_block_size_shift()` -- query file configuration
 - `optimize()` -- compaction and defragmentation (returns bytes reclaimed)
 - `verify()` -- integrity checking
 
@@ -106,8 +142,6 @@ The architecture discusses reserved capacity and compression conceptually but do
 
 Both caches are write-through. The `CacheMode` enum is threaded through L3 to select the appropriate cache for each operation. The architecture describes a single thread-local cache; the dual-cache avoids full cache invalidation when threads share access to internal streams (like the Streams stream that holds descriptors).
 
-### Architecture header example has a terminology inconsistency
+### Architecture header example has a terminology inconsistency (superseded)
 
-**Architecture says** (in the header layout example): `block index size shift`
-
-**Reality:** The field is `block_index_width` -- it represents the number of bytes per block index (e.g. 4 = 32-bit), not a shift. The architecture's own L2 header table later correctly calls it "Block index width". The header layout example at the top should say `block index width` instead of `block index size shift`.
+**Status:** This inconsistency (`block index size shift` vs `block index width`) is now moot — block index width has been removed entirely (see "Block index width removed" above). The architecture still references both terms in the old header layout example and in the L2 header table; both are outdated.

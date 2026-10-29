@@ -29,3 +29,6 @@ __pycache__/
 
 # Profiling output
 profile.json.gz
+
+# Claude Code worktrees
+.claude/worktrees/

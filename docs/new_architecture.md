@@ -22,7 +22,6 @@ This section lists decisions reached together with an AI. The rest of the docume
   | `delete_stream`, `rename_stream`                       | ✓                   |                 |
   | `create_dir`, `delete_dir`, `rename_dir`               | ✓                   |                 |
   | `stream_version`, `dir_version`, `version` → `Version` | ✓ (working version) | ✓ (its version) |
-  | `create_unlinked_stream`, `link_stream`                | ✓                   |                 |
   | `commit`, `rollback`                                   | ✓                   |                 |
   | `refresh`, `close`                                     |                     | ✓               |
   
@@ -50,23 +49,11 @@ Streams are addressable by "directory" (recognised by ending with a forward-slas
 
 It is not possible to "open" a directory, i.e. in the above example, the user cannot open "an empty folder/". The user can only open streams for reading and writing - the "directories" function the same way as a real file system directory functions, in that they are used to contain things, namely other directories and streams.
 
-To make any changes to streams and directories, a transaction must first be created. Using this transaction, the necessary changes can be made and then committed, once the state of the Yak file is consistent as defined by the caller. A transaction enables both reading and writing from streams and any changes made in the transaction are immediately visibly to other readers created by the same transaction. 
+To make changes to streams and directories, a transaction must be begun. Using this transaction, the necessary changes can be made and then committed, enabling atomic changes to occur in the file. A transaction enables both reading and writing from streams and any changes made in the transaction are immediately visibly to other readers created by the same transaction. 
 
-Alternatively, a snapshot can be created, which enables the reading of contents of directories and streams. This snapshot is frozen in time from the last last succesful transaction commit and it is isolated from changes that occur in later transactions. A snapshot can be manually refreshed, which brings it up to date to the last succesful transaction, meaning its view of the Yak file is always consistent.
+Alternatively, a snapshot can be created, which enables the reading of contents of directories and streams. This snapshot is frozen in time from the last last successful transaction commit and it is isolated from changes that occur in later transactions. A snapshot can be manually refreshed, which brings it up to date to the last successful transaction, meaning its view of the Yak file is always consistent.
 
 From a transaction, functions are provided for deleting both streams and directories and for shrinking the length of an existing stream. If a stream write exceeds the current length of the stream, the stream is extended automatically, akin to writing a regular file. If a stream "position" is set beyond the length of the stream, an error occurs. Any changes made only become durable, and readable by later or refreshed snapshots, once committed. 
-
-## Transactions
-
-THIS SECTION SHOULD PROBABLY BE SOMEWHERE ELSE.
-
-A Yak file has one *committed version*: the complete state of the file - every directory, every stream and every byte in them - as of the last commit. While a write transaction is open, it also has a *working version*: the committed version plus the transaction's changes. A commit makes the working version the new committed version, all at once. Previous versions are not kept: once nothing is reading them, their blocks are reused. A read transaction keeps the committed version it began on for as long as it is open, so while a long-running reader is open, older versions can exist alongside the current one. Versions are numbered by a sequence number that increases by one with every commit.
-
-Changes made to a Yak file are made in a *write transaction*. A write transaction is started explicitly with `begin_transaction()`, and nothing it changes becomes part of a version until it is *committed*, at which point all of its changes become the new version at once. If the process crashes, or the machine loses power, before a commit completes, the Yak file opens at the previous version, exactly as it was. A write transaction can also be *rolled back*, discarding its changes. Only one write transaction can be open on a Yak file at a time.
-
-Yak never overwrites data that belongs to a committed version. Changes are written to fresh blocks, and a commit makes them the committed version by switching a single root pointer in the file header. This technique is known as copy-on-write (COW), and it is the same approach used by file systems such as ZFS and Btrfs and by databases such as LMDB.
-
-Reading is done in a *read transaction*, started with `begin_snapshot()`. A read transaction is pinned to the version that was committed when it began, and everything read through it - directory listings, stream lengths and stream contents - comes from that version, so it is always a consistent picture of the whole file. Because committed versions are never modified, any number of read transactions can read while a write transaction prepares the next version: they never block the writer and are never blocked by it. A write transaction sees its own changes - new names in its listings, new data in its streams - and nobody else sees them until it commits.
 
 ## Use
 
@@ -223,9 +210,9 @@ If a process crash or a system power loss occurs, a Yak file opens to look exact
 Since commits can be optionally specified to occur with no durability (increases speed when the Yak file's integrity isn't critical or can easily be recreated), a function to verify the integrity of a Yak file is provided.
 
 ## Block indices and stream identifiers
-By default, block indices are defined to be 32-bit unsigned integers (u32), whatever the block size. The value 0xFFFFFFFF is reserved as a sentinel meaning "no block", so a Yak file holds at most 2^32 - 1 blocks. The block size therefore sets the largest possible file (e.g. ~16 TiB with 4 KiB blocks and ~256 TiB with 64 KiB blocks). Files that need to be larger use larger blocks. Yak can optionally be built using smaller (u8, U16) or larger (u64) blocks but Yak files created with these settings must be opened by a custom Yak library that supports this type. When creating a new Yak file, or loading an existing Yak file, block index width (1, 2, 4 or 8 bytes) are stored and verified in a Yak file and an error occurs if a file is loaded with the wrong block index width.
+Block indices are defined to be 32-bit unsigned integers (u32), whatever the block size. The value 0xFFFFFFFF is reserved as a sentinel meaning "no block", so a Yak file holds at most 2^32 - 1 blocks. The block size therefore sets the largest possible file (e.g. ~16 TiB with 4 KiB blocks and ~256 TiB with 64 KiB blocks). Files that need to be larger use larger blocks. Yak can optionally be built using smaller (u8, U16) or larger (u64) blocks but Yak files created with these settings must be opened by a custom Yak library that supports this type. Block index width (1, 2, 4 or 8 bytes) is stored in a Yak file and an error occurs if a caller attempts to load a Yak file created using a different block index width.
 
-It follows that stream identifiers are the same datatype as block indices, since a stream typically are at least 1 block and there cannot be more streams than there are blocks possible. For stream identifiers, 0xFFFFFFFF is reserved as a sentinel value as well.
+It follows that stream identifiers are the same datatype as block indices, since a stream typically are at least 1 block and there cannot be more streams than there are blocks possible (technically, a stream can take no storage other than the stream descriptor in the Streams stream, but it's hard to imagine a Yak file with more than 4 billion completely empty streams). For stream identifiers, 0xFFFFFFFF is reserved as a sentinel value as well.
 
 Byte counts, such as a stream's size and reserved size, are u64, because a single stream can be larger than 4 GiB.
 
@@ -237,182 +224,135 @@ Naturally Yak cannot make any guarantees about the endianness of user-written st
 
 ## Transactions & snapshots
 
-All modifications made in a Yak ultimately end up as modifications to the bytes held in the stream blocks and to the header of the Yak file. In a storage library without transaction support, changes would be written directly to the file, but in Yak (like in most other other embedded storage libraries), changes made by a transaction are kept separate from the original file; instead of performing those changes on the original blocks and the original header, all changes occur in *new* blocks and a *new* header that is kept in memory by the transaction. 
+All modifications made in a Yak ultimately end up as modifications to the bytes held in the stream blocks and to the header of the Yak file. In a storage library without transaction support, changes would be written directly to the file, but in Yak (like in other embedded storage libraries with transaction support), changes made by a transaction are kept separate from the original file; instead of performing those changes on the original blocks and the original header, all changes occur in *new* blocks and a *new* header that is kept in memory by the transaction. 
 
 ### Committing a transaction
 
-So when a user needs to change, say, the value of 10 bytes in a stream, Yak first copies the original block where those 10 bytes are held into memory and then performs the change on this in-memory block, not the physical block on disk. The transaction keeps hold of this in-memory block, and any other blocks that are modified during the transaction, and whenever further changes, or further reads, happen in that block, the transaction uses the in-memory, stand-in block rather than the block on disks. In effect, a transaction pretends that the changes have occurred in the original file, but they have actually only occurred in the in-memory stand-in blocks.
+When a user needs to change the value of 10 bytes in a stream, say, Yak first copies the original block where those 10 bytes are held into memory and then performs the change on this in-memory block, not the original, physical block on disk. The transaction keeps hold of this in-memory block, and any other blocks that are modified during the transaction, and whenever further changes, or further reads, happen in those modified blocks, the transaction uses the in-memory, stand-in blocks rather than the blocks on disks. In effect, a transaction pretends that the changes have occurred in the original file, but they have actually only occurred in the in-memory stand-in blocks.
 
-When a transaction is committed all the in-memory blocks are written to the Yak file - not on top of the existing blocks, but as new blocks. These blocks are connected together by redirectors, from bottom up, as they are written into the file. An additional upside of knowing which blocks have changed, and which streams they belong to, is that the blocks can be written out as contiguously as possible, promoting optimised read and write speeds to the actual file.
+When a transaction is committed all the in-memory blocks are written to the Yak file - not on top of the existing blocks, but as new blocks. These blocks are connected together by redirectors, from bottom up, as they are written into the file. An additional upside of knowing which blocks have changed, and which streams they belong to, is that the blocks can be written out as contiguously as possible, promoting optimised read and write speeds on the actual file.
 
-Once the blocks are known to have actually been written to disk, the header is updated with a new version number and also written to disk. To avoid the new header overwriting the old header that may be in the process of being read by another thread or process, the header is written to a second slot and a higher version number is written as the very last thing in the write. This makes the second slot the highest header version, which causes new readers to recognise the new header as the current header. In this way, writers alternate between two header slots, using the version number to signal which one is the latest one.
+Once the blocks are known to have actually been written to disk, the header is updated with a new version number and also written to disk. To avoid the new header overwriting the old header that may be in the process of being read by another thread or process, the header is written to a second header slot and a higher version number is written as the very last thing in the write. This makes the second slot the highest header version, which causes new readers to recognise the new header as the current header. In this way, writers alternate between two header slots, using the version number to signal which one is the latest one.
+
+As a practical example, observer Fig 1.a. Here the current header is version 410 and its out-of-band stream descriptor (which points to the Streams stream) indicates that block 84 is the top block in the Streams stream. Inside block 41 there are 5 stream descriptors, with the last one pointing to a data stream at block 140.
+
+Fig 1.a
+
+ Header 1                Header 2                                                                            
+ (current header)                                                                                            
+┌──────────────┐        ┌──────────────┐                                                                     
+│ Version 410  │        │ Version 409  │                                                                     
+│              │        │              │                                                                     
+│              │        │              │                                                                     
+│ ┌          ┐ │        │ ┌          ┐ │                                                                     
+│ │ Size: 14 │ │        │ │ Size: 10 │ │                                                                     
+│ │ Top:  84 │ │        │ │ Top:  12 │ │                                                                     
+│ └       │  ┘ │        │ └          ┘ │                                                                     
+└─────────┼────┘        └──────────────┘                                                                     
+          │                                                                                                  
+          │                                                                                                  
+          │                                                                                                  
+          │                                                                                                  
+          │                                                                                                  
+          │                                                                                                  
+          │                                                                                                  
+          │                                                                                                  
+          │                                                                                                  
+          ▼  (Streams stream)                                                                                
+          84┌──────────┐                                                                                     
+            │41|39|  | │                                             (data stream)                           
+            └─┬────────┘                                      ┌─►140┌──────────┐                             
+              ├41┌──────────┐                   ┌          ┐  │     │15|11|  | │                             
+              │  │[][][][][]┼──────────────────►│ Size: 18 ├──┘     └─┬────────┘                             
+              │  └──────────┘                   │ Top: 140 │          ├15┌──────────┐                        
+              └39┌──────────┐                   └          ┘          │  │..........│                        
+                 │[][]      │                                         │  └──────────┘                        
+                 └──────────┘                                         └11┌──────────┐                        
+                                                                         │........  │                        
+                                                                         └──────────┘                        
+                                                                                                             
+ ─────────────────────────────────────────────────────────────────────────────────────────────────────────── 
+
+Fig 1.b
+
+ Header 1                Header 2                                                                            
+                         (current header)                                                                    
+┌──────────────┐        ┌──────────────┐                                                                     
+│ Version 410  │        │ Version 411  │                                                                     
+│              │        │              │                                                                     
+│              │        │              │                                                                     
+│ ┌          ┐ │        │ ┌          ┐ │                                                                     
+│ │ Size: 14 │ │        │ │ Size: 14 │ │                                                                     
+│ │ Top:  84 │ │        │ │ Top:  60 │ │                                                                     
+│ └       │  ┘ │        │ └       │  ┘ │                                                                     
+└─────────┼────┘        └─────────┼────┘                                                                     
+          │                       │                                                                          
+          │                       │ (new Streams stream)                                                     
+          │                       ▼ (copy of 84)                                                             
+          │                       60┌──────────┐                                                             
+          │                         │61|39|  | │               (copy of stream descriptor                    
+          │                         └─┬────────┘                from 41, now modified in 61)                 
+          │                           ├61┌──────────┐          ┌          ┐                                  
+          │                           │  │[][][][]xx┼─────────►│ Size: 18 ├──────────┐                       
+          │                           │  └──────────┘          │ Top:  77 │          │                       
+          ▼  (old Streams stream)     │  (copy of 41)          └          ┘          │                       
+          84┌──────────┐(-)           │                                              │      (data stream)    
+            │41|39|  | │              │                             (data stream)    │      (copy of 140)    
+            └─┬────────┘              │                       ┌─►140┌──────────┐(-)  └───►77┌──────────┐     
+              ├41┌──────────┐(-)      │         ┌          ┐  │     │15|11|  | │            │41|11|  | │     
+              │  │[][][][][]┼─────────┼────────►│ Size: 18 ├──┘     └─┬────────┘            └─┬────────┘     
+              │  └──────────┘         │         │ Top: 140 │          ├15┌──────────┐(-)      ├41┌──────────┐
+              └39┌──────────┐39───────┘         └          ┘          │  │..........│         │  │...xxxx...│
+                 │[][]      │                                         │  └──────────┘         │  └──────────┘
+                 └──────────┘                                         └11┌──────────┐11───────┘  (copy of 15)
+                                                                         │........  │                        
+                                                                         └──────────┘     
+
+In Fig 1.b, we can see the results of changing some data inside of the data stream starting at block 140. This data is located at block 15 and when Yak writes the user data into this stream, it does not write these changes into block 15 - instead it allocates a new block (41), copies the content of block 15 into 41, then modifies the data in 41.
+
+Because we now need to modify the redirector at 140 to point to new block 41, it would be tempting to modify 140 directly. But Yak never touches the data that already exists. Instead it copies the redirector at 140 into a newly allocated block (77), copies the content of 140 into 77, then writes the updated block index 41 over the previous index 15.
+
+We now need to change the descriptor that points to this modified stream, because the top block, the redirector, is no longer 140, but 77. So we wish to modify the stream descriptor at 41, but once again, we never modify data in-place. Instead we allocate a new block, 61, copy 41 into 61 and write our updated stream descriptor there. Because we've now created a new top block for the Streams stream, we allocate a new top block (60), copy 84 into 60 and then write our modified redirector there.
+
+Finally we update the header that now points to the Streams stream (the top block has moved from 84 to 60). Once again, we do not do this in the original header, but we instead write it into the previously used header (Header 2), where we update the version number to now be higher than the previous header (411 > 410). This marks Header 2 as the current header and the transaction has now committed.
+
+#### File system consistency
+
+File writes - to Yak files or indeed any other file found on a machine - are generally not guaranteed to be done in the order they were issued. In addition, file system and storage hardware caches can often mean the file system reports "changes written to disk" before they actually are. To guarantee that a new header update doesn't get written to disk before the changed blocks, which would cause inconsistency for a new reader that might read the new header and assume that the blocks had indeed been written to disk, Yak uses file system sync points to guarantee that a write has fully completed; first sync point is after the transaction blocks have been written, the second is after the new header has been written. This ensures things occur in order and that the header gets written as the very last thing.
 
 ### Reading a snapshot
 
-While a transaction is occurring, many snapshots, across separate threads and processes on the local machine, can still read data from the Yak file, without being affected by any changes the transaction is making. Even after the transaction has committed, the snapshot's view of the Yak file stays frozen from when the snapshot was originally begun. 
+While a transaction is occurring, many snapshots, across threads and processes on the local machine, can still read data from the Yak file, without being affected by any changes the transaction is making. Even after the transaction has committed, and actually written to the disk, the snapshot's view of the Yak file stays frozen from when the snapshot was originally begun. A snapshot does not keep itself up to date with the latest transaction - it can either be manually refreshed or closed and a new snapshot can be begun.
 
 A snapshot begins by reading both header slots and choosing the header with the highest version, which it copies into memory. In this header copy there is the Streams stream descriptor, which enables the snapshot to locate all other streams. This is possible because any later transaction write its changes to new blocks, not the original blocks. So all the blocks of the Streams stream, and all the blocks that make up all the other streams for this version, are still in the file, unchanged from when the snapshot first copied the header. Changed blocks only occur from committing transactions and they are always written into new blocks.
 
-It follows from this that a Yak file continually grows; every time a transaction is committed, it writes changes to unused or brand new blocks. If we proceeded like this, a Yak file would grow indefinitely large as transactions are committed, because no blocks would ever be freed.
+It follows from this that a Yak file could continually grow; every time a transaction is committed, it writes changes to unused or brand new blocks. If we proceeded like this, a Yak file would grow indefinitely large as transactions are committed, because no blocks would ever be re-used. This is clearly not practical, so the lifetime of blocks have to be managed. Put another way, as long as a snapshot exists to read a block, the block needs to continue to stick around, in original form, at the original location.
 
-Blocks need to stay around exactly as long as the snapshot that's reading from the blocks exist.
+### Managing block lifetime with transactions & snapshots
 
-### Managing blocks with transactions & snapshots
+To manage block lifetime, transactions mark the blocks that have been superseded (because they have been copied and modified) as "pending free". From the perspective of the transaction, only the content in the new blocks (which are modified copies of the old blocks) and the existing, unmodified blocks matter. Yak does not actually free these superseded blocks yet, however, because a snapshot may still read from them. Each "pending free" block is marked with the version number that the transaction was started at.
 
-Because transactions write changes to new blocks only, and never overwrite old blocks, transactions mark the blocks that have been superseded (because the transaction has changed the blocks) as "pending free". From the perspective of the transaction, only the content in the new blocks (which are a modified copies of the old blocks) matter and the original blocks do not. Yak does not actually free these blocks yet, however, because a snapshot may still read from them. Each "pending free" block is marked with the version number that the transaction was started at.
-
-To understand when a block that has been marked as "pending free" can actually be freed, Yak keeps track of each snapshot's version. When a later write transaction needs unused blocks (to make changes) Yak checks what snapshots are ongoing and which version each were begun at. If a "pending free" block has a lower version number than the lowest version number of all ongoing snapshots (or if there are no snapshots), it is no longer required and can therefore be reused by the committing transaction.
-
+When a later write transaction needs unused blocks (adding blocks to a stream, or needing new blocks because changes need to be written to existing blocks) Yak needs to either re-use blocks or add new blocks at the end of the Yak file. For the re-use case, which it checks first, it frees all "pending free" blocks that were marked "pending free" before the oldest snapshots or, if there are no snapshots, the last committed transaction. This is safe because no snapshot now exists to read from these blocks. 
 
 ### Synchronising access to a Yak file across processes
 
-The final step in a transaction commit is thus to write the new header
+So far, the transaction & snapshot explanations above have assumed that transactions and snapshots occur within the same process, where threads can share memory to coordinate.
 
-This system creates a couple of advantages:
-- In-progress changes are isolated away from the main file. If a crash occurs, these changes disappear, leaving the file in a consistent state.
-
-
-
-
-Since the header of the Yak file is the "root" of the entire Yak file, from which all other information is found, to commit a transaction is to update the header, which points to an updated Streams stream, which points to updated stream descriptor, which points to updated redirectors, which points to updated data blocks.
-
-changes made to these "pretend" blocks exist only in the transaction's memory. Outside of the transaction, snapshots enable reading of a Yak file, and those 
-
-After a transaction has been opened, it is able to modify directories and streams. Every modification occurs in a new block instead of the original blocks written to disk inside the Yak file. So, for example, if 10 bytes are overwritten in a stream, it means those 10 bytes should be overwritten in a block somewhere in the Yak file - but instead of being written directly into the Yak file, the block that needs modification is copied into memory and the change occurs there. Inside the transaction, whenever further data is read from or written to this block, it now reads from or modifies the in-memory copy instead of the actual, physical file. Since this modified block is part of a stream, any redirector blocks pointing to this block also need a modification (they should no longer point to the original block, but the modified block that now sits in memory). Further redirectors may sit on top of this block, so the hierarchy of redirectors blocks are modified - all creating in-memory edits - up to and including the Stream descriptor that
-
-When the transaction is committed, it is now time to write this modified block 
-
-A transaction is created on the Yak file itself, returning a transaction handle.
-
-### The one rule
-
-Everything in this design follows from one rule:
-
-> **A block that can be reached from a committed version that might still be read is never overwritten.**
-
-"Might still be read" covers three cases: the committed version (the latest commit), any version a reader is holding, and the version a crash would fall back to. Changes are written to blocks that no such version can reach. A version only ever points at blocks whose contents are final.
-
-### Words used in this document
-
-| Term              | Meaning                                                                                                                                                                                              |
-| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Version           | The complete state of the Yak file as of a commit, identified by its sequence number. Only the committed version, the working version and versions held by open read transactions exist at any time. |
-| Committed version | The version made by the latest commit. New read transactions start here.                                                                                                                             |
-| Header slot       | One of two fixed locations at the start of the file holding a complete header. The slot with the highest valid sequence number is live.                                                              |
-| Write transaction | A set of changes, begun with `begin_transaction()` and ended by committing or rolling back. At most one is open per Yak file at a time.                                                              |
-| Working version   | What a write transaction sees: the committed version when it began, plus its own changes.                                                                                                            |
-| Read transaction  | A read-only view pinned to the version that was committed when it began.                                                                                                                             |
-| Dirty block       | A block changed in the write transaction that has not yet been placed in the file.                                                                                                                   |
-| Private block     | A block allocated by the write transaction. No committed version can reach it, so it can be written in place.                                                                                        |
-| Pending block     | A block that the committed version no longer uses but an older version still might. It cannot be reused yet.                                                                                         |
-
-### Life of a transaction
-
-A write transaction begins with `begin_transaction()`. Every change made through it, by any thread sharing it, joins it. Since write transactions are serialised, the committed version when a write transaction begins is the version it will replace.
-
-1. **Changes collect in memory.** When a stream is written, L3 does not touch the blocks of the committed version. It records the changed block in a *dirty map* in memory, keyed by the block's position in the stream rather than by a block index. Changing a block also means its parent redirector must point somewhere new, so the parent is copied into the dirty map too, and so on up to the stream's top block and its stream descriptor. Directory changes are writes to directory streams, so they are collected the same way.
-2. **Large transactions spill.** If the dirty map grows beyond its memory budget, L3 places some dirty blocks early: it allocates private blocks for them, writes them out and keeps only their new index in memory. Nothing committed points at a private block, so this is safe.
-3. **Commit places everything, bottom-up.** On commit, L3 gives every dirty block a home. Children are placed before their parents, because a parent's contents are its children's block indices. Data blocks come first, then redirectors, then stream descriptors, then the Streams stream that holds the descriptors.
-4. **L2 records its free space.** L2 writes its own changes copy-on-write: the head of the free list, and a record of the blocks this commit stopped using.
-5. **Everything is synced.** L1 makes sure every block written so far has reached storage.
-6. **The header is published.** L1 writes a complete new header into the header slot that is *not* live, with the next sequence number, and syncs it. This single write is the commit.
-7. **Old blocks are released when safe.** Blocks used by the previous version but not by the new one become pending. They are made available for reuse once no reader can still see them.
-
-```ASCII
- write calls                    commit()
- ───────────►  ┌───────────┐    ──────────────────────────────────────────────────────►
-               │ Dirty map │    place      L2 free     sync    write other    sync
-               │ (memory)  │    bottom-up  list +              header slot    = commit
-               └───────────┘    (L3)       pending             (L1)           point
-                     │          │          (L2)        (L1)                    │
-              spill if over     ▼                                              ▼
-              memory budget   new blocks written to free space          new version live;
-                              (no committed block touched)              old blocks pending
-```
-
-### Two header slots
-
-The file header exists twice, in two slots at fixed positions at the start of the file. Each slot holds a full copy of every layer's header data, a sequence number and a checksum. A commit always writes the slot that is not live:
-
-```ASCII
-┌───────────────────────────────────────────────┐
-│ Magic: Yak magic | layout version | slot size │  written once, at creation
-├───────────────────────────────────────────────┤
-│ Slot A: seq 41 | L1 | L2 | L3 | L4 | checksum │  previous commit (fallback)
-├───────────────────────────────────────────────┤
-│ Slot B: seq 42 | L1 | L2 | L3 | L4 | checksum │  latest commit (live)
-├───────────────────────────────────────────────┤
-│ Block 1 | Block 2 | Block 3 | ...             │
-└───────────────────────────────────────────────┘
-```
-
-When a Yak file is opened, L1 reads both slots and uses the one with the highest sequence number whose checksum is valid. If a crash interrupts a header write, that slot's checksum fails and the other slot - the previous commit, still fully intact because the one rule kept all its blocks untouched - is used instead.
-
-### What a crash leaves behind
-
-| Crash happens...                        | File opens at    | Why                                                                                                      |
-| --------------------------------------- | ---------------- | -------------------------------------------------------------------------------------------------------- |
-| While changes collect in memory         | Previous version | Nothing has been written outside free space.                                                             |
-| After spilling, or while placing blocks | Previous version | New blocks were written to space the previous version considers free. Nothing it references was touched. |
-| During the header write                 | Previous version | The torn slot fails its checksum.                                                                        |
-| After the header sync                   | New version      | The commit completed.                                                                                    |
-| While releasing old blocks              | New version      | Releasing is recorded as part of later commits, so an interrupted release only delays reuse.             |
-
-Because new blocks always come from space the previous version considers free, a crash before the commit point leaks nothing. Recovery on open is limited to shortening the file if it was grown beyond the length recorded in the live header (see L2). There is no log to replay.
-
-### Committing and ending transactions
-
-```Rust
-let tx = yk.begin_transaction()?;               // waits while another write transaction is open
-let version: Version = tx.commit()?;                // all of tx's changes, atomically; ends tx
-// or
-tx.rollback()?;                                 // discard tx's changes; ends tx
-// or
-drop(tx);                                       // same as rollback
-
-tx.commit_with(Durability::None)?;              // atomic against process crashes only (see below)
-tx.commit_and_continue()?;                      // commit, but keep tx and its open handles
-
-let rx = yk.begin_snapshot()?;                  // pinned to the committed version
-rx.close();                                     // release the pin; dropping rx does the same
-```
-
-A stream handle belongs to the transaction it was opened in, and cannot be used once that transaction has ended. In Rust, handles borrow their transaction, so the compiler enforces this. In the C and Python bindings, using a handle after its transaction has ended returns `YakError::TransactionEnded`. Committing or rolling back closes any handles that are still open; data written through them before the commit is included.
-
-`commit_and_continue()` commits everything the transaction has done so far and leaves the transaction open, with its handles still usable; later changes become part of the next commit. It suits long-lived writers, such as a log that is appended to continuously and committed every few seconds. It waits for write calls already in progress in other threads to finish, and holds back new write calls until it has completed.
-
-A write transaction that is dropped without being committed is rolled back, as are uncommitted changes when a Yak file is closed with a write transaction still open (which Rust's borrow rules prevent, but the C and Python bindings allow). Changes are never committed implicitly.
-
-`Durability::Full` (the default) syncs twice, as described above. `Durability::None` skips both syncs. The commit is still atomic if the process crashes, because the operating system keeps every completed write, but a power loss or operating system crash can then lose the commit, or (since the operating system may write blocks to storage in any order) corrupt the file. It is intended for tests and for files that are recreated on failure, such as caches.
-
-If a commit fails part way, for example because the disk is full, the committed version is untouched and the transaction stays open with all its changes, so the caller can retry the commit or roll back.
-
-### Read transactions
-
-```Rust
-let rx = yk.begin_snapshot()?;         // pinned to the committed version
-let a = rx.open_stream("index.bin")?;
-let b = rx.open_stream("data.bin")?;   // same version as a, even if a commit happened in between
-for entry in rx.list("textures")? { /* committed names, from the same version */ }
-rx.refresh()?;                         // move to the latest version (no handles may be open)
-rx.close();
-```
-
-A read transaction is a read-only view pinned to the version that was committed when it began. Every directory listed, every stream opened and every length or version asked for through it comes from that version, so streams that belong together - an index and the data it points into, say - are always read consistently. It is safe to share between threads, it takes no stream locks, and it sees nothing of any write transaction.
-
-While a read transaction is open, the blocks of its version cannot be reused, so the Yak file can only grow. Read transactions should be ended when they are done, or refreshed regularly. Short-lived read transactions are cheap: beginning one reads the live header slot and records the version in memory.
-
-For simple uses, a Yak file offers shortcuts that run in their own transaction: `yk.read_all(path)` reads a whole stream in a read transaction, and `yk.write_all(path, bytes)` replaces a stream in a write transaction and commits it (waiting for any open write transaction first).
+But when multiple processes wish to read from and write to the same Yak files, snapshots and transactions must coordinate in a different way. This is resolved by a side-car file, which each process maps into shared memory.
 
 ## Opening and creating a Yak file
 
 An API is provided to create a new Yak file. This takes in a L3 type, a L2 type, a L1 type and a L0 type, which Yak uses to open the file and initialise the file for writing. A new file that is created is automatically opened for writing, with L1 taking the writer lock through L0. The new file is created with version 1, an empty root directory, and both header slots written so that the file is valid from the start.
 
-An API is also provided to open an existing Yak file, also taking in L3, L2, L1 and L0 types. When opening a file, a caller must specify either for reading - in which case only read transactions can be begun - or for writing - in which case write transactions can also be begun, and no other process can open the file for writing at the same time. Processes reading the file are not blocked by a writer. This is handled by L1, using locks provided by L0 (see Thread & process safety in L1).
+An API is also provided to open an existing Yak file, also taking in L3, L2, L1 and L0 types. When opening a file, a caller must specify either for reading - in which case only snapshots can be begun - or for writing - in which case transactions can also be begun. Multiple processes can open a Yak file for writing and Yak will serialise changes to the file so that changes don't conflict. This means one set of changes may block until another set of changes complete. Processes only reading the file are not blocked by a writer.
 
-Every layer has a *header section*: a fixed amount of data it stores in each header slot, outside the regular block format. Header sections flow down through the layers, so that every layer only ever talks to the layer directly below it, and only L1 knows where the sections are in the file:
+## Yak headers
+A Yak file is predominantly made of blocks; uniformly sized chunks of data from which streams are composed. Ahead of these blocks is a header, which enables each layer to store the necessary meta-information required for the layer to operate. When a Yak file is created, each layer passes the size that it needs for its own meta information down through the layers and receives back a "header slot". Layer 1, having now received the necessary information to create the header section creates the Yak file and begins by writing a header section that is sized to hold all the layers' headers.
 
-* **Creating.** Each layer declares the size of its section to the layer below as it is created. L4 passes its size to L3, L3 adds its own size in front and passes the list to L2, and L2 does the same for L1. L1 lays out the sections in each slot from this list - L1's own section first, then L2's, L3's and L4's - and gives each a *section ID*.
+When a layer needs to read its own meta-information, stored in the header, it asks its layer below to 
+
+**** NEW DESIGN DOWN TO HERE ****
+
 * **Finding a section.** A layer finds its section ID by asking the layer below for the first section above it. It answers the same question for the layer above by asking the layer below for the section after its own.
 * **Reading.** L1 reads a header slot once and passes a copy of it up through the layers, and each layer reads its own section from that copy. All the sections a layer stack works from therefore come from the same slot and the same version, even if a commit happens in between. This is used when a Yak file is opened, and when a read transaction begins.
 * **Writing.** A layer stages its section for the next commit by passing it down through the layers below to L1. Nothing is written to the file until L1 publishes the staged sections together in the next header slot (see Header slots in L1).
@@ -460,8 +400,7 @@ L4's public API is similar to a file system API and pertains to:
 * Writing to a stream, based on current head position (possibly enlarging the stream)
 * Closing the Yak stream,
 * Beginning, committing and rolling back write transactions,
-* Beginning, refreshing and ending read transactions,
-* Creating unlinked streams and linking them under a name, optionally on a condition.
+* Beginning, refreshing and ending read transactions.
 
 Every operation in this list is made through a transaction. Operations that change names - creating, renaming and deleting streams and directories - can only be made through a write transaction. They take effect in the transaction's working version immediately and become part of a version when the transaction commits. Name changes check for clashes against the working version, so a name created earlier in the transaction cannot be created again. A rename, which is a delete followed by an add, is therefore atomic on disk: after a crash the stream has either its old name or its new one.
 
@@ -540,42 +479,6 @@ Typical uses:
 
 Reading a version reads one stream descriptor, which is far cheaper than reading the stream. Directory listings do not include versions, because that would read one descriptor per entry.
 
-### Conditional operations
-
-Some storage formats that sit on top of a file system make their own transactions by writing data files freely and then committing by creating one small file, on the condition that no file of that name exists yet. If two writers race, only one can win. Delta Lake and Iceberg tables work this way, and object stores offer the same primitive as a conditional put. Yak provides this primitive directly.
-
-The building block is an *unlinked stream*: a stream that has a stream identifier but no name in any directory. An unlinked stream is written like any other stream. When it is complete, it is given a name with `link_stream`, which applies a condition and changes the directory in one step:
-
-```Rust
-// Work out the next log entry from a consistent view of the table
-let rx = yk.begin_snapshot()?;
-let next = latest_log_entry(&rx)? + 1;      // say, 11
-rx.close();
-
-let tx = yk.begin_transaction()?;
-let h = tx.create_unlinked_stream(false)?;
-tx.write(&h, &log_entry)?;
-match tx.link_stream(&h, &format!("_delta_log/{next:020}.json"), Condition::IfAbsent) {
-    Ok(()) => { tx.commit()?; }              // we won: this is version 11 of the table
-    Err(YakError::ConditionFailed(_)) => { tx.rollback()?; /* someone committed 11 first: re-read and retry as 12 */ }
-    Err(e) => return Err(e),
-}
-```
-
-| Condition                     | `link_stream` succeeds when...                            | Effect                                                                         |
-| ----------------------------- | --------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| `Condition::IfAbsent`         | no entry with that name exists                            | The name is added, pointing at the unlinked stream.                            |
-| `Condition::IfMatch(version)` | the name exists and its stream's version equals `version` | The name is pointed at the unlinked stream and the previous stream is deleted. |
-| `Condition::Always`           | always                                                    | As `IfMatch`, without the check, or as `IfAbsent` if the name doesn't exist.   |
-
-The condition is checked against the write transaction's working version, and the directory changed, while L4 holds the directory stream open for writing (the same blocking open used for every directory change), so no other thread sharing the transaction can change the name in between. If two threads of the same transaction link the same name with `IfAbsent`, exactly one succeeds. Because write transactions are serialised, the working version already includes every earlier commit, so a condition also fails if a transaction that committed since the caller last read the file changed the name. If the condition fails, nothing changes and the stream stays unlinked, so the caller can delete it or link it under another name.
-
-`IfMatch` compares against the stream's version (see Detecting changes). A writer that read a manifest's version in a snapshot and then links with `IfMatch` and that version fails if the manifest has changed since, or if another stream has been put at its name, whether by a later commit or earlier in its own transaction.
-
-An unlinked stream exists only for as long as its handle is open. If the handle is closed, or its transaction ends, without the stream having been linked, the stream is deleted. Its descriptor is marked unlinked (see Tracking streams in L3), so if the process crashes while an unlinked stream exists, the stream is deleted the next time the file is opened for writing.
-
-Conditional operations arbitrate between threads sharing a write transaction, and between write transactions. Only one process can write to a Yak file at a time, and within it only one write transaction is open at a time, so there is never a race between transactions; a condition is always checked against every earlier commit.
-
 ## L3 : Streams
 
 L3 deals with linking blocks together from L2 and presenting them as identified streams to L4.
@@ -584,7 +487,7 @@ L3 deals with linking blocks together from L2 and presenting them as identified 
 
 L3's API, which is used by L4, should solely concern itself with:
 
-* Creating a new stream (returns a stream identifier), linked or unlinked.
+* Creating a new stream (returns a stream identifier).
 * Verifying that a stream exists, by identifier.
 * Opening an existing stream for writing, by identifier (returns a stream handle on the working version).
 * Opening an existing stream for reading, by identifier and version (returns a stream handle on that version).
@@ -766,11 +669,10 @@ A Stream Descriptor is 29 bytes. Its stream identifier is not stored in it: a st
 
 The flags byte holds:
 
-| Bit | Flag       | Meaning                                                                                                                         |
-| --- | ---------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| 0   | Compressed | The stream is compressed.                                                                                                       |
-| 1   | Unlinked   | The stream has no name in any directory. It is deleted when its handle closes, or the next time the file is opened for writing. |
-| 2-7 |            | Reserved for future use.                                                                                                        |
+| Bit | Flag       | Meaning                   |
+| --- | ---------- | ------------------------- |
+| 0   | Compressed | The stream is compressed. |
+| 1-7 |            | Reserved for future use.  |
 
 The version is the version of the Yak file in which the stream last changed: it is set when the stream is created, when its contents change and when it is renamed (see Detecting changes in L4). A reused Stream Descriptor belongs to a stream created in a later version, so its version is always newer than that of the stream that used the descriptor before. L3 stamps the version of creations and content changes itself; L4 asks L3 to stamp it when it renames a stream, since L3 knows nothing of names.
 
@@ -965,11 +867,11 @@ A read transaction that is held open for a long time prevents every block releas
 
 ### Block caching
 
-L2 will often be requested to read the same block over and over again. This is most often the case when data is being written or read to a larger stream (i.e. a stream that must use redirector blocks) and the redirector blocks need constant access to locate the data in the stream. L2 therefore manages a cache of blocks and it provides to L3 a way to use this cache for some blocks, while not for others. L3 uses the cache for redirector blocks. The actual data written/read to a stream circumvents the cache, under the assumption that callers know what data they've placed in the Yak file (and therefore won't be asking the Yak file to read that data again) and, when reading, receive a copy of the stream into their memory buffer and therefore won't ask to read the same data again.
+L2 will often be requested to read the same block over and over again. This is most often the case when data is being written to or read from a larger stream (i.e. a stream that must use redirector blocks) and the redirector blocks need constant access to locate the data in the stream. L2 therefore manages a cache of blocks and it provides to L3 a way to use this cache for some blocks, while not for others. L3 uses the cache for redirector blocks. The actual data written/read to a stream circumvents the cache, under the assumption that callers know what data they've placed in the Yak file (and therefore won't be asking the Yak file to read that data again) and, when reading, receive a copy of the stream into their memory buffer and therefore won't ask to read the same data again.
 
-Copy-on-write makes this cache simpler. A block that belongs to a committed version never changes, so a cached copy of it can never become stale while the block is in use by any version. A block only changes when it is reused after being freed, and L2 evicts a block from the cache whenever it allocates it. Every thread and every transaction can therefore share one cache of committed blocks without invalidating it. Changes in the write transaction do not pass through this cache at all: they live in L3's dirty map until they are placed, and are added to the cache once their commit has completed.
+L2 block caching inside the process is relatively simple. Once committed, a block stays the same until it is marked "pending free" (by a transaction) and then finally freed for reuse (when a transaction detects that no more snapshots could possibly read from that block). When a block is reused, L2 evicts it from the cache so no readers accidentally read stale block content. During a transaction any modified block exists in transaction memory and these blocks are only written to the actual file when the transaction commits. During this write, the new content of the block is placed back into the cache so that later reads can read the new content.
 
-The cache has a configurable memory budget (default: 2 MB). It may be organised per thread, to avoid locking on lookup, or shared; with copy-on-write, both are correct.
+Block caching across processes is less simple: As part of a transaction commit in another process, blocks can be reused for placement and nothing notifies this process' cache that one or more blocks in the cache have gone stale. This is solved by looking out for commits from other processes and clearing caches when they have been detected. Practically it happens when a transaction or snapshot begins, or a snapshot is refreshed: L1 compares the header version it finds in the file with the last version this process committed itself. If they are different Yak knows that another process has committed and all caches (the L2 block cache, the L4 directory cache) are cleared before proceeding. This requires new reading from the file, warming up the caches again.
 
 ### Additional feature & additional complexity: Block encryption
 Occasionally, a caller may desire data stored in a Yak file to be encrypted. The default L2 implementation in Yak offers optional whole-file encryption for all streams in a Yak file.
@@ -1125,7 +1027,6 @@ L0 does not know what the lock storage holds or what its ranges mean; the writer
 * That no block is both reachable from the committed version and on the free list.
 * That no block appears on both the free list and the pending list.
 * That every block of the file below `total blocks` is reachable from the committed version, on the free list, or on the pending list. A block that is none of these has leaked; leaked blocks are reported, and reclaimed by `optimize()`.
-* Which stream descriptors are marked unlinked. These are expected only while a writer has them open; any left behind by a crash are deleted the next time the file is opened for writing.
 * The oldest version held by any reader.
 
 Verification of a version can run alongside the writer, because the version it checks does not change.

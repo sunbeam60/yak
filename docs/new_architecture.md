@@ -1,4 +1,4 @@
-<!-- cspell:locale en-GB,da -->
+<!-- cspell:locale en-GB -->
 
 # Yak
 
@@ -30,8 +30,10 @@ This section lists decisions reached together with an AI. The rest of the docume
 - **Block indices and stream identifiers are u32 for 1.0, through named types.** The code uses `BlockIndex` and `StreamId` (each with its sentinel constant), defined in one place, never a bare `u32`. u32 is enough for 1.0: block indices cap a file at 2^32 - 1 blocks (about 16 TiB with 4 KiB blocks, more with larger blocks), and every stream that holds data needs at least one block, so only empty streams could ever exceed 2^32 identifiers - and other limits, such as the 4 GiB maximum size of a directory stream, are reached long before. Stream identifiers of deleted streams are reused, so the limit is on streams existing at the same time, not streams ever created.
   - Because the width is defined in one place, Yak can be built with larger (or smaller) types by changing those definitions. A file built with one width cannot be read with another, so the width must be recorded through the layer identifiers or versions in the header sections, and opening a file with the wrong width fails cleanly.
   - If more than one width is ever needed in the same build, the planned route is associated types on the layer that owns each concept (`BlockLayer::BlockIndex`, `StreamLayer::StreamId`), so each layer still only knows the one below it. This is not done for 1.0: it makes every on-disk structure generic, the C and Python bindings would need a concrete type per width, and the test suite would need to run per width.
-- **One writer process, any number of reader processes.** Yak is a flexible, durable file format, not a database. Within the writing process, transactions and snapshots give full ACID, with snapshots never blocked by the transaction. Across processes, one process at a time holds the file open for writing, for as long as it has it open, while other processes may read it at the same time (for example, a viewer following a log that another process writes). Several processes taking turns to write was considered and rejected: every transaction would have to reload its state from the header, every process's snapshots would need cross-process locks, and a transaction would have to sync before reusing blocks released by another process's commit, all without a use case that needs it. Processes that need to exchange data should use a protocol designed for that.
-- **No side-car file; locks are taken on bytes far beyond the end of the Yak file.** The locks themselves carry the information: a presence byte, a writer byte and one byte per version for readers in other processes (see Locks in L1). A side-car file was considered and rejected: it is found by path, so two paths to the same file (a symbolic link, a hard link, a different mount) would coordinate through different side-cars and corrupt the file silently; it needs write access to the directory; it can never be safely deleted; and its permissions are separate from the Yak file's. A shared-memory side-car, as LMDB and SQLite's WAL mode use, would also have to detect crashed processes itself, where byte-range locks are released by the operating system.
+- **Every process is alike: any open can write, one transaction at a time.** Yak is a flexible, durable file format, not a database, but once each transaction and snapshot keeps its own state, letting processes take turns to write costs only a few rules, and no process needs special handling as "the writer". The writer lock is held by a transaction, from `begin_transaction()` to `commit()` or `rollback()`, not by an open. Snapshots in every process never block, and are never blocked by, the transaction. Holding the writer lock for a whole open was considered first, and dropped because it made the writing process a special case. Processes that need to exchange data, rather than share a file, should still use a protocol designed for that.
+  - **Threads are treated like processes.** A transaction or a snapshot belongs to the thread that began it, and can neither be shared with nor moved to another thread (in Rust it is neither `Send` nor `Sync`). Threads take turns to write exactly as processes do. Letting several threads write into one transaction was considered and dropped: parallel writers inside one commit need a commit lock, guarded access to the Streams stream and directory streams, and a locked allocator, all to synchronise threads within a process. Without them, L3 and L2 need no locking at all inside a transaction or snapshot.
+  - Waiting writers are not served in order: neither OFD locks nor `LockFileEx` promise it, so a process that commits and immediately begins another transaction, in a tight loop, can starve writers in other processes. This is documented rather than solved for now; a gate lock, as CompoundFs uses, would solve it.
+- **No side-car file; locks are taken on bytes far beyond the end of the Yak file.** The locks themselves carry the information: a writer byte and one byte per version for readers in other processes (see Locks in L1). A side-car file was considered and rejected: it is found by path, so two paths to the same file (a symbolic link, a hard link, a different mount) would coordinate through different side-cars and corrupt the file silently; it needs write access to the directory; it can never be safely deleted; and its permissions are separate from the Yak file's. A shared-memory side-car, as LMDB and SQLite's WAL mode use, would also have to detect crashed processes itself, where byte-range locks are released by the operating system.
   - On every supported platform, locks belong to the open file, not to the process: `LockFileEx` on Windows, and open file description (OFD) locks on Linux and macOS (10.11 and later). Other code in the process that opens and closes the same file therefore cannot disturb Yak's locks. The BSDs only have process-wide record locks, which are released when the process closes *any* descriptor for the file, so the BSDs are not supported.
 - **Block reuse is held back by the oldest snapshot**, as in LMDB: blocks released after the oldest version that any snapshot holds are not reused until that snapshot ends, even if no snapshot needs them. Tracking exactly which versions need which blocks would need the version each block was created in, which is not worth it for snapshots that are expected to be short-lived.
 - **Each snapshot and each transaction has its own cache.** A snapshot's version never changes and its blocks are never reused while it is open, so its cache can never go stale and needs no coordination with the writer or with other processes. Snapshots therefore share nothing, at the cost of each one warming its own cache. A cache shared by all snapshots of the same version can be added later if many short-lived snapshots turn out to suffer.
@@ -41,7 +43,7 @@ This section lists decisions reached together with an AI. The rest of the docume
 
 ## Yak purpose
 
-Yak is a Rust library that enables users to create, manage and use Yak storage files. A Yak storage file is a "file system in a file", wherein there are 0..n streams, addressable by a name. Each stream can be read and written similar to how a real file can be read and written, meaning that after a stream has been opened, it returns a handle from which the user can obtain the length, a position (where reads and writes happen) and the contents of the stream itself. After such a stream has been opened, there are functions to read and write data from and to the streams. All changes to Yak files occur within a transaction that are committed or rolled-back as one, and which protects a Yak file from becoming inconsistent in the event of a crash or power-loss, and protect simultaineous readers from reading changes in progress. 
+Yak is a Rust library that enables users to create, manage and use Yak storage files. A Yak storage file is a "file system in a file", wherein there are 0..n streams, addressable by a string name. Each stream can be read and written similar to how a real file can be read and written, meaning that after a stream has been opened, it returns a handle from which the user can obtain the length, a position (where reads and writes happen) and the contents of the stream itself. After a stream has been opened, there are functions to read and write data from and to the streams. All changes to Yak files occur within a transaction that is committed or rolled-back as one, which protects a Yak file from becoming inconsistent in the event of a crash or power-loss, and protect simultaineous readers from reading changes in progress. 
 
 ## Streams, directories and transactions
 
@@ -57,31 +59,36 @@ Streams are addressable by "directory" (recognised by ending with a forward-slas
 
 It is not possible to "open" a directory, i.e. in the above example, the user cannot open "an empty folder/". The user can only open streams for reading and writing - the "directories" function the same way as a real file system directory functions, in that they are used to contain things, namely other directories and streams.
 
-To make changes to streams and directories, a transaction must be begun. Using this transaction, the necessary changes can be made and then committed, enabling atomic changes to occur in the file. A transaction enables both reading and writing from streams and any changes made in the transaction are immediately visibly to other readers created by the same transaction. 
+To make changes to streams and directories, a transaction must be used. Once a transaction has begun, the necessary changes can be made and then committed, enabling changes to occur in the file as one, atomic change. A transaction enables both reading and writing from streams and any changes made in the transaction are immediately visibly to other readers opened by the same transaction. Functions are provided for deleting both streams and directories and for shrinking the length of an existing stream. If a stream write exceeds the current length of the stream, the stream is extended automatically, akin to writing a regular file. If a stream "position" is set beyond the length of the stream, an error occurs. Any changes made only become durable, and readable by later or refreshed snapshots, once committed.   
 
-Alternatively, a snapshot can be created, which enables the reading of contents of directories and streams. This snapshot is frozen in time from the last last successful transaction commit and it is isolated from changes that occur in later transactions. A snapshot can be manually refreshed, which brings it up to date to the last successful transaction, meaning its view of the Yak file is always consistent.
-
-From a transaction, functions are provided for deleting both streams and directories and for shrinking the length of an existing stream. If a stream write exceeds the current length of the stream, the stream is extended automatically, akin to writing a regular file. If a stream "position" is set beyond the length of the stream, an error occurs. Any changes made only become durable, and readable by later or refreshed snapshots, once committed. 
+Alternatively, a snapshot can be created, which only enables the reading of contents of directories and streams. This snapshot is frozen in time from the last last successful transaction commit and it is isolated from changes that occur in simultainous or later transactions. In this way, a Yak file cannot be read in an inconsistent state, provided that the user data is consistent on transaction commit.
 
 ## Use
 
 A Yak file is useful as a generic storage container. Given that it supports extending and shortening streams inside of a single file, it is particularly useful as a way to provide storage for other libraries that continually write data to a file system and indeed for any writing scenarios where the expected length is not known when the stream write begins, or changes over the lifetime of the file.
 
-That said, even when the final data length is well known, Yak can be useful as a rapid, relatively well optimized way of writing binary data without having to worry about the particulars.
+That said, even when the final data length is well known, Yak can be useful as a rapid, relatively well optimized way of writing binary data without having to worry about the particulars of how these are laid out in the file.
 
-Transactions make Yak suitable for data that must survive a crash intact, such as an application's document format, where a save must either complete or leave the previous save untouched.
+Transactions make Yak suitable for data that must survive a crash without degradation, such as an application's document format, where a save must either complete or leave the previous save untouched.
+
+Yak's intended use is effectively as a binary "storage format" for other applications. 
+
+Multiple processes can read and write to the same Yak file - the Yak library coordinates their access to the file so that multiple transactions are serialised and multiple snapshots are isolated from each other and from any transactions in progress or completed since the snapshot was opened. This enables writer/reader scenarios where one or more processes produce data that one or more processes reads, commonly found in multimedia applications and similar. 
 
 Some imagined scenarios:
 
-* Log entry storage
-* Receiving storage for streaming data
-* Undo stack storage
 * Application file formats with crash-safe saves
 * Game save files
 * Backup storage
-* A storage backend for multi-dimensional array data
+* Log entry storage for multiple processes
+* Receiving storage for streaming data
+* A container for scientific multi-dimensional array data sets
+* A composit multimedia data container
+* Undo stack storage
 
 Naturally, to be usable as a storage container for other libraries, which would normally write their data to a regular file system, the using library has to support abstractions on top of the file system so that a write to a file goes instead into a Yak data stream.
+
+Yak is not too dissimilar to other "database in a file" formats, such as SQLite, LMDB, CFB and CompoundFS. The key difference is that Yak "thinks in binary" and aims for stream contiguity, which provides quick reads and quick writes of large binary data sets, and organises its data like a file system, instead of structured, queryable data.
 
 ## High level architecture
 
@@ -103,9 +110,9 @@ Layer 4 is where a caller reads and writes named streams, both done through tran
 
 At Layer 4, directories can be created, deleted and listed and streams can be opened, closed, written to, and read from.
 
-Layer 4 provides to the caller a data structure that wraps a stream, which the caller must use to write data, read data from, change the position, and shorten the length of the data stream. Additionally there are utility functions to "reserve" space for the stream growing, which keeps a stream that grows across many commits - a log, say - in one contiguous run.
+Layer 4 provides to the caller a data structure that wraps a stream, which the caller must use to write data, read data from, change the position, and shorten the length of the data stream. Additionally there are utility functions to "reserve" space for the stream growing, which keeps a stream that grows across many commits - a log, say - in a few contiguous runs.
 
-This layer also provides utility functions to iterate the named contents of the Yak file, equivalent to typing "ls" on a regular file system to discover the hierarchical content of the Yak file.
+This layer also provides utility functions to iterate the named contents of the Yak file, equivalent to typing "ls" on a regular file system, to discover the hierarchical content of the Yak file.
 
 Internally, this layer translates between a "filing name" (e.g. "folder1/folder2/image.png") and a stream number-based identifier. The stream number-based identifier is never revealed to the caller.
 
@@ -115,23 +122,23 @@ In short, Layer 4 answers the question: Can you build a filing system out of num
 
 At this layer, streams can be created, lengthened, shortened, deleted, written to and read from. This layer responds to requests from Layer 4 to create a new stream and it returns a number-based identifier to Layer 4. This layer doesn't know anything about the filing name (that is the concern of Layer 4) or the content of the streams.
 
-Internally, this layer requests new blocks from Layer 2. It links these blocks together to create streams. When the streams are created and lengthened, it requests new blocks from Layer 2 to achieve this. When the streams are deleted or shortened, it returns blocks no longer needed to Layer 2.
+Internally, this layer requests new blocks from Layer 2. It links these blocks together to create streams. When the streams are created and lengthened, it requests new blocks from Layer 2 to achieve this. When the streams are deleted or shortened it returns blocks no longer needed to Layer 2.
 
 Layer 3 concerns itself only with streams. It provides functions for Layer 4 to discover how many streams exist and to iterate over each stream identifier. It also provides to Layer 4 the ability to lengthen, shorten, create and delete streams. Layer 3 never reveals to Layer 4 how streams are composed of blocks that are linked together.
 
-Layer 3 is also responsible for optimising the layout of blocks used in streams to optimise towards quick writes and reads (one long read/write instead of lots of little reads/writes) and it provides a capability to amass changes in memory and commit them to the file as one.
+Layer 3 is also responsible for optimising the layout of blocks used in streams to optimise towards quick writes and reads (one long read/write instead of lots of little reads/writes) and it provides a capability to amass changes in memory (provided the changes stay within a defined limit, otherwise they write to the file early) and commit them to the file as one transaction.
 
 In short, Layer 3 answers the question: Can you build numbered streams out of numbered blocks?
 
 ### Layer 2: Block abstraction
 
-Layer 2 manages blocks but does not know what role each block takes. It provides to Layer 3 a new, unused block when requested and it keeps track of unused blocks that it has created or received back from Layer 3. Layer 2 uses Layer 1 to create new blocks, which it does by lengthening the the data region, doing whatever is required to initialise free blocks and then adds them to an internal list of unused blocks. Because snapshots are frozen in time from when they were created, Layer 2 holds back blocks that have been released by Layer 3 but may still be read by live snapshots. When a snapshot is closed, Layer 2 handles returning "frozen" blocks as free blocks, ready for re-use.
+Layer 2 manages blocks but does not know what role each block takes. It provides to Layer 3 new, unused blocks when requested and it keeps track of unused blocks that it has created or received back from Layer 3. Layer 2 uses Layer 1 to create new blocks, which it does by lengthening the the data region, doing whatever is required to initialise free blocks and then adds them to an internal list of unused blocks. Because snapshots are frozen in time from when they were created, Layer 2 holds back blocks that have been released by Layer 3 but may still be read by live snapshots. When a snapshot is closed, Layer 2 handles returning "frozen" blocks as free blocks, ready for re-use.
 
 In short, Layer 2 answers the question: Can you build numbered blocks out of a storage abstraction that behaves like a file?
 
 ### Layer 1: Storage abstraction
 
-Layer 1 provides the fundamental storage abstractions that enables Yak to work. It creates and manages the header that stores information from each layer above. It provides access to the data region that will hold blocks and it provides the transaction primitives which with L2 and the layers above change the content atomically. Finally it maintains a system to coordinate between multiple processes reading from and writing to the same Yak file. 
+Layer 1 provides the fundamental storage abstractions that enables Yak to work. It creates and manages the header that stores information from each layer above. It provides access to the data region that will hold blocks and it provides the transaction primitives with which L2 and the layers above change the content atomically. Finally it maintains a system to coordinate between multiple processes reading from and writing to the same Yak file. 
 
 In short, Layer 1 answers the question: Can you build a file that changes atomically, and that several processes & threads can share safely, out of the calls a system provides?
 
@@ -141,33 +148,9 @@ Layer 0 provides system-specific implementations of file, lock and sync primitiv
 
 In short, Layer 0 answers the question: Can the underlying system provide operating system primitives that can be opened by name, read from, written to, synced and locked?
 
-### Layer composition opportunities
+# Yak Architecture & Implementation
 
-Layer 4 (the filing abstraction layer) provides to the caller a "virtual file system", with directories and files. Similarly Layer 0 (the storage abstraction) handles access to a file system, with directories and files.
-
-Because Layer 4 and Layer 0 operate on the same constructs - files and directories - you could write a Layer 0 that writes to and reads from a stream in another Yak file, in the way of Matryoshka dolls.
-
-This reveals some interesting opportunities, such as:
-
-- One Yak file could be operating on top of a real file system, using very large blocks (say 512 KB). Large streams could be written directly to this Yak file. For smaller streams, a stream inside this Yak file (say "small_files.yak") could operate with much smaller blocks (say 4 KB) to store small files. Whenever this small_files Yak file needed to expand to accommodate more small files, it would grow the small_files data stream, in effect obtaining more 512 KB blocks to parcel out in 4 KB increments.
-
-- In addition to stream names stored in directory blocks at L4, an "extended attribute" stream could tie a property-value system together with the streams, hiding the properties away from the normal stream hierarchy.
-
-- One Yak file with large-ish blocks (e.g. 64 KB) could use a custom Layer 2 (block storage layer) that, instead of storing its blocks in Layer 1's data region like normal, compressed and stored the 64 KB blocks it handled in a Yak file (with each block simply given its block number as a name) with much smaller blocks (say 4 KB), thereby enabling real-time, transparent compression/decompression (and possibly encryption) of blocks.
-
-- Instead of a Layer 2 that retrieves blocks from Layer 1's data region, an alternative Layer 2 could be written that creates a directory instead of a `.yak` file and store each block as a real file inside this directory. This would ease testability as each block could be inspected using a regular file manager.
-
-- Instead of a Layer 3 that links blocks together from Layer 2, an alternative Layer 3 could be written that creates a directory instead of a `.yak` file and store each stream as a real file inside this directory. This would ease testability as new streams could be inspected using a regular file manager.
-
-- Instead of a Layer 2 that stores and retrieves blocks into a regular file stream provided by Layer 1, it could encrypt blocks (with a length preserving encryption algorithm like AES-XTS) when they were written and decrypt them when they were read.
-
-- A Layer 0 could record every write and sync it receives, and on request simulate a power loss by discarding writes that were never synced or tearing the last write in half. This makes it possible to test that every crash leaves a Yak file at either the old or the new version (see Testing). Because Layer 0 knows nothing about commits, this tests the real Layer 1 commit logic, not a copy of it.
-
-- When a Yak file is nested inside a stream of another Yak file, the inner file's commit is just a set of writes to the outer stream. The inner commit is only durable once the outer Yak file has also committed, so a nested Yak file's Layer 0 should hold a write transaction on the outer file and commit it (with `commit_and_continue`, see Committing and ending transactions) when asked to sync. Such a Layer 0 keeps its locks in memory, so a nested Yak file can only be used by the process that opened it.
-
-# Yak Architecture & Implementation notes
-
-This documentation provides architectural support notes and considerations.
+This section provides a deep dive into how Yak operates at each layer.
 
 Throughout this section, layers are described by L0, L1, L2, L3 and L4, denoting Layer 0, 1, 2, 3 and 4 respectively.
 
@@ -186,7 +169,7 @@ There are 5 projects across the workspace:
 * The Yak library is published as a crate on crates.io
 * The C ABI wrapper produces a dynamic and a static library with non-mangled names for linking into a C/C++ project - and for use in any environment that supports C FFI libraries (e.g. LuaJIT). A Yak header file is generated using cbindgen, which defines the function names used in the libraries.
 * The Python Yak wrapper is published as a PyPI wheel. It provides a full Yak experience in Python.
-* The command line Yak tool is not meant as a day to day production tool, but it provides a set of functions to manipulate Yak files during development and, crucially, it provides a set of benchmarks that are useful for profiling and performance optimization.
+* The command line Yak tool is not meant as a day to day production tool, but it provides a set of functions to manipulate Yak files during development, including compacting them (see Compacting a Yak file), and, crucially, it provides a set of benchmarks that are useful for profiling and performance optimization.
 
 ## Testing
 
@@ -194,35 +177,31 @@ The library is tested using Python/pytest. This allows rapid test development an
 
 Additional Rust tests exist in the library itself, to test functionality that can't adequately be tested by pytest.
 
-Crash consistency is tested with a fault-injecting L0 (see Layer composition opportunities), which can introduce fake crashes. `verify()` is the test suite's check that every state a crash leaves behind is a valid Yak file.
-
-Coordination between processes is tested in pytest by starting reader and writer subprocesses on the same Yak file. The tests check that a second writer process waits or fails, that a reader process holding a snapshot holds back block reuse in the writer, that a reader process that is killed releases its hold, that `optimize()` is refused while another process has the file open, that a second open for writing of the same file in one process fails at once, and that a second open for reading in the same process works alongside the first.
-
 ## Yak file thread, process, machine & crash safety
 
 A Yak file must handle being accessed by multiple threads within the same process and multiple processes on the local machine, with the following considerations:
 
-- Only one process at a time can have a Yak file open for writing. Another process that opens the file for writing either waits until the writer closes it or fails, according to the open options.
-- Any number of processes can have a Yak file open for reading, at the same time as the writer process.
-- Each process can only open a Yak file for writing once. A second open for writing of the same file in the same process, through the same path or another one, fails at once: waiting for the first open to close, as an open from another process would, could wait forever. Opening a file for reading that the same process already has open is allowed, and behaves exactly like an open from another process.
-- A child process created with `fork()` must not use the Yak files its parent opened; it must open them itself. A forked child shares its parent's locks, so a child that keeps running can hold the parent's writer lock even after the parent has exited. This affects, for example, Python's `multiprocessing` with the fork start method.
+- Any number of processes can have a Yak file open, for reading or for writing, at the same time.
+- Only one transaction at a time can be running on a Yak file, across all processes. Beginning a transaction while another is open, in this process or another, either waits until that transaction commits or rolls back, or fails at once, according to the options. 
+- A child process created with `fork()` must not use the Yak files its parent opened; it must open them itself. A forked child shares its parent's locks, so a child that keeps running can hold the parent's writer lock (if it forked during a transaction) or reader locks even after the parent has exited. This affects, for example, Python's `multiprocessing` with the fork start method.
+- A transaction or snapshot belongs to the thread that began it, and cannot be shared with or moved to another thread, just as it could not be shared with another process.
 - If a process has a Yak file opened for reading, it can open multiple snapshots in any thread.
-- If a process has a Yak file opened for writing, it can open multiple snapshots in any thread and one transaction across all threads (other transactions can attempt to start, but queue up in order).
+- If a process has a Yak file opened for writing, it can open multiple snapshots in any thread and one transaction per thread. Multiple transactions serialise amongst the threads and any other process/thread requesting a transaction, though order is not guaranteed. If a thread already has an open transaction, beginning a new transaction on the same thread, through the same open, fails at once; through a different open of the same file, it hangs if the second transaction requested to wait for the first transaction to finish. 
 - Snapshots never block, neither each other nor the transaction, and never prevent a transaction from committing, whichever process they are in.
 - A snapshot can open multiple Readers per stream.
 - A transaction can open multiple Readers per stream OR one Writer per stream.
 - All access coordination happens on the same machine. It is not safe to open a Yak file over the network, unless callers know they are the only ones accessing the file.
 
-If a process crash or a system power loss occurs, a Yak file opens to look exactly like it did at the last successful transaction, with no recovery work required by the caller. If a transaction was in progress during the crash it is as if it never happened. In other words, changes to Yak files are ACID:
+If a process crash or a system power loss occurs, a Yak file opens to look exactly like it did at the last successful transaction, with no recovery work required by the caller. If a transaction was in progress during the crash it is as if it never happened. In other words, changes to Yak files are ACI(D):
 - **A**tomic - they either happened fully or they didn't happen at all.
 - **C**onsistent - a Yak file is always "valid" - although since Yak doesn't know what a caller writes to the file, consistency of user data cannot be guaranteed.
 - **I**solated - a change is invisible until it happens and every snapshot sees only a committed version.
-- **D**urable - when a commit has returned successfully, data is guaranteed to be stored.
+- **(D)**urable - depending on the options chosen when the caller commits a transaction, Yak can be fully durable.
 
 Each commit chooses a durability level (see Commit ordering in L1). `Full` gives all four guarantees above. `Ordered` keeps the file valid after a power loss but may lose the most recent commits, so it gives up some durability for speed. `None` skips all syncs, which is fastest when the Yak file's integrity isn't critical or it can easily be recreated, and is why a function to verify the structure of a Yak file is provided (see Verifying a Yak file).
 
-## Block indices and stream identifiers
-Block indices are defined to be 32-bit unsigned integers (u32), whatever the block size. The value 0xFFFFFFFF is reserved as a sentinel meaning "no block", so a Yak file holds at most 2^32 - 1 blocks. The block size therefore sets the largest possible file (e.g. ~16 TiB with 4 KiB blocks and ~256 TiB with 64 KiB blocks). Files that need to be larger use larger blocks. Yak can optionally be built using smaller (u8, U16) or larger (u64) blocks but Yak files created with these settings must be opened by a custom Yak library that supports this type. Block index width (1, 2, 4 or 8 bytes) is stored in a Yak file and an error occurs if a caller attempts to load a Yak file created using a different block index width.
+## Yak file sizing types
+By default, Yak uses 32-bit unsigned integets to address its blocks; the value 0xFFFFFFFF is reserved as a sentinel meaning "no block", so a Yak file holds at most 2^32 - 1 blocks. The block size therefore sets the largest possible file (e.g. ~16 TiB with 4 KiB blocks and ~256 TiB with 64 KiB blocks). Files that need to contain larger streams use larger blocks. Yak can optionally be built using smaller (u8, U16) or larger (u64) block index type but Yak files created with these settings must be opened by a custom Yak library that supports this type. Block index width (1, 2, 4 or 8 bytes) is stored in a Yak file and an error occurs if a caller attempts to load a Yak file created using a different block index width.
 
 It follows that stream identifiers are the same datatype as block indices, since a stream typically are at least 1 block and there cannot be more streams than there are blocks possible (technically, a stream can take no storage other than the stream descriptor in the Streams stream, but it's hard to imagine a Yak file with more than 4 billion completely empty streams). For stream identifiers, 0xFFFFFFFF is reserved as a sentinel value as well.
 
@@ -236,13 +215,13 @@ Naturally Yak cannot make any guarantees about the endianness of user-written st
 
 ## Transactions & snapshots
 
-All modifications made in a Yak ultimately end up as modifications to the bytes held in the stream blocks and to the header of the Yak file. In a storage library without transaction support, changes would be written directly to the file, but in Yak (like in other embedded storage libraries with transaction support), changes made by a transaction are kept separate from the original file; instead of performing those changes on the original blocks and the original header, all changes occur in *new* blocks and a *new* header that is kept in memory by the transaction. 
+All modifications made in a Yak ultimately end up as modifications to the bytes held in the stream blocks and to the header of the Yak file. In a storage library without transaction support, changes would be written directly to the file, but in Yak (like in other embedded storage libraries with transaction support), changes made by a transaction are kept separate from the original file; instead of performing those changes on the original blocks and the original header, all changes occur in *new* blocks and a *new* header that is separate from the original blocks and header.
 
 ### Committing a transaction
 
-When a user needs to change the value of 10 bytes in a stream, say, Yak first copies the original block where those 10 bytes are held into memory and then performs the change on this in-memory block, not the original, physical block on disk. The transaction keeps hold of this in-memory block, and any other blocks that are modified during the transaction, and whenever further changes, or further reads, happen in those modified blocks, the transaction uses the in-memory, stand-in blocks rather than the blocks on disks. In effect, a transaction pretends that the changes have occurred in the original file, but they have actually only occurred in the in-memory stand-in blocks.
+When a user needs to change the value of 10 bytes in a stream, say, Yak first copies the original block where those 10 bytes are held into memory and then performs the change on this in-memory block, not the original, physical block on disk. The transaction keeps hold of this in-memory block, and any other blocks that are modified during the transaction, and whenever further changes, or further reads, happen in those modified blocks, the transaction uses the in-memory, stand-in blocks rather than the blocks on disks. In effect, a transaction pretends that the changes have occurred in the original file, but they have actually only occurred in the stand-in blocks.
 
-When a transaction is committed all the in-memory blocks are written to the Yak file - not on top of the existing blocks, but as new blocks. These blocks are connected together by redirectors, from bottom up, as they are written into the file. An additional upside of knowing which blocks have changed, and which streams they belong to, is that the blocks can be written out as contiguously as possible, promoting optimised read and write speeds on the actual file.
+When a transaction is committed all the stand-in blocks are written to the Yak file - not on top of the existing blocks, but as new blocks. These blocks are connected together by redirectors, from bottom up, as they are written into the file. An additional upside of knowing which blocks have changed, and which streams they belong to, is that the blocks can be written out as contiguously as possible, promoting optimised read and write speeds on the actual file.
 
 Once the blocks are known to have actually been written to disk, the header is updated with a new version number and also written to disk. To avoid the new header overwriting the old header that may be in the process of being read by another thread or process, the header is written to a second header slot and a higher version number is written as the very last thing in the write. This makes the second slot the highest header version, which causes new readers to recognise the new header as the current header. In this way, writers alternate between two header slots, using the version number to signal which one is the latest one.
 
@@ -324,15 +303,11 @@ In Fig 1.b, we can see the results of changing some data inside of the data stre
 
 Because we now need to modify the redirector at 140 to point to new block 41, it would be tempting to modify 140 directly. But Yak never touches the data that already exists. Instead it copies the redirector at 140 into a newly allocated block (77), copies the content of 140 into 77, then writes the updated block index 41 over the previous index 15.
 
-We now need to change the descriptor that points to this modified stream, because the top block, the redirector, is no longer 140, but 77. So we wish to modify the stream descriptor at 41, but once again, we never modify data in-place. Instead we allocate a new block, 61, copy 41 into 61 and write our updated stream descriptor there. Because we've now created a new top block for the Streams stream, we allocate a new top block (60), copy 84 into 60 and then write our modified redirector there.
+We now need to change the descriptor that points to this modified stream, because the top block, which is a redirector, is no longer 140, but 77. So we wish to modify the stream descriptor at 41, but once again, we never modify data in-place. Instead we allocate a new block, 61, copy 41 into 61 and write our updated stream descriptor there. Because we've now created a new top block for the Streams stream, we allocate a new top block (60), copy 84 into 60 and then write our modified redirector there.
 
-Finally we update the header that now points to the Streams stream (the top block has moved from 84 to 60). Once again, we do not do this in the original header, but we instead write it into the previously used header (Header 2), where we update the version number to now be higher than the previous header (411 > 410). This marks Header 2 as the current header and the transaction has now committed.
+Finally we update the header that now points to the Streams stream (the top block has moved from 84 to 60). Once again, we do not do this in the original header, but cddvddfdfdfdsfdswe instead write it into the previously used header (Header 2), where we update the version number to now be higher than the previous header (411 > 410). This marks Header 2 as the current header and the transaction has now committed. From now one, any new snapshot that begins finds the highest header, now version 411 and reads the data from here. By starting with this new header, the Streams stream is located in block 60 and the fifth stream is located not in 140, but in block 77.
 
-#### Committing and ending transactions
-
-A transaction ends in one of two ways: `commit()` makes its changes the new committed version, and `rollback()` discards them. Both consume the transaction, so its Readers and Writers, which borrow it, must be closed first.
-
-`commit_and_continue()` commits in the same way, but keeps the transaction open, with a new working version that starts from the version just committed. Its open Readers and Writers stay open, and its cache stays warm (see Block caching in L2). Changes made after it are part of the next commit. Because the transaction stays open, no other transaction can begin in between. This suits a long-running writer, such as one appending to a log, that commits every so often without reopening its streams, and a nested Yak file's Layer 0, which commits the outer Yak file whenever the inner one syncs (see Layer composition opportunities).
+It follows from this that a Yak file could continually grow; every time a transaction is committed, it writes changes to unused or brand new blocks. If we proceeded like this, a Yak file would grow indefinitely large as transactions are committed, because no blocks would ever be re-used. This is clearly not practical, so the lifetime of blocks have to be managed. A simplistic solution would be mark blocks free once the transaction has committed, but this would prevent other readers from continuing to read once a transaction had been committed. We must, in other words, hold on to blocks that could still be read and only free them once we know for certain that no other snapshot could need to read from the blocks.
 
 #### File system consistency
 
@@ -340,37 +315,64 @@ File writes - to Yak files or indeed any other file found on a machine - are gen
 
 ### Reading a snapshot
 
-While a transaction is occurring, many snapshots, across threads and processes on the local machine, can still read data from the Yak file, without being affected by any changes the transaction is making. Even after the transaction has committed, and actually written to the disk, the snapshot's view of the Yak file stays frozen from when the snapshot was originally begun. A snapshot does not keep itself up to date with the latest transaction - it can either be manually refreshed or closed and a new snapshot can be begun. The two are exactly equivalent: `refresh()` moves the snapshot to the latest committed version and empties its cache, and the Readers opened in the snapshot, which borrow it, must be closed first.
+A snapshot is a "frozen" view into a Yak file, as it was when the snapshot was begun. This means a snapshot is isolated from any changes in an ongoing transaction and it is isolated from transactions that were committed since the snapshot was begun. Snapshots are used to read from streams in a Yak file without being affected by what other threads or processes are doing to the Yak file.
 
-A snapshot begins by reading both header slots and choosing the header with the highest version, which it copies into memory. In this header copy there is the Streams stream descriptor, which enables the snapshot to locate all other streams. This is possible because any later transaction write its changes to new blocks, not the original blocks. So all the blocks of the Streams stream, and all the blocks that make up all the other streams for this version, are still in the file, unchanged from when the snapshot first copied the header. Changed blocks only occur from committing transactions and they are always written into new blocks.
+To achieve this, snapshots must freeze their view of Yak file. They achieve this by copying the current header, from which all other streams can be found, and preventing any block that is used in that view of the Yak file from being reused.
+
+A snapshot begins by reading both header slots and choosing the header with the highest version, which it copies into memory. In this header copy is the Streams stream descriptor, which enables the snapshot to locate all other streams in the Yak file. Because transactions write to new blocks, not the existing blocks, as long as the blocks that were in use when the header copy was taken are still there, the snapshot can continue to read the blocks. Changed blocks only occur from committing transactions and they are always written into new blocks.
 
 Because nothing a snapshot can read ever changes while it is open, each snapshot keeps its own cache of the blocks it has read (see Block caching in L2). That cache never needs to be cleared or checked, whatever other snapshots, the transaction or other processes do.
 
-It follows from this that a Yak file could continually grow; every time a transaction is committed, it writes changes to unused or brand new blocks. If we proceeded like this, a Yak file would grow indefinitely large as transactions are committed, because no blocks would ever be re-used. This is clearly not practical, so the lifetime of blocks have to be managed. Put another way, as long as a snapshot exists to read a block, the block needs to continue to stick around, in original form, at the original location.
+Put another way, as long as a snapshot exists to read a block, the block needs to continue to stick around, in original form, at the original location.
 
 ### Managing block lifetime with transactions & snapshots
 
-To manage block lifetime, transactions mark the blocks that have been superseded (because they have been copied and modified) as "pending free". From the perspective of the transaction, only the content in the new blocks (which are modified copies of the old blocks) and the existing, unmodified blocks matter. Yak does not actually free these superseded blocks yet, however, because a snapshot may still read from them. Each "pending free" block is marked with the version number that the transaction was started at.
+When a block is freed in L3, because a stream has been deleted, truncated or changes have been written to the stream (which are written to new blocks, causing the blocks with the original content to no longer be required), the block is returned to L2 as "pending free". From the perspective of a transaction the block is free, but snapshots may still exist that need to read from this block and so it cannot be freed for re-use. Instead it is marked with the version that it belonged to (the header version number when it was marked as free by L3) and kept by L2 until it is known that no more snapshots exist that could potentially read from the block.
 
-When a later write transaction needs unused blocks (adding blocks to a stream, or needing new blocks because changes need to be written to existing blocks) Yak needs to either re-use blocks or add new blocks at the end of the Yak file. For the re-use case, which it checks first, it frees all "pending free" blocks that were marked "pending free" before the oldest snapshots or, if there are no snapshots, the last committed transaction. This is safe because no snapshot now exists to read from these blocks. 
+When a later write transaction needs unused blocks (adding blocks to a stream, or needing new blocks because changes need to be written to existing blocks) Yak needs to either re-use blocks or add new blocks at the end of the Yak file.
+
+Yak first tries to re-use blocks. For each "pending free" block in L2 it checks if any snapshots could conceivably still need to read from the block. If all snapshots were created after the block was marked as "pending free", the block cannot possibly be read by any of those snapshots and it is therefore eligible to actually be freed reused.
+
+For example, looking at Fig 1.b, blocks 84, 41, 140, 15 have been marked as "pending free" by L3. Because the blocks could still be read by snapshots begun at version 410, the blocks cannot be actually freed yet. But when all snapshots are version 411 or later, those four blocks can now actually be freed and reused.
+
+If L2 cannot find any blocks eligble for reuse, it extends the file, thereby creating new blocks, and it adds those blocks to the free list in the current header, thereby creating new blocks. These blocks are now freed to be used and as they are, they come off the free list. 
+
+If, at this very point, the Yak process should crash, the transaction header is not written to the file and while the file is actually longer than it should be, those newly created blocks were never created officially (in that they weren't added to the free list that was written into the file). When the next transaction starts, the transaction checks the current header and if the file is longer than it should be by the current header, the Yak file is truncated, effectually cleaning up the blocks that the previous, crashing transaction had created.
 
 ### Synchronising access to a Yak file across processes
 
+Throughout this section, the word "thread" is used consistently. In this discussion it doesn't matter whether the tread belongs to the current process, or to another process that shares access to the Yak file.
+
+So far, the transaction & snapshot explanations above have assumed that transactions and snapshots occur within the same thread. Yak supports multiple other threads reading from and making changes to the Yak file
+
+To facilitate this, Yak needs to coordinate two elements:
+1) No more than one transaction may be ongoing at the same time.
+2) No block may be re-used if a snapshot exists that can still read from in, no matter which thread that could occur in.
+
+Yak achieves this coordination using a portable method of locking byte-ranges on the Yak file, far, far beyond the end of the file. This is why Yak requires a 64 bit file system; it reserves the byte ranges from 2^62 --> (2^64-1) for thread coordination. On Linux, MacOS and Windows byte ranges beyond the actual end of a file can still be locked, which Yak uses as signalling method between threads. This creates some obvious advantages and disadvantages:
+
+Advantages:
+- Yak files do not need a side-car file-based coordination with write access. As such, Yak files can be opened in directories where the caller has no write access.
+- Yak files are singular and users are not confused by the presence of a side-car file when copying Yak files around.
+- If a thread crashes, the operating system frees any byte range locks it has so no crashing thread can hang on a transaction, nor prevent blocks from being freed because a snapshot (which has now crashed) ostensibly use it.
+
+Disadvantages:
+- Yak files can only be 2^62-1 bytes large, not 2^64-1. This is considered an acceptable maximum size for a single file.
+- Yak files can theoretically run out of transactions; if Yak ran one million transactions a second, a Yak file would run out of transactions after 148,000 years. This is considered an acceptable transaction load and lifetime for a storage format such as Yak.
+- Yak files rely on operating system support for byte range locks that fulfil Yak's criteria. Since this is the case for Linux, MacOS (and its device-based cousins) and Windows, with the only known exception being BSD-based operating systems, Yak considers this tradeoff acceptable.
 **** NEW DESIGN DOWN TO HERE ****
 
 ** CLEAN TO HERE **
 
-So far, the transaction & snapshot explanations above have assumed that transactions and snapshots occur within the same process, where threads can share memory to coordinate.
+Across processes, every process is alike: any of them can read, and any that opened the file for writing can begin a transaction, one transaction at a time. Two things need coordinating: that only one transaction is open at a time, and that a transaction does not reuse blocks that a snapshot, in any process, can still read. Both are done with operating system byte-range locks on bytes far beyond the end of the Yak file, which are never read or written; the locks themselves carry all the information, and the operating system releases them if a process dies (see Locks in L1). No side-car file and no shared memory are needed.
 
-Across processes, Yak allows one writer process and any number of reader processes. Two things need coordinating: that only one process writes, and that the writer does not reuse blocks that a snapshot in a reader process can still read. Both are done with operating system byte-range locks on bytes far beyond the end of the Yak file, which are never read or written; the locks themselves carry all the information, and the operating system releases them if a process dies (see Locks in L1). No side-car file and no shared memory are needed.
-
-Since each snapshot has its own cache, a reader process never has to notice the writer's commits: a snapshot only ever reads its own version, which the writer does not change. A reader process sees new commits by beginning a new snapshot, or by refreshing one.
+Since each snapshot and transaction keeps its own state, nothing has to notice another process's commits. A snapshot only ever reads its own version, which no transaction changes, and sees new commits by beginning a new snapshot or by refreshing one. A transaction starts from the live header, whoever committed it (see Beginning a transaction in L1).
 
 ## Opening and creating a Yak file
 
-An API is provided to create a new Yak file. This takes in a L3 type, a L2 type, a L1 type and a L0 type, which Yak uses to open the file and initialise the file for writing. A new file that is created is automatically opened for writing, with L1 taking the writer lock through L0. The new file is created with version 1, an empty root directory, and both header slots written so that the file is valid from the start.
+An API is provided to create a new Yak file. This takes in a L3 type, a L2 type, a L1 type and a L0 type, which Yak uses to open the file and initialise the file for writing. A new file that is created is automatically opened for writing, with L1 holding the writer lock through L0 while it initialises the file. The new file is created with version 1, an empty root directory, and both header slots written so that the file is valid from the start.
 
-An API is also provided to open an existing Yak file, also taking in L3, L2, L1 and L0 types. When opening a file, a caller must specify either for reading - in which case only snapshots can be begun - or for writing - in which case transactions can also be begun. Only one process can have the file open for writing at a time; opening it for writing while another process has it open for writing either waits until that process closes it or fails, according to the open options. Processes reading the file are not blocked by the writer, and do not block it. Opening a file for writing that the same process already has open for writing fails at once (see Opening a Yak file for writing once per process in L1).
+An API is also provided to open an existing Yak file, also taking in L3, L2, L1 and L0 types. When opening a file, a caller must specify either for reading - in which case only snapshots can be begun - or for writing - in which case transactions can also be begun. Any number of opens, in any processes, can be for writing; opening never waits for another open. Only transactions take turns (see Yak file thread, process, machine & crash safety). Snapshots are not blocked by a transaction, and do not block it.
 
 ## Yak headers
 A Yak file is predominantly made of blocks; uniformly sized chunks of data from which streams are composed. Ahead of these blocks is a header, which enables each layer to store the necessary meta-information required for the layer to operate. When a Yak file is created, each layer passes the size that it needs for its own meta information down through the layers and receives back a "header slot". Layer 1, having now received the necessary information to create the header section creates the Yak file and begins by writing a header section that is sized to hold all the layers' headers.
@@ -407,7 +409,7 @@ Assuming that it can, L1 reads both slots, discards any whose checksum fails, an
 
 If all layers have found a header they are capable of handling, the file has successfully opened. If the file is opened for writing, L2 then shortens the file if it is longer than the committed version's `total blocks` (see L2), which removes anything a crash left behind.
 
-Files created with header layout version 1 (before transaction support) have a single header that is updated in place. Such files can be read, and are converted to layout version 2 by `optimize()`, which already rewrites the whole file.
+Files created with header layout version 1 (before transaction support) have a single header that is updated in place. Such files can be read, and are converted to layout version 2 by compacting them with the command line Yak tool, which writes a new file (see Compacting a Yak file).
 
 ## L4: The public API
 
@@ -493,7 +495,7 @@ Every stream and every directory has a *version*: the version of the Yak file in
 
 A stream's version is stamped when the stream is created, when its contents change (written or shortened), and when it is renamed. Reserving space does not change it, since the contents stay the same. Stamping renames means that a different stream cannot arrive at a name without the version at that name moving forward: a stream created there has the version it was created in, and a stream renamed there has the version of the rename. A directory is a stream too, so its version is stamped in the same way: when it is created or renamed, and when entries in it are created, renamed or deleted. It reflects changes to its own entries only, not to the streams and directories below it.
 
-Versions are read from the version the transaction or snapshot sees. In a snapshot, they come from the snapshot's committed version. In a transaction, a stream or directory that the transaction has changed reports the version the transaction will commit as (the committed version plus one), which is exactly what snapshots will see once it commits; after `commit_and_continue()`, later changes report the version after that. Two changes made in the same transaction share a version and cannot be told apart, which only threads sharing that transaction could observe.
+Versions are read from the version the transaction or snapshot sees. In a snapshot, they come from the snapshot's committed version. In a transaction, a stream or directory that the transaction has changed reports the version the transaction will commit as (the committed version plus one), which is exactly what snapshots will see once it commits; after `commit_and_continue()`, later changes report the version after that. Two changes made in the same transaction share a version and cannot be told apart, which only the transaction's own thread could observe.
 
 Typical uses:
 
@@ -617,7 +619,7 @@ With copy-on-write, it is worth being clear about what reserving does and does n
 
 Reserving brings little for compressed streams. Their blocks are rewritten as a whole at commit, so they cannot be written in place, and they get no help with fragmentation across commits beyond what any stream gets.
 
-Reserved space that is never written is wasted until the stream is truncated or the file is optimized. When a stream is truncated, all blocks - including those in any extended reserve - are returned as free blocks, in effect making the stream's size and reserved size very near to each other (reserved will include the unwritten space in the last data block, so tends to be ever so slightly larger).
+Reserved space that is never written is wasted until the stream is truncated or the file is compacted (see Compacting a Yak file). When a stream is truncated, all blocks - including those in any extended reserve - are returned as free blocks, in effect making the stream's size and reserved size very near to each other (reserved will include the unwritten space in the last data block, so tends to be ever so slightly larger).
 
 A possible extension is automatic reservation, in the manner of XFS's speculative preallocation: when a stream is appended to in several consecutive commits, Yak grows its reservation geometrically (say 64 KB, then 128 KB, and so on, up to a cap), and trims any unused reservation when the stream is closed. Streams that grow like logs would then get the benefits above without callers needing to know reserve exists.
 
@@ -797,15 +799,17 @@ A read-only view of a version needs only that version's Streams descriptor. From
 
 ### Thread safety in L3
 
-Streams must be opened and closed like regular files before they can be written to and read from, including the Streams stream. Within a write transaction, this is to track that there is at most one active writer (with no readers) or many active readers (with no writer) per stream, since all of them work on the transaction's uncommitted changes. The list of active readers and writers per stream, which is not exposed directly to L4, but kept internally and found from the stream handle that L3 exposes to L4, must be guarded with a mutex to avoid the multi-threaded creation of simultaneous readers and writer.
+A transaction, and every Reader and Writer opened in it, is only ever used by the thread that began it, and the same holds for a snapshot (see Yak file thread, process, machine & crash safety). L3 therefore needs no locks inside a transaction or a snapshot: everything it keeps for one of them is touched by one thread only.
 
-Read transactions are not tracked per stream. A read transaction only reads blocks of a committed version, which no write transaction changes, so it needs no lock against the writer. What it does need is for its version's blocks not to be reused while it reads; that is handled by pinning versions (see Pending blocks in L2 and Reader registry in L1).
+Streams must still be opened and closed like regular files before they can be written to and read from, including the Streams stream. Within a transaction, this tracks that there is at most one Writer (with no Readers) or any number of Readers (with no Writer) per stream, since all of them work on the transaction's uncommitted changes. The record of open Readers and Writers per stream is kept internally and found from the stream handle that L3 exposes to L4. It is a check, not a lock: opening a Writer on a stream that already has a Reader or Writer open in the transaction fails.
 
-The Streams stream needs modification every time a stream is created or deleted. Because many threads can do that at the same time, it is guarded to prevent multiple threads attempting to modify this stream at the same time. If one thread is modifying the Streams stream, and another thread needs to do the same at the same time, the second thread is put to sleep until the first thread is done with the modification. A separate, non-public L3 API enables L4 to read and write in a blocking fashion to ensure multiple threads do modifications to the Streams stream in an orderly fashion.
+Snapshots are not tracked per stream. A snapshot only reads blocks of a committed version, which no transaction changes, so it needs no lock against the transaction. What it does need is for its version's blocks not to be reused while it reads; that is handled by pinning versions (see Pending blocks in L2 and Reader registry in L1).
 
-The dirty map is divided by stream. Since a stream has at most one writer, only one thread changes a stream's part of the dirty map at a time, and no extra locking is needed for it. The parts belonging to the Streams stream and to directory streams are guarded by the blocking opens described above.
+The Streams stream and directory streams change every time a stream or directory is created, renamed or deleted. L4 changes them through a separate, non-public L3 API, within a single call, so they are never left open between calls and never conflict with a caller's Readers and Writers.
 
-Only one write transaction is open at a time; `begin_transaction()` waits on a mutex held for the life of the write transaction. Within the transaction, commit is guarded by a commit lock, a reader-writer lock. Every call that changes the working version holds the shared side of the lock for the duration of the call. Commit, `commit_and_continue()` and rollback take the exclusive side, so they wait for calls in progress in other threads to finish, and calls that arrive during a commit wait for it to complete. Read transactions read committed versions only, so they do not take the commit lock; a read transaction that begins during a commit simply gets the version that was live before it.
+The dirty map belongs to the transaction, and is divided by stream; since only the transaction's thread changes it, it needs no locking.
+
+Commit, `commit_and_continue()` and rollback are calls on the transaction like any other, so they can never run while another call on the same transaction is in progress. Snapshots, in other threads or processes, read committed versions only; a snapshot that begins during a commit simply gets the version that was live before it.
 
 ## L2: Blocks
 
@@ -825,7 +829,7 @@ L2's API, which is used by L3, concerns itself with creating, managing and retur
 
 ### Managing blocks
 
-The management of blocks in L2 assumes nothing about what blocks contain or which stream they belong to. It is assumed that L3, where streams are managed, will appropriately handle access to a stream by multiple threads and that block writes are dispatched by L3 in the right order. Only a single writer can exist per stream at a time (as per Yak's thread/process safety constraints) so any writes to blocks in a stream will be guarded by L3.
+The management of blocks in L2 assumes nothing about what blocks contain or which stream they belong to. It is assumed that L3, where streams are managed, will appropriately handle access to a stream by its Readers and Writers and that block writes are dispatched by L3 in the right order. Only a single writer can exist per stream at a time (as per Yak's thread/process safety constraints) so any writes to blocks in a stream will be guarded by L3.
 
 Which block is allocated to which stream is untracked in L2. It is assumed that L3 remembers what blocks it has been given and what blocks it is handing back. L2 doesn't perform any checking of whether it *should* be writing a block, or returning a block to the free list. In other words, L3 is responsible for the integrity of blocks only being assigned to one stream, or available.
 
@@ -846,7 +850,7 @@ New blocks are always taken from space the committed version considers free: the
 
 L3 asks for blocks in runs, with an optional *goal* (a block index that the run should ideally follow, usually the last block of the same stream). L2 tries to satisfy the request with one contiguous extent starting at the goal, then with one contiguous extent anywhere, and only then with several extents. If the free list cannot satisfy the request, the file is grown, once, by the number of blocks still needed.
 
-When the file is grown, the new length is recorded in memory only. The `total blocks` field in L2's header section is updated as part of the commit. If the process crashes before the commit, the file may be longer than the committed version's `total blocks`; when the file is next opened for writing, L2 shortens it to that length, which discards anything the crashed transaction wrote there.
+When the file is grown, the new length is recorded in memory only. The `total blocks` field in L2's header section is updated as part of the commit. If the process crashes before the commit, the file may be longer than the committed version's `total blocks`; when the next transaction begins, in whichever process, L2 shortens it to that length, which discards anything the crashed transaction wrote there. Snapshots are unaffected, since no version reaches beyond its own `total blocks`.
 
 Blocks taken from the free list are not zeroed when allocated. Every block placed by L3 is written in full, and reserved space beyond a stream's size is never read, so zeroing would only add writes. Blocks gained by growing the file are already zero.
 
@@ -887,7 +891,7 @@ A block released by the commit that created version *v* may be reused once both 
 
 At the start of each transaction, and again at each `commit_and_continue()`, L2 asks L1 whether any snapshot, in this process or another, holds a version older than a given version (see Reader registry in L1). A pending trunk tagged with version *v* is eligible when the answer for *v* is no. The answer can only change from yes to no as *v* gets smaller, so L2 finds the newest eligible tag with a few questions rather than one per trunk. The extents of every eligible trunk are moved into the free list in memory. The move is recorded on disk by the next commit, which writes the new free list head and pending list head together. If the process crashes before then, the blocks are still pending when the file reopens and are released again, so a crash can delay reuse but never lose a block.
 
-L2 knows which durability level its own commits used, but not which one a previous writer process used: that process may have committed with `Durability::None` and closed the file, leaving its last commit unordered in the operating system's cache. When a Yak file is opened for writing, L1 therefore syncs it once before any block is reused, which makes every commit already in the file durable.
+An open knows which durability level its own commits used, but not which one another open used: the last commit may have come from another process, with `Durability::None`, leaving it unordered in the operating system's cache. When a transaction begins and the live header was not written by this open, L1 therefore issues one barrier before any block is reused, which orders every commit already in the file before anything the new transaction writes.
 
 A snapshot that is held open for a long time prevents every block released since its version from being reused, so the file grows. This is the cost of snapshots that never block. A diagnostic reporting the oldest version held by a snapshot, to help find ones that are held for too long, may be added later; it is not part of `verify()`.
 
@@ -946,9 +950,7 @@ If encryption is enabled together with compression the runtime penalty is less t
 
 ### Thread safety in L2
 
-Since multiple threads can attempt to allocate or deallocate blocks at the same time (because different streams from the same Yak file can be opened for writing at the same time), changes to L2's in-memory free list and its record of private and released blocks are protected by a mutex. Because the free list on disk is only written at commit, allocation no longer needs to write anything to the file while holding the mutex.
-
-L2's commit runs while L3 holds the exclusive side of the commit lock, so no allocation can happen during it.
+L2's in-memory free list, its record of private and released blocks, and its block cache all belong to a transaction or a snapshot, which only one thread uses, so L2 needs no locking for them. Only one transaction exists at a time, so only one thread ever allocates or releases blocks. Snapshots never allocate.
 
 ## L1: Commits
 
@@ -960,8 +962,9 @@ L1 has no direct access to a file system; everything it stores, it stores throug
 
 L1's API, which is used by L2, should expose:
 
-* Creating a Yak file, as the writer
-* Opening a Yak file as a reader, as the writer, or as its only user (for `optimize()`)
+* Creating a Yak file
+* Opening a Yak file for reading or for writing
+* Beginning and ending a transaction's hold on the writer lock
 * Reading from and writing to the data region, at an offset from its start
 * Growing and shortening the data region
 * Laying out the header sections at creation, from the section sizes passed down by the layers above
@@ -983,11 +986,11 @@ Copy-on-write is only crash safe if the header never reaches storage before the 
 
 The durability level chosen for a commit decides what is done at each point:
 
-| Level                  | Sync point 1 | Sync point 2 | After a power loss or operating system crash                                                     |
-| ---------------------- | ------------ | ------------ | ------------------------------------------------------------------------------------------------ |
-| `Durability::Full`     | Barrier      | Sync         | The commit has happened once `commit()` returns.                                                  |
-| `Durability::Ordered`  | Barrier      | Barrier      | The file is valid, but the most recent commits may be lost. (Like SQLite's WAL mode with `synchronous=NORMAL`.) |
-| `Durability::None`     | Nothing      | Nothing      | The file may be damaged; `verify()` can check it.                                                 |
+| Level                 | Sync point 1 | Sync point 2 | After a power loss or operating system crash                                                                    |
+| --------------------- | ------------ | ------------ | --------------------------------------------------------------------------------------------------------------- |
+| `Durability::Full`    | Barrier      | Sync         | The commit has happened once `commit()` returns.                                                                |
+| `Durability::Ordered` | Barrier      | Barrier      | The file is valid, but the most recent commits may be lost. (Like SQLite's WAL mode with `synchronous=NORMAL`.) |
+| `Durability::None`    | Nothing      | Nothing      | The file may be damaged; `verify()` can check it.                                                               |
 
 A process crash loses nothing at any level, since the operating system already has every write the process made. Where a platform has no barrier, the barrier is a sync, so `Ordered` costs the same as `Full` there; the benefit is on macOS, where a full sync is expensive. The relative cost of the levels has not been benchmarked yet.
 
@@ -1009,15 +1012,14 @@ L1 coordinates processes with byte-range locks that L0 takes on the Yak file's o
 
 The lock region starts at the *lock base*, 2^62, a constant defined in one place. L1 never grows the data region into it; at 4 EiB, no real file comes close.
 
-| Offset                  | Lock                  | Taken by                                                                                                                                             |
-| ----------------------- | --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| lock base               | Presence              | Shared by every open of the file, for as long as it is open. Exclusive by `optimize()`, which proves that no other process has the file open.        |
-| lock base + 1           | Writer                | Exclusive by the process that has the file open for writing, for as long as it has it open.                                                          |
-| lock base + 2 + *v*     | Reader of version *v* | Shared by a reader process whose oldest snapshot holds version *v* (see Reader registry).                                                             |
+| Offset              | Lock                  | Taken by                                                                                        |
+| ------------------- | --------------------- | ----------------------------------------------------------------------------------------------- |
+| lock base           | Writer                | Exclusive by the open transaction, from `begin_transaction()` until `commit()` or `rollback()`. |
+| lock base + 1 + *v* | Reader of version *v* | Shared by an open whose oldest snapshot holds version *v* (see Reader registry).                |
 
-Opening for writing takes the presence lock shared and the writer lock exclusive, waiting for the writer lock or failing at once, according to the open options. Opening for reading takes only the presence lock. Readers therefore never conflict with the writer, and only one process can write. To `optimize()` the file, the writer releases its shared presence lock and tries to take it exclusive, failing at once; if another process has the file open, `optimize()` fails and the shared lock is taken again.
+Opening a Yak file, for reading or for writing, takes no lock, so opening never waits. Beginning a transaction takes the writer lock exclusive, waiting for it or failing at once, according to the options (see Beginning a transaction). `commit_and_continue()` keeps it. Snapshots therefore never conflict with a transaction, and only one transaction exists at a time.
 
-Versions are 64-bit sequence numbers, and lock base + 2 + *v* must stay below the largest offset that can be locked (2^63 - 1 on POSIX), which leaves room for about 4.6 × 10^18 versions. A commit that would exceed it fails rather than corrupting anything.
+Versions are 64-bit sequence numbers, and lock base + 1 + *v* must stay below the largest offset that can be locked (2^63 - 1 on POSIX), which leaves room for about 4.6 × 10^18 versions. A commit that would exceed it fails rather than corrupting anything.
 
 ### Reader registry
 
@@ -1025,37 +1027,52 @@ Before L2 reuses blocks released by the commit that created version *v*, it asks
 
 For each open of a Yak file, L1 keeps a map from version to the number of open snapshots on that version, guarded by a mutex. The map is ordered, so its first entry is the open's oldest snapshot.
 
-An open for reading also publishes its oldest version to the writer, by holding a shared lock on that version's reader byte. It holds at most one reader lock at a time. That is enough, because blocks are only reused once no snapshot holds a version older than the commit that released them, so the oldest snapshot protects every newer one. It also matters for correctness: locking the same byte twice through the same open merges into one lock with OFD locks but stacks on Windows, so L1 never does it, and lets the map decide when to lock and unlock. Below, "reader process" means any open for reading, including one in the writer's own process, since each open is a separate lock owner. Several processes can hold a shared lock on the same byte; each releases its own, independently of the others.
+Every open publishes its oldest version, by holding a shared lock on that version's reader byte, whether or not it can also write: any open may hold the next transaction, and that transaction cannot see the other opens' maps. An open holds at most one reader lock at a time. That is enough, because blocks are only reused once no snapshot holds a version older than the commit that released them, so the oldest snapshot protects every newer one. It also matters for correctness: locking the same byte twice through the same open merges into one lock with OFD locks but stacks on Windows, so L1 never does it, and lets the map decide when to lock and unlock. Several opens, in the same process or in different ones, can hold a shared lock on the same byte; each releases its own, independently of the others.
 
-To begin its first snapshot, a reader process:
+To begin its first snapshot, an open:
 
 1. Reads the header, and notes its version.
 2. Locks that version's reader byte, shared, waiting if necessary.
 3. Reads the header again. If a newer commit has completed in the meantime, it locks the newer version's byte, unlocks the older one, and repeats this step.
 
-The writer only checks the registry after it has published a new header. A reader therefore either locked its version before the writer looked, so the writer respects it, or it sees the writer's newer header in step 3 and moves to it. Either way, no block the reader can see is reused.
+A transaction only checks the registry after it has read the live header it starts from, or published a new one. A snapshot therefore either locked its version before the transaction looked, so the transaction respects it, or it sees that header, or a newer one, in step 3 and moves to it before reading anything. Either way, no block a snapshot can see is reused.
 
 After that, the map drives the lock:
 
-* **A later snapshot** reads the header to find the latest version, begins on it and only adds to the map; the lock on the oldest version already protects it. (In the writer process, the latest version is the last one it committed, so no header read is needed.)
-* **A snapshot ends.** Its version's count goes down. If that removes the oldest version and other snapshots remain, the process locks the next oldest version's byte, then unlocks the old one, so it is covered throughout. If no snapshots remain, it unlocks.
+* **A later snapshot** reads the header to find the latest version, begins on it and only adds to the map; the lock on the oldest version already protects it.
+* **A snapshot ends.** Its version's count goes down. If that removes the oldest version and other snapshots remain, the open locks the next oldest version's byte, then unlocks the old one, so it is covered throughout. If no snapshots remain, it unlocks.
 * **`refresh()`** is a snapshot ending and a new one beginning, with the new one counted before the old one is removed.
 
-To answer whether any snapshot holds a version older than *v*, the writer open first checks its own map. Its own snapshots are only recorded there: it never takes reader locks itself. If its oldest snapshot is older than *v*, the answer is yes. Otherwise it tries to lock the range lock base + 2 up to lock base + 2 + *v*, exclusive and failing at once. If that fails, a reader process holds an older version; if it succeeds, none does, and the lock is released straight away. Because the writer open holds no reader locks, the range never covers one of its own, which matters with OFD locks, where an exclusive lock over the same open's shared lock silently converts it. A reader process that moves its lock while the writer briefly holds the range waits for a moment, which is why reader locks are taken waiting.
+To answer whether any snapshot holds a version older than *v*, the transaction's open first checks its own map. If its own oldest snapshot is older than *v*, the answer is yes, with no lock needed. Otherwise *v* is at or below the open's own oldest version, so the range lock base + 1 up to lock base + 1 + *v* cannot contain the open's own reader lock. The transaction tries to lock that range, exclusive and failing at once. If that fails, another open holds an older version; if it succeeds, none does, and the lock is released straight away. Staying below its own reader lock matters with OFD locks, where an exclusive lock over the same open's shared lock silently converts it instead of failing. An open that moves its reader lock while a transaction briefly holds the range waits for a moment, which is why reader locks are taken waiting.
+
+The only blocks a transaction can reuse are on the free list, which needs no check, or on the pending list, whose tags it reads from the live header whichever open committed them. So the only versions it ever asks about are the pending tags: it never needs to know which versions other opens hold, only whether each pending tag is clear yet.
 
 An L0 whose locks only work within one process, such as one keeping the file in memory, gives the same results, since every snapshot is then in the same process.
 
-### Opening a Yak file for writing once per process
+### Beginning a transaction
 
-Locks belong to the open file on every supported platform (see Locks in L0), so each open of a Yak file is a separate lock owner, and a second open in the same process behaves exactly like an open from another process. For reading, that is harmless: a second read open takes its own presence and reader locks, and a writer in the same process sees them as it would a reader process's.
+A transaction may follow commits made by other opens, in this process or in others, so it carries nothing over from earlier transactions:
 
-A second open *for writing* is the exception. It would wait for the first open's writer lock, and if the thread that holds the first open is the one waiting, it would wait forever. L1 therefore keeps a process-wide table of the Yak files open for writing, keyed by the *storage identity* that L0 reports: an opaque value that is the same for every path that leads to the same file (see L0 API). When a Yak file is opened for writing, L1 opens the storage through L0, asks for its identity, and fails at once with "already open for writing in this process" if the identity is in the table, before taking any locks. The duplicate storage is then simply closed; closing it cannot affect the first open's locks.
+1. It takes the writer lock, exclusive, waiting or failing at once according to the options. The operating system cannot tell threads apart, since all threads of one open share its lock owner, so each open puts a mutex in front of the writer lock and records which thread holds it: threads of the same open wait on the mutex, threads of other opens and processes wait on the writer lock, and either way the behaviour is the same. A thread that already holds the open's transaction fails at once instead of waiting for itself.
+2. It reads the live header, and every layer starts from the sections in that header. No layer keeps transaction state from one transaction to the next. A layer may keep such state as an optimisation only while the live header is still the one this open last committed, which shows that no other open has committed since.
+3. If the live header was not written by this open, L1 issues one barrier (see Pending blocks in L2), and L2 shortens the file to the header's `total blocks` if a crashed transaction left it longer (see Allocating blocks in L2).
+4. L2 checks which pending tags are clear (see Reader registry) and moves those trunks onto the free list in memory.
+
+`commit()` and `rollback()` release the writer lock. `commit_and_continue()` keeps it, so the transaction carries on with its own state, which no other open can have changed.
+
+Waiting for the writer lock is not fair: neither OFD locks nor `LockFileEx` serve waiting locks in order. An open that commits and begins a new transaction straight away, in a loop, can keep transactions in other opens waiting indefinitely. This is a documented limitation for now; a gate lock that waiting transactions take first, as CompoundFs uses, would make it fair.
+
+### Several opens in one process
+
+Locks belong to the open file on every supported platform (see Locks in L0), so each open of a Yak file is a separate lock owner, and L1 needs no record of which files a process has open. A second open in the same process behaves exactly like an open from another process: it takes its own reader lock, and its transactions take turns with every other open's through the writer lock.
 
 ### Thread & process safety in L1
 
-L1 ensures that only one process opens the Yak file for writing at a time, through the writer lock (see Locks), so readers can open the Yak file while a writer has it open. Within the writer process, only one transaction is open at a time (see Thread safety in L3).
+L1 ensures that only one transaction is open at a time, across all opens and processes, through the writer lock (see Locks), so snapshots can be begun while a transaction is open. Threads of the same open take turns through the open's mutex in front of the writer lock, so a thread behaves exactly like a process (see Beginning a transaction).
 
-Readers do not need a lock to read the Yak file itself. They only read blocks that belong to the version they hold, which the writer guarantees not to change, and they find that version through a header slot whose checksum protects against reading it while it is being written.
+The only state L1 shares between an open's threads is the writer mutex and the map of open snapshots per version (see Reader registry), each guarded by its own mutex. Everything else belongs to a transaction or a snapshot, which only one thread uses.
+
+Snapshots do not need a lock to read the Yak file itself. They only read blocks that belong to the version they hold, which no transaction changes, and they find that version through a header slot whose checksum protects against reading it while it is being written.
 
 ## L0: Storage
 
@@ -1073,21 +1090,19 @@ L0's API, which is used by L1, should expose the functions necessary to wrap act
 * Ordering writes with a barrier (every write completed before it reaches storage before any write issued after it)
 * Syncing the storage (all completed writes reach storage)
 * Reporting the storage's block size, if it is known
-* Reporting the storage's identity: an opaque value that can be compared, and that is the same for every path to the same storage
 * Locking and unlocking byte ranges of the storage, including ranges beyond its end, shared or exclusive, either waiting or failing at once
-* Replacing one storage with another atomically (used by `optimize()`)
 
-L0 keeps no process-wide state: everything it holds belongs to one storage it has opened (its handle or, for an L0 that keeps the file in memory, its contents and locks). It does not know which storages are open in the process, or what its locks mean.
+L0 keeps no process-wide state: everything it holds belongs to the storage itself (a file's handle or, for an L0 that keeps the file in memory, its contents and locks). It does not know which storages are open in the process, or what its locks mean.
 
 ### Syncing
 
 L0's sync must not return until every write completed before it has reached storage. L0's barrier only promises order: every write completed before the barrier reaches storage before any write issued after it, but the barrier may return before either has. L1 relies on both to order commits (see Commit ordering in L1).
 
-| Platform | Barrier                 | Sync                   |
-| -------- | ----------------------- | ---------------------- |
-| Linux    | `fdatasync`             | `fdatasync`            |
-| Windows  | `FlushFileBuffers`      | `FlushFileBuffers`     |
-| macOS    | `fcntl(F_BARRIERFSYNC)` | `fcntl(F_FULLFSYNC)`   |
+| Platform | Barrier                 | Sync                 |
+| -------- | ----------------------- | -------------------- |
+| Linux    | `fdatasync`             | `fdatasync`          |
+| Windows  | `FlushFileBuffers`      | `FlushFileBuffers`   |
+| macOS    | `fcntl(F_BARRIERFSYNC)` | `fcntl(F_FULLFSYNC)` |
 
 Linux and Windows have no barrier that is cheaper than a sync, so their barrier is a sync. On macOS, plain `fsync` does not flush the drive's own cache, so a sync is `F_FULLFSYNC`, which costs around 20 ms on Apple's internal drives; `F_BARRIERFSYNC` orders writes without waiting for them, which is what makes `Durability::Ordered` worthwhile there.
 
@@ -1099,10 +1114,10 @@ L1 coordinates the writer and readers across processes with byte-range locks on 
 
 For a file on disk, locks are the operating system's byte-range locks, which both POSIX and Windows allow beyond the end of a file:
 
-| Platform       | Mechanism                                                           | Held by       |
-| -------------- | ------------------------------------------------------------------- | ------------- |
-| Windows        | `LockFileEx` and `UnlockFileEx`                                     | The handle    |
-| Linux, macOS   | `fcntl` open file description locks (`F_OFD_SETLK`, `F_OFD_SETLKW`) | The open file |
+| Platform     | Mechanism                                                           | Held by       |
+| ------------ | ------------------------------------------------------------------- | ------------- |
+| Windows      | `LockFileEx` and `UnlockFileEx`                                     | The handle    |
+| Linux, macOS | `fcntl` open file description locks (`F_OFD_SETLK`, `F_OFD_SETLKW`) | The open file |
 
 The operating system releases them if the process dies. Locks on Windows are mandatory, so a locked range cannot be read or written through other handles; this does not matter, since nothing reads or writes the locked ranges. A shared lock only needs the file open for reading, so reader processes need no write access.
 
@@ -1112,11 +1127,9 @@ macOS has had open file description locks in its kernel since OS X 10.11. Its he
 
 The BSDs are not supported. They only have process-wide `fcntl` record locks, which never conflict within a process and are all released when the process closes *any* descriptor for the file.
 
-The storage identity of a file on disk is its device and inode number (from `fstat`) on POSIX, and its volume serial number and file ID (from `GetFileInformationByHandle`) on Windows.
+An L0 that keeps the file in memory, or in a stream of another Yak file, can keep its locks in memory, which works within one process only. The locks must be kept with the stored data, not with each open of it, so that every open of the same storage sees the others' locks, as the operating system does for a file on disk.
 
-An L0 that keeps the file in memory, or in a stream of another Yak file, can keep its locks in memory, which works within one process only, and give each storage it opens a unique identity.
-
-L0 does not know what the locked ranges mean; the presence, writer and reader locks are L1's.
+L0 does not know what the locked ranges mean; the writer and reader locks are L1's.
 
 ## Verifying a Yak file
 
@@ -1125,22 +1138,24 @@ With atomic commits, a Yak file does not need verifying after a crash: it opens 
 * Commits made with `Durability::None` skip syncs, so a power loss can leave a header whose blocks never reached storage.
 * Bugs in Yak itself. The test suite runs `verify()` to check that every state Yak leaves behind, including every state a simulated crash leaves behind, is valid (see Testing).
 * Structural damage to the file from the storage it is kept on. Only the header slots carry a checksum, so `verify()` can find damage to structure (indices out of range, impossible lengths, broken chains), but not to the contents of streams.
-* Leaked blocks, which show whether `optimize()` is worth running.
+* Leaked blocks, which show whether compacting the file is worth it (see Compacting a Yak file).
 
 `verify()` is implemented as a chain across the four upper layers (L4 -> L3 -> L2 -> L1; L0 has no invariants of its own to check), each layer checking its own invariants and passing claimed resource lists down. With transactions, verification checks a committed version, and additionally checks:
 
 * That both header slots can be read, and reports which is live and the sequence number of each.
 * That no block is both reachable from the committed version and on the free list.
 * That no block appears on both the free list and the pending list.
-* That every block of the file below `total blocks` is reachable from the committed version, on the free list, or on the pending list. A block that is none of these has leaked; leaked blocks are reported, and reclaimed by `optimize()`.
+* That every block of the file below `total blocks` is reachable from the committed version, on the free list, or on the pending list. A block that is none of these has leaked; leaked blocks are reported, and reclaimed by compacting the file.
 
 `verify()` does not report which versions snapshots hold. That is information about who has the file open at the moment, not about the file's integrity (see Pending blocks in L2).
 
 Verification of a version can run alongside the writer, because the version it checks does not change.
 
-## Optimizing a Yak file
+## Compacting a Yak file
 
-`optimize()` rewrites a Yak file into a new file, copying only the committed version's directories and streams, stripping excess reserved capacity, and writing each stream's data contiguously. The new file then atomically replaces the original. Pending blocks, leaked blocks and the history of older versions are not copied, so optimizing also resets the file to a single version. Because optimizing replaces the file, it requires that no other process has the file open, either as a reader or as the writer, which it checks by taking the presence lock exclusive (see Locks in L1). Locks belong to the file, not to its path, so the new file is opened and locked as the writer's before it replaces the original; otherwise another process could open the new file for writing in between.
+Compacting is not part of the library. The command line Yak tool compacts a Yak file using only the public API: it begins a snapshot of the file, creates a new Yak file, and for each directory and stream in the snapshot creates one with the same name in the new file, reserving the stream's size before copying its data so that the data is written contiguously. The new file then replaces the original. Only the snapshot's version is copied, so pending blocks, leaked blocks, excess reserved capacity and the history of older versions are left behind, and the new file starts from a single version. Streams keep their names but may be given different stream identifiers. Settings fixed at creation, such as the block size, the encryption or the header layout version, can be changed along the way.
+
+Yak does not check whether anyone else has the file open when it is replaced. An open of the original keeps the original's storage, so its snapshots keep working, but anything it commits afterwards goes into the replaced file and is lost. A file should only be compacted when no other process is using it. Keeping compaction out of the library was chosen over making this check: the check needs a presence lock taken by every open and a way for L0 to replace one storage with another atomically, all for one maintenance task that the public API can already do.
 
 ```ASCII
                             Header 1          Header 2                                                                               
@@ -1237,16 +1252,15 @@ Verification of a version can run alongside the writer, because the version it c
 
 #### Lock discipline (for Locks in L1)
 
-OFD locks and `LockFileEx` behave the same only if L1 keeps to four rules:
+OFD locks and `LockFileEx` behave the same only if L1 keeps to three rules:
 
-1. **One open for writing per process.** Each open is a separate lock owner, so a second open for writing would wait on its own writer lock (see Opening a Yak file for writing once per process).
-2. **Never lock a byte that the same open already holds.** OFD locks merge a repeated lock into one, while Windows stacks it and needs one unlock per lock. The map in the reader registry decides when to lock and unlock, and a reader moves by locking the new byte before unlocking the old one, so no byte is ever locked twice.
-3. **Never convert a lock in place.** OFD locks silently turn a shared lock into an exclusive one when the same open locks over it, and Windows cannot convert at all. The writer open holds no reader locks, so its range probe never covers one of its own; `optimize()` releases the presence lock and takes it again rather than converting it.
-4. **Unlock exactly the range that was locked.** Windows requires an unlock to match a lock's range exactly, where OFD locks can unlock part of a range. Every lock is a single byte, locked and unlocked on its own, except the writer's probe, which is locked and unlocked as one identical range.
+1. **Never lock a byte that the same open already holds.** OFD locks merge a repeated lock into one, while Windows stacks it and needs one unlock per lock. The map in the reader registry decides when to lock and unlock, and a reader moves by locking the new byte before unlocking the old one, so no byte is ever locked twice.
+2. **Never convert a lock in place.** OFD locks silently turn a shared lock into an exclusive one when the same open locks over it, and Windows cannot convert at all. A transaction only probes below its own open's oldest snapshot, so its range never covers its own reader lock.
+3. **Unlock exactly the range that was locked.** Windows requires an unlock to match a lock's range exactly, where OFD locks can unlock part of a range. Every lock is a single byte, locked and unlocked on its own, except the writer's probe, which is locked and unlocked as one identical range.
 
 #### Probing for readers cheaply (for Pending blocks in L2)
 
-The probe only answers yes or no: does any reader process hold a version older than *v*? Two facts keep the number of probes small:
+The probe only answers yes or no: does any other open hold a version older than *v*? Two facts keep the number of probes small:
 
 * **Probe the newest pending tag first.** If no reader holds a version older than it, none holds a version older than any older tag either, so one probe usually releases every pending trunk. Only when it fails does the writer search, and only across the tags actually on the pending list.
 * **A clear answer stays clear.** A new snapshot always begins on the latest version, and a reader only ever moves its lock to a newer version, so once no reader holds a version older than *v*, that remains true. The writer remembers the newest tag it found clear, and only probes tags newer than that.
@@ -1259,7 +1273,7 @@ A child process created with `fork()` inherits the parent's descriptors, and wit
 
 #### A stuck writer (for Thread & process safety in L1)
 
-The writer lock is held for as long as the writer process has the file open. A writer that crashes releases it at once, but a writer that hangs without crashing keeps it, and every process that wants to open the file for writing waits for it, or fails, indefinitely. Yak has no timeout or handover for the writer lock. Reader processes are unaffected, since they never wait for the writer.
+The writer lock is held for as long as a transaction is open. A process that crashes during a transaction releases it at once, but a process that hangs inside a transaction without crashing keeps it, and every transaction that other opens try to begin waits for it, or fails, indefinitely. Yak has no timeout or handover for the writer lock. Snapshots are unaffected, since they never wait for a transaction; and a process that hangs outside a transaction blocks nobody.
 
 #### 64-bit file offsets (for Locks in L0)
 

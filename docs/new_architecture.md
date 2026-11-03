@@ -181,16 +181,16 @@ Additional Rust tests exist in the library itself, to test functionality that ca
 
 A Yak file must handle being accessed by multiple threads within the same process and multiple processes on the local machine, with the following considerations:
 
-- Any number of processes can have a Yak file open, for reading or for writing, at the same time.
-- Only one transaction at a time can be running on a Yak file, across all processes. Beginning a transaction while another is open, in this process or another, either waits until that transaction commits or rolls back, or fails at once, according to the options. 
-- A child process created with `fork()` must not use the Yak files its parent opened; it must open them itself. A forked child shares its parent's locks, so a child that keeps running can hold the parent's writer lock (if it forked during a transaction) or reader locks even after the parent has exited. This affects, for example, Python's `multiprocessing` with the fork start method.
-- A transaction or snapshot belongs to the thread that began it, and cannot be shared with or moved to another thread, just as it could not be shared with another process.
-- If a process has a Yak file opened for reading, it can open multiple snapshots in any thread.
-- If a process has a Yak file opened for writing, it can open multiple snapshots in any thread and one transaction per thread. Multiple transactions serialise amongst the threads and any other process/thread requesting a transaction, though order is not guaranteed. If a thread already has an open transaction, beginning a new transaction on the same thread, through the same open, fails at once; through a different open of the same file, it hangs if the second transaction requested to wait for the first transaction to finish. 
-- Snapshots never block, neither each other nor the transaction, and never prevent a transaction from committing, whichever process they are in.
+- It is generally not safe to open a Yak file over a network (SMB, NFS etc.) or through a virtual machine, unless the caller can guarantee singular access. Yak cannot adequately coordinate processes outside of the current machine.
+- Any number of processes can have the same Yak file open, for reading or for writing, at the same time. A forked child process must not use the Yak files its parent opened; it must open them itself. 
+- If a process has a Yak file opened for reading, it can begin multiple snapshots in any thread.
 - A snapshot can open multiple Readers per stream.
-- A transaction can open multiple Readers per stream OR one Writer per stream.
-- All access coordination happens on the same machine. It is not safe to open a Yak file over the network, unless callers know they are the only ones accessing the file.
+- If a process has a Yak file opened for writing, it can begin multiple snapshots in any thread and one transaction per thread. Multiple transactions serialise amongst the threads (if happy to wait, otherwise they fail) across processes, though order is not guaranteed. Opening a second transaction on the same thread fails.
+- A transaction can open multiple Readers per stream OR one Writer per stream. 
+- An open Yak file can be shared between threads.
+- Once opened, a transaction must only be used on the thread it was opened on.
+- A snapshot can technically be moved to another thread, but only one thread can use it at a time (which the snapshot does not coordinate). It's often a lot simpler just to open another snapshot instead of sharing.
+- Snapshots never block, neither each other nor a transaction, and never prevent a transaction from committing, whichever thread or process they are in.
 
 If a process crash or a system power loss occurs, a Yak file opens to look exactly like it did at the last successful transaction, with no recovery work required by the caller. If a transaction was in progress during the crash it is as if it never happened. In other words, changes to Yak files are ACI(D):
 - **A**tomic - they either happened fully or they didn't happen at all.
@@ -198,10 +198,8 @@ If a process crash or a system power loss occurs, a Yak file opens to look exact
 - **I**solated - a change is invisible until it happens and every snapshot sees only a committed version.
 - **(D)**urable - depending on the options chosen when the caller commits a transaction, Yak can be fully durable.
 
-Each commit chooses a durability level (see Commit ordering in L1). `Full` gives all four guarantees above. `Ordered` keeps the file valid after a power loss but may lose the most recent commits, so it gives up some durability for speed. `None` skips all syncs, which is fastest when the Yak file's integrity isn't critical or it can easily be recreated, and is why a function to verify the structure of a Yak file is provided (see Verifying a Yak file).
-
 ## Yak file sizing types
-By default, Yak uses 32-bit unsigned integets to address its blocks; the value 0xFFFFFFFF is reserved as a sentinel meaning "no block", so a Yak file holds at most 2^32 - 1 blocks. The block size therefore sets the largest possible file (e.g. ~16 TiB with 4 KiB blocks and ~256 TiB with 64 KiB blocks). Files that need to contain larger streams use larger blocks. Yak can optionally be built using smaller (u8, U16) or larger (u64) block index type but Yak files created with these settings must be opened by a custom Yak library that supports this type. Block index width (1, 2, 4 or 8 bytes) is stored in a Yak file and an error occurs if a caller attempts to load a Yak file created using a different block index width.
+By default, Yak uses 32-bit unsigned integers to address its blocks; the value 0xFFFFFFFF is reserved as a sentinel meaning "no block", so a Yak file holds at most 2^32 - 1 blocks. The block size therefore sets the largest possible file (e.g. ~16 TiB with 4 KiB blocks and ~256 TiB with 64 KiB blocks). Files that need to contain larger streams use larger blocks. Yak can optionally be built using smaller (u8, U16) or larger (u64) block index type but Yak files created with these settings must be opened by a custom Yak library that supports this type. Block index width (1, 2, 4 or 8 bytes) is stored in a Yak file and an error occurs if a caller attempts to load a Yak file created using a different block index width.
 
 It follows that stream identifiers are the same datatype as block indices, since a stream typically are at least 1 block and there cannot be more streams than there are blocks possible (technically, a stream can take no storage other than the stream descriptor in the Streams stream, but it's hard to imagine a Yak file with more than 4 billion completely empty streams). For stream identifiers, 0xFFFFFFFF is reserved as a sentinel value as well.
 
@@ -215,7 +213,7 @@ Naturally Yak cannot make any guarantees about the endianness of user-written st
 
 ## Transactions & snapshots
 
-All modifications made in a Yak ultimately end up as modifications to the bytes held in the stream blocks and to the header of the Yak file. In a storage library without transaction support, changes would be written directly to the file, but in Yak (like in other embedded storage libraries with transaction support), changes made by a transaction are kept separate from the original file; instead of performing those changes on the original blocks and the original header, all changes occur in *new* blocks and a *new* header that is separate from the original blocks and header.
+All modifications made in a Yak ultimately end up as modifications to the bytes held in the stream blocks and to the header of the Yak file. In a storage library without transaction support, changes would be written directly to the file, but in Yak (like in other embedded storage libraries with transaction support), changes made by a transaction are kept separate from the original file; instead of performing those changes on the original blocks and the original header, all changes occur in *new* blocks and a *new* header that is separate from the original blocks and header. Only when the transaction is committed are the changes written to the Yak file.
 
 ### Committing a transaction
 
@@ -311,7 +309,7 @@ It follows from this that a Yak file could continually grow; every time a transa
 
 #### File system consistency
 
-File writes - to Yak files or indeed any other file found on a machine - are generally not guaranteed to be done in the order they were issued. In addition, file system and storage hardware caches can often mean the file system reports "changes written to disk" before they actually are. To guarantee that a new header update doesn't get written to disk before the changed blocks, which would cause inconsistency for a new reader that might read the new header and assume that the blocks had indeed been written to disk, Yak uses file system sync points to guarantee that a write has fully completed; first sync point is after the transaction blocks have been written, the second is after the new header has been written. This ensures things occur in order and that the header gets written as the very last thing.
+File writes - to Yak files or indeed any other file found on a machine - are generally not guaranteed to be done in the order they were issued. In addition, file system and storage hardware caches can often mean the file system reports "changes written to disk" before they actually are. To guarantee that a new header update doesn't get written to disk before the changed blocks, which would cause inconsistency for a new reader that might read the new header and assume that the blocks had indeed been written to disk, Yak uses file system sync points to guarantee that a write has fully completed; first sync point is after the transaction blocks have been written, the second is after the new header has been written. This ensures things occur in order and that the header gets written as the very last thing. Callers can choose between "Full" durability, which guarantees that bytes are written to disk before the commit call returns, "Ordered" durability, which ensures things are written in order (ensuring Yak file integrity and process/thread coordination) or durability "None", which is fast but should only be used for singular writers that can tolerate an inconsistent file in case of a crash.
 
 ### Reading a snapshot
 
@@ -327,13 +325,13 @@ Put another way, as long as a snapshot exists to read a block, the block needs t
 
 ### Managing block lifetime with transactions & snapshots
 
-When a block is freed in L3, because a stream has been deleted, truncated or changes have been written to the stream (which are written to new blocks, causing the blocks with the original content to no longer be required), the block is returned to L2 as "pending free". From the perspective of a transaction the block is free, but snapshots may still exist that need to read from this block and so it cannot be freed for re-use. Instead it is marked with the version that it belonged to (the header version number when it was marked as free by L3) and kept by L2 until it is known that no more snapshots exist that could potentially read from the block.
+When a block is freed in L3, because a stream has been deleted, truncated or changes have been written to the stream (which are written to new blocks, causing the blocks with the original content to no longer be required), the block is returned to L2 as "pending free". From the perspective of a transaction the block is free, but snapshots may still exist that need to read from this block and so it cannot be freed for re-use. Instead it is tagged with the version created by the commit that released it, and kept by L2 until it is known that no snapshot holds a version older than that tag, since only those snapshots could still read from the block.
 
 When a later write transaction needs unused blocks (adding blocks to a stream, or needing new blocks because changes need to be written to existing blocks) Yak needs to either re-use blocks or add new blocks at the end of the Yak file.
 
-Yak first tries to re-use blocks. For each "pending free" block in L2 it checks if any snapshots could conceivably still need to read from the block. If all snapshots were created after the block was marked as "pending free", the block cannot possibly be read by any of those snapshots and it is therefore eligible to actually be freed reused.
+Yak first tries to re-use blocks. For each "pending free" block in L2 it checks if any snapshots could conceivably still need to read from the block. If every snapshot holds a version at or after the block's tag, the block cannot possibly be read by any of those snapshots and it is therefore eligible to actually be reused.
 
-For example, looking at Fig 1.b, blocks 84, 41, 140, 15 have been marked as "pending free" by L3. Because the blocks could still be read by snapshots begun at version 410, the blocks cannot be actually freed yet. But when all snapshots are version 411 or later, those four blocks can now actually be freed and reused.
+For example, looking at Fig 1.b, blocks 84, 41, 140, 15 have been marked as "pending free" by L3 in the commit that created version 411, so they are tagged 411. Because the blocks could still be read by snapshots begun at version 410, the blocks cannot be actually freed yet. But when all snapshots are version 411 or later, those four blocks can now actually be freed and reused.
 
 If L2 cannot find any blocks eligble for reuse, it extends the file, thereby creating new blocks, and it adds those blocks to the free list in the current header, thereby creating new blocks. These blocks are now freed to be used and as they are, they come off the free list. 
 
@@ -349,17 +347,37 @@ To facilitate this, Yak needs to coordinate two elements:
 1) No more than one transaction may be ongoing at the same time.
 2) No block may be re-used if a snapshot exists that can still read from in, no matter which thread that could occur in.
 
-Yak achieves this coordination using a portable method of locking byte-ranges on the Yak file, far, far beyond the end of the file. This is why Yak requires a 64 bit file system; it reserves the byte ranges from 2^62 --> (2^64-1) for thread coordination. On Linux, MacOS and Windows byte ranges beyond the actual end of a file can still be locked, which Yak uses as signalling method between threads. This creates some obvious advantages and disadvantages:
+Yak achieves this coordination using a portable method of locking byte-ranges on the Yak file, far, far beyond the end of the file. This is why Yak requires a 64 bit file system; it reserves the byte ranges from 2^62 --> (2^63-1) for thread coordination. The range stops at 2^63-1 because that is the largest offset POSIX can lock. On Linux, MacOS and Windows byte ranges beyond the actual end of a file can still be locked, which Yak uses as signalling method between threads. This creates some obvious advantages and disadvantages:
 
 Advantages:
 - Yak files do not need a side-car file-based coordination with write access. As such, Yak files can be opened in directories where the caller has no write access.
 - Yak files are singular and users are not confused by the presence of a side-car file when copying Yak files around.
-- If a thread crashes, the operating system frees any byte range locks it has so no crashing thread can hang on a transaction, nor prevent blocks from being freed because a snapshot (which has now crashed) ostensibly use it.
+- If a thread crashes, the operating system frees any byte range locks it has so that no crashing thread can hang on a transaction, nor prevent blocks from being freed because a snapshot (which has now crashed) ostensibly use it.
 
 Disadvantages:
-- Yak files can only be 2^62-1 bytes large, not 2^64-1. This is considered an acceptable maximum size for a single file.
-- Yak files can theoretically run out of transactions; if Yak ran one million transactions a second, a Yak file would run out of transactions after 148,000 years. This is considered an acceptable transaction load and lifetime for a storage format such as Yak.
+- Yak files can only be 2^62-1 bytes (4 EiB) large. This is considered an acceptable maximum size for a single file.
+- Yak files can theoretically run out of transactions; if Yak ran one million transactions a second, a Yak file would run out of transactions after ~148,000 years. This is considered an acceptable transaction load and lifetime for a storage format such as Yak.
 - Yak files rely on operating system support for byte range locks that fulfil Yak's criteria. Since this is the case for Linux, MacOS (and its device-based cousins) and Windows, with the only known exception being BSD-based operating systems, Yak considers this tradeoff acceptable.
+
+In practice, there are two byte-ranges that can be locked:
+- A write lock byte, positioned at byte 2^62, used to indicate that a thread is writing to the Yak file.
+- A range of snapsnot bytes, positioned between 2^62+1 --> 2^63-1, used to indicate the lowest (oldest) snapshot held by each thread operating on the Yak file.
+
+As implied before, it is important to understand that a Yak file can be 100 kb large and still have bytes locked above 2^62. The size of the Yak file does not limit which bytes can be locked. On the other hand, the range of bytes that are required for thread coordination does limit how large a Yak file can grow (size limit 2^62 - 1), because if it grew into the byte ranges that were locked, the locking would prevent Yak from functioning in those byte ranges.
+
+#### Locking the write byte
+When a transaction wishes to write to commit, which causes writes to the actual Yak file, it attempts to exclusively lock the write lock byte, indicating whether it's willing to wait (i.e. be blocked) or fail early (i.e. be told "you can't lock this right now"). If it's willing to wait, the operating system holds the thread until the other thread(s) have completed their write and unlock the write lock byte. The order in which the operating system grants another thread the exclusive write lock is not guaranteed to be in order that it was requested.
+
+Eventually, the write lock byte is exclusively locked. This means the thread now knows that it is the only thread writing to the Yak file. It performs the necessary writes and unlocks the write lock byte again, potentially allowing another thread write access to the file.
+
+If a thread crashes during the commit, i.e. during the time it holds the write lock byte exclusively, two things occur automatically:
+- The operating system releases any locks held by the thread, including the exclusive write lock byte.
+- The commit never completes, in that the new header doesn't get written to the Yak file.
+
+#### Locking reader bytes
+For a transaction to determine which blocks it can reuse, i.e. which blocks it can move from "pending free" to actually free, it needs to know the oldest snapshots currently live in all threads.
+
+Each open of a Yak will have one or more snapshots. These snapshots are tracked together
 **** NEW DESIGN DOWN TO HERE ****
 
 ** CLEAN TO HERE **
@@ -858,23 +876,35 @@ Blocks taken from the free list are not zeroed when allocated. Every block place
 
 When a block is released, it will often be in the middle of the underlying file that L1 is managing. For efficiency, blocks are reused by way of keeping a free list of blocks.
 
-The free list is stored in the free blocks themselves, as a chain of *trunk* blocks. Each trunk block holds the index of the next trunk (4 bytes) followed by as many free extents (start index and length, 4 bytes each) as fit in a block. L2 has a "free list head" block index in its header section, which points to the first trunk (using 0xFFFFFFFF when there is no free block available).
+The free list is stored in the free blocks themselves, as a chain of *trunk* blocks. Each trunk block holds the index of the next trunk (4 bytes) followed by fixed-size free extents:
+
+| Field  | Size (bytes) | Notes                                             |
+| ------ | ------------ | ------------------------------------------------- |
+| Start  | 4            | Little-endian u32; index of the first free block  |
+| Length | 4            | Little-endian u32; number of free blocks          |
+
+With 4 KiB blocks a trunk holds (4096 - 4) / 8 = 511 extents, with 4 bytes left over. L2 has a "free list head" block index in its header section, which points to the first trunk (using 0xFFFFFFFF when there is no free block available). Pending-list trunks are laid out the same way, with a tag added to each extent (see Pending blocks), so both kinds of trunk are read and followed the same way:
+
+* **New trunks are added at the head of the chain**, which is the only end a copy-on-write chain can change cheaply.
+* **The head trunk fills from the back.** Extents are placed from the end of the block towards its front, so adding one never moves another. The unused part of the head trunk is the gap between the next pointer and its first used slot, and the bytes left over when the extents do not fill the block exactly are part of that gap.
+* **Every trunk except the head is full.**
+* **Empty slots are all zeros.** No extent has a length of 0, so the first slot with a length that is not 0 is the head trunk's first used slot. No count of used slots is stored.
 
 ```ASCII
-L2 header                trunk 811                       trunk 95
-┌──────────────┐        ┌──────────────────────────┐    ┌──────────────────────────┐
-│ Free: 811    │──────► │ next: 95                 │──► │ next: 0xFFFFFFFF         │
-└──────────────┘        │ 812+4 | 1200+38 | 77+1   │    │ 96+12 | 3001+250 | ...   │
-                        └──────────────────────────┘    └──────────────────────────┘
+L2 header              head trunk 811                                    trunk 95
+┌──────────────┐      ┌────────────────────────────────────────────┐    ┌──────────────────────────────────────────────┐
+│ Free: 811    │────► │ next: 95 │ 0+0 │ 0+0 │ 812+4 │ 1200+38 │ 77+1 │──► │ next: 0xFFFFFFFF │ 96+12 │ 3001+250 │ … │
+└──────────────┘      └────────────────────────────────────────────┘    └──────────────────────────────────────────────┘
+                                    gap
 ```
 
-When blocks are freed, L2 sorts them and coalesces them into extents before adding them to the head trunk, starting a new trunk (taken from the freed blocks themselves) when the head trunk is full. This promotes them being later re-allocated in run-order, enabling multi-block read and write operations (i.e. IO operations that span across as many blocks as possible, thereby lowering the number of IO calls).
+When blocks are freed, L2 sorts them and coalesces them into extents before adding them to the head trunk, starting a new head trunk (taken from the freed blocks themselves) when the current one is full. This promotes them being later re-allocated in run-order, enabling multi-block read and write operations (i.e. IO operations that span across as many blocks as possible, thereby lowering the number of IO calls).
 
 #### The free list is copy-on-write too
 
 The free list is part of a version, just like the streams are: a version's free list must stay intact for as long as that version is the one a crash would fall back to, because after such a crash, the next transaction allocates from it.
 
-During a transaction, L2 holds the part of the free list it is using in memory: it takes extents from the head trunks as blocks are allocated, and adds released blocks that have become free. Trunks reachable from the live header are never modified in place. At commit, L2 writes the head trunks it changed as new trunk blocks (taken from the free extents themselves) and records the new free list head in its header section. Because the chain is consumed and extended at its head, a commit typically rewrites one or two trunk blocks. Trunks further down the chain are shared with the previous version, unchanged.
+During a transaction, L2 holds the part of the free list it is using in memory: it takes extents from the head trunks as blocks are allocated, and adds released blocks that have become free. Trunks reachable from the live header are never modified in place. At commit, L2 writes the head trunks it changed as new trunk blocks (taken from the free extents themselves) and records the new free list head in its header section. Because the chain is consumed and extended at its head, a commit typically rewrites one or two trunk blocks. Trunks further down the chain are shared with the previous version, unchanged. L2 packs the extents of the trunks it rewrites from the oldest end, so every trunk except the head stays full, and the head holds what is left over, at its back. Extents taken from the middle of a trunk leave no holes on disk, since that trunk is one of those rewritten.
 
 Trunk blocks that the new version no longer uses are only needed by the previous version's free list, which only the writer ever reads. They are released in the same way as stream blocks, except that no reader can be holding them, so they become free as soon as the next transaction begins.
 
@@ -882,14 +912,40 @@ Trunk blocks that the new version no longer uses are only needed by the previous
 
 A block released by a commit cannot go straight back on the free list. Readers holding an older version may still be reading it, and until the commit's header is ordered before later writes, a crash could fall back to the previous version, which uses it.
 
-L2 therefore keeps a *pending list*: a chain of blocks in the same trunk format as the free list, where each trunk is additionally tagged with the sequence number of the commit that released its blocks. The pending list head is in L2's header section. Each commit adds a trunk (or a few) recording what it released.
+L2 therefore keeps a *pending list*, whose head is in L2's header section. It is laid out exactly like the free list (see Reusing blocks), except that each extent is preceded by a *tag*: the version created by the commit that released it.
+
+| Field  | Size (bytes) | Notes                                                                 |
+| ------ | ------------ | --------------------------------------------------------------------- |
+| Tag    | 8            | Little-endian u64; the version created by the commit that released the extent |
+| Start  | 4            | Little-endian u32; as in the free list                                |
+| Length | 4            | Little-endian u32; as in the free list                                |
+
+With 4 KiB blocks a pending trunk holds (4096 - 4) / 16 = 255 entries, with 12 bytes left over. Moving an entry to the free list just drops its tag.
+
+Only three things differ from the free list:
+
+* **Pending trunks never live in the blocks they describe.** They are taken from the free list, or from growing the file. A pending block may still be read by a snapshot on an older version, and writing a trunk into it would change what that snapshot reads.
+* **Entries are in descending tag order, newest first.** Commits take turns through the writer lock and each one creates a higher version, so adding entries at the head, as the free list does, puts the newest tag in the head trunk's first used slot and the oldest at the end of the last trunk. The tags that are clear are therefore always the oldest ones, at the far end of the chain. A commit that releases more extents than the head trunk has room for continues in a new head trunk, so the same tag can appear in two trunks; the order is then descending or equal, which changes nothing below.
+* **An empty slot is recognised by its tag.** No commit releases blocks when creating version 1, the first version of a file, so a tag is never 0.
+
+```ASCII
+L2 header              head trunk 520                                trunk 133
+┌──────────────┐      ┌───────────────────────────────────────┐     ┌──────────────────────────────────────┐
+│ Pending: 520 │────► │ next: 133 │ 0 │ 0 │ 412 │ 411 │ 411 │ ────► │ next: 0xFFFFFFFF │ 410 │ 409 │ … │ 400 │
+└──────────────┘      └───────────────────────────────────────┘     └──────────────────────────────────────┘
+                                   gap   newest ──────────────────────────────────────────────────► oldest
+```
+
+Each commit adds its entries to the head trunk, so a trunk holds the releases of many commits and the chain stays short even while a snapshot holds back reuse for a long time.
 
 A block released by the commit that created version *v* may be reused once both of these are true:
 
 * Version *v*'s header is ordered before anything written after it, so a crash can no longer fall back to an earlier version that still uses the block while the block has been overwritten. A `Full` or `Ordered` commit guarantees this at its second sync point (see Commit ordering in L1). A `None` commit gives no guarantee after a power loss anyway, so it does not hold back reuse.
 * No reader holds a version older than *v*.
 
-At the start of each transaction, and again at each `commit_and_continue()`, L2 asks L1 whether any snapshot, in this process or another, holds a version older than a given version (see Reader registry in L1). A pending trunk tagged with version *v* is eligible when the answer for *v* is no. The answer can only change from yes to no as *v* gets smaller, so L2 finds the newest eligible tag with a few questions rather than one per trunk. The extents of every eligible trunk are moved into the free list in memory. The move is recorded on disk by the next commit, which writes the new free list head and pending list head together. If the process crashes before then, the blocks are still pending when the file reopens and are released again, so a crash can delay reuse but never lose a block.
+At the start of each transaction, and again at each `commit_and_continue()`, L2 asks L1 whether any snapshot, in this process or another, holds a version older than a given version (see Reader registry in L1). An entry tagged with version *v* is eligible when the answer for *v* is no. The answer can only change from yes to no as *v* gets smaller, so L2 finds the newest eligible tag with a few questions rather than one per entry: it asks first about the newest tag, the head trunk's first used slot, and only if that is not yet clear does it walk the chain and search among the tags, which are in order at fixed offsets. The extents of that entry and of every entry after it are moved into the free list in memory.
+
+When every entry is eligible, which is the common case, the pending list head simply becomes the sentinel and nothing is rewritten. When only some are, L2 cuts the chain after the last entry that is still held back, which rewrites the trunks from the head down to that point. These are exactly the trunks that are still held back, and this only happens when a snapshot holding back reuse moves on, since otherwise no new entry becomes eligible. L2 repacks the entries it keeps as it rewrites them, as it does for the free list. Trunks that are no longer reachable from the pending list are released like free-list trunks (see The free list is copy-on-write too). The move is recorded on disk by the next commit, which writes the new free list head and pending list head together. If the process crashes before then, the blocks are still pending when the file reopens and are released again, so a crash can delay reuse but never lose a block.
 
 An open knows which durability level its own commits used, but not which one another open used: the last commit may have come from another process, with `Durability::None`, leaving it unordered in the operating system's cache. When a transaction begins and the live header was not written by this open, L1 therefore issues one barrier before any block is reused, which orders every commit already in the file before anything the new transaction writes.
 
@@ -1056,7 +1112,7 @@ A transaction may follow commits made by other opens, in this process or in othe
 1. It takes the writer lock, exclusive, waiting or failing at once according to the options. The operating system cannot tell threads apart, since all threads of one open share its lock owner, so each open puts a mutex in front of the writer lock and records which thread holds it: threads of the same open wait on the mutex, threads of other opens and processes wait on the writer lock, and either way the behaviour is the same. A thread that already holds the open's transaction fails at once instead of waiting for itself.
 2. It reads the live header, and every layer starts from the sections in that header. No layer keeps transaction state from one transaction to the next. A layer may keep such state as an optimisation only while the live header is still the one this open last committed, which shows that no other open has committed since.
 3. If the live header was not written by this open, L1 issues one barrier (see Pending blocks in L2), and L2 shortens the file to the header's `total blocks` if a crashed transaction left it longer (see Allocating blocks in L2).
-4. L2 checks which pending tags are clear (see Reader registry) and moves those trunks onto the free list in memory.
+4. L2 checks which pending tags are clear (see Reader registry) and moves the extents of those entries onto the free list in memory.
 
 `commit()` and `rollback()` release the writer lock. `commit_and_continue()` keeps it, so the transaction carries on with its own state, which no other open can have changed.
 
@@ -1262,7 +1318,7 @@ OFD locks and `LockFileEx` behave the same only if L1 keeps to three rules:
 
 The probe only answers yes or no: does any other open hold a version older than *v*? Two facts keep the number of probes small:
 
-* **Probe the newest pending tag first.** If no reader holds a version older than it, none holds a version older than any older tag either, so one probe usually releases every pending trunk. Only when it fails does the writer search, and only across the tags actually on the pending list.
+* **Probe the newest pending tag first.** If no reader holds a version older than it, none holds a version older than any older tag either, so one probe usually releases every pending entry. Only when it fails does the writer search, and only across the tags actually on the pending list.
 * **A clear answer stays clear.** A new snapshot always begins on the latest version, and a reader only ever moves its lock to a newer version, so once no reader holds a version older than *v*, that remains true. The writer remembers the newest tag it found clear, and only probes tags newer than that.
 
 In practice a transaction start costs one to three probes. Each is a single system call into the kernel's lock table (roughly a microsecond, not benchmarked), which is negligible next to the sync of a durable commit.

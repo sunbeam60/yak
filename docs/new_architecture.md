@@ -199,7 +199,9 @@ If a process crash or a system power loss occurs, a Yak file opens to look exact
 - **(D)**urable - depending on the options chosen when the caller commits a transaction, Yak can be fully durable.
 
 ## Yak file sizing types
-By default, Yak uses 32-bit unsigned integers to address its blocks; the value 0xFFFFFFFF is reserved as a sentinel meaning "no block", so a Yak file holds at most 2^32 - 1 blocks. The block size therefore sets the largest possible file (e.g. ~16 TiB with 4 KiB blocks and ~256 TiB with 64 KiB blocks). Files that need to contain larger streams use larger blocks. Yak can optionally be built using smaller (u8, U16) or larger (u64) block index type but Yak files created with these settings must be opened by a custom Yak library that supports this type. Block index width (1, 2, 4 or 8 bytes) is stored in a Yak file and an error occurs if a caller attempts to load a Yak file created using a different block index width.
+By default, Yak uses 32-bit unsigned integers to address its blocks; the value 0xFFFFFFFF is reserved as a sentinel meaning "no block", so a Yak file holds at most 2^32 - 1 blocks. The block size therefore sets the largest possible file (e.g. ~16 TiB with 4 KiB blocks and ~256 TiB with 64 KiB blocks). Files that need to contain larger streams use larger blocks. The minimum (and default) block size is 4 KiB - any smaller and crash safety cannot be guaranteed.
+
+Yak can optionally be built using smaller (u8, U16) or larger (u64) block index type but Yak files created with these settings must be opened by a custom Yak library that supports this type. Block index width (1, 2, 4 or 8 bytes) is stored in a Yak file and an error occurs if a caller attempts to load a Yak file created using a different block index width.
 
 It follows that stream identifiers are the same datatype as block indices, since a stream typically are at least 1 block and there cannot be more streams than there are blocks possible (technically, a stream can take no storage other than the stream descriptor in the Streams stream, but it's hard to imagine a Yak file with more than 4 billion completely empty streams). For stream identifiers, 0xFFFFFFFF is reserved as a sentinel value as well.
 
@@ -221,7 +223,7 @@ When a user needs to change the value of 10 bytes in a stream, say, Yak first co
 
 When a transaction is committed all the stand-in blocks are written to the Yak file - not on top of the existing blocks, but as new blocks. These blocks are connected together by redirectors, from bottom up, as they are written into the file. An additional upside of knowing which blocks have changed, and which streams they belong to, is that the blocks can be written out as contiguously as possible, promoting optimised read and write speeds on the actual file.
 
-Once the blocks are known to have actually been written to disk, the header is updated with a new version number and also written to disk. To avoid the new header overwriting the old header that may be in the process of being read by another thread or process, the header is written to a second header slot and a higher version number is written as the very last thing in the write. This makes the second slot the highest header version, which causes new readers to recognise the new header as the current header. In this way, writers alternate between two header slots, using the version number to signal which one is the latest one.
+Once the blocks are known to have actually been written to disk, the header is updated with a new version and also written to disk. To avoid the new header overwriting the old header that may be in the process of being read by another thread or process, the header is written to a second header slot and a higher version is written as the very last thing in the write. This makes the second slot the one with the highest version, which causes new readers to recognise the new header as the current header. In this way, writers alternate between two header slots, using the version to signal which one is the latest one.
 
 As a practical example, observe Fig 1.a. Here the current header is version 410 and its out-of-band stream descriptor (which points to the Streams stream) indicates that block 84 is the top block in the Streams stream. Inside block 41 there are 5 stream descriptors, with the last one pointing to a data stream at block 140.
 
@@ -303,7 +305,7 @@ Because we now need to modify the redirector at 140 to point to new block 41, it
 
 We now need to change the descriptor that points to this modified stream, because the top block, which is a redirector, is no longer 140, but 77. So we wish to modify the stream descriptor at 41, but once again, we never modify data in-place. Instead we allocate a new block, 61, copy 41 into 61 and write our updated stream descriptor there. Because we've now created a new top block for the Streams stream, we allocate a new top block (60), copy 84 into 60 and then write our modified redirector there.
 
-Finally we update the header that now points to the Streams stream (the top block has moved from 84 to 60). Once again, we do not do this in the original header, but cddvddfdfdfdsfdswe instead write it into the previously used header (Header 2), where we update the version number to now be higher than the previous header (411 > 410). This marks Header 2 as the current header and the transaction has now committed. From now one, any new snapshot that begins finds the highest header, now version 411 and reads the data from here. By starting with this new header, the Streams stream is located in block 60 and the fifth stream is located not in 140, but in block 77.
+Finally we update the header that now points to the Streams stream (the top block has moved from 84 to 60). Once again, we do not do this in the original header, but instead write it into the previously used header (Header 2), where we update the version to now be higher than the previous header (411 > 410). This marks Header 2 as the current header and the transaction has now committed. From now on, any new snapshot that begins finds the highest header, now version 411 and reads the data from here. By starting with this new header, the Streams stream is located in block 60 and the fifth stream is located not in 140, but in block 77.
 
 It follows from this that a Yak file could continually grow; every time a transaction is committed, it writes changes to unused or brand new blocks. If we proceeded like this, a Yak file would grow indefinitely large as transactions are committed, because no blocks would ever be re-used. This is clearly not practical, so the lifetime of blocks have to be managed. A simplistic solution would be mark blocks free once the transaction has committed, but this would prevent other readers from continuing to read once a transaction had been committed. We must, in other words, hold on to blocks that could still be read and only free them once we know for certain that no other snapshot could need to read from the blocks.
 
@@ -366,7 +368,7 @@ In practice, there are two byte-ranges that can be locked:
 As implied before, it is important to understand that a Yak file can be 100 kb large and still have bytes locked above 2^62. The size of the Yak file does not limit which bytes can be locked. On the other hand, the range of bytes that are required for thread coordination does limit how large a Yak file can grow (size limit 2^62 - 1), because if it grew into the byte ranges that were locked, the locking would prevent Yak from functioning in those byte ranges.
 
 #### Locking the write byte
-When a transaction wishes to write to commit, which causes writes to the actual Yak file, it attempts to exclusively lock the write lock byte, indicating whether it's willing to wait (i.e. be blocked) or fail early (i.e. be told "you can't lock this right now"). If it's willing to wait, the operating system holds the thread until the other thread(s) have completed their write and unlock the write lock byte. The order in which the operating system grants another thread the exclusive write lock is not guaranteed to be in order that it was requested.
+When a transaction wishes to commit, which causes writes to the actual Yak file, it attempts to exclusively lock the write lock byte, indicating whether it's willing to wait (i.e. be blocked) or fail early (i.e. be told "you can't lock this right now"). If it's willing to wait, the operating system holds the thread until the other thread(s) have completed their write and unlock the write lock byte. The order in which the operating system grants another thread the exclusive write lock is not guaranteed to be in order that it was requested.
 
 Eventually, the write lock byte is exclusively locked. This means the thread now knows that it is the only thread writing to the Yak file. It performs the necessary writes and unlocks the write lock byte again, potentially allowing another thread write access to the file.
 
@@ -375,55 +377,51 @@ If a thread crashes during the commit, i.e. during the time it holds the write l
 - The commit never completes, in that the new header doesn't get written to the Yak file.
 
 #### Locking reader bytes
-For a transaction to determine which blocks it can reuse, i.e. which blocks it can move from "pending free" to actually free, it needs to know the oldest snapshots currently live in all threads.
+For a transaction to determine which blocks it can reuse, i.e. which blocks it can move from "pending free" to actually free, it needs to know the oldest snapshots currently live across all threads. Any blocks that were kept alive for snapshots that no longer exist can be moved from "pending free" to free. Conversely, any blocks that are kept alive for snapshots that are still in progress need to still be readable.
 
-Each open of a Yak will have one or more snapshots. These snapshots are tracked together
-**** NEW DESIGN DOWN TO HERE ****
+Yak uses byte range locks to coordinate which snapshots are the oldest across threads. For example, if there are four snapshots currently in progress, one which was begun at version 41, one begun at version 45, one begun at 46 and one begun at 50, the oldest snapshot is version 41. As a result, Yak share-locks byte 2^62+1+41 (2^62 is the base lock offset, the +1 is the first byte which is used to indicate writing lock and +41 is for the byte that indicates that version 41 is the oldest snapshot). A share lock is used because other threads may also need to indicate that they've got a snapshot of 41.
 
-** CLEAN TO HERE **
+When snapshot 41 is complete, Yak checks for the next-oldest snapshot, which is 45. It locks byte 2^61+1+45 and then unlocks byte 2^61+2+41 and it thereby signals that all blocks between version 41 and version 44 can be actually freed.
 
-Across processes, every process is alike: any of them can read, and any that opened the file for writing can begin a transaction, one transaction at a time. Two things need coordinating: that only one transaction is open at a time, and that a transaction does not reuse blocks that a snapshot, in any process, can still read. Both are done with operating system byte-range locks on bytes far beyond the end of the Yak file, which are never read or written; the locks themselves carry all the information, and the operating system releases them if a process dies (see Locks in L1). No side-car file and no shared memory are needed.
 
-Since each snapshot and transaction keeps its own state, nothing has to notice another process's commits. A snapshot only ever reads its own version, which no transaction changes, and sees new commits by beginning a new snapshot or by refreshing one. A transaction starts from the live header, whoever committed it (see Beginning a transaction in L1).
 
 ## Opening and creating a Yak file
 
 An API is provided to create a new Yak file. This takes in a L3 type, a L2 type, a L1 type and a L0 type, which Yak uses to open the file and initialise the file for writing. A new file that is created is automatically opened for writing, with L1 holding the writer lock through L0 while it initialises the file. The new file is created with version 1, an empty root directory, and both header slots written so that the file is valid from the start.
 
-An API is also provided to open an existing Yak file, also taking in L3, L2, L1 and L0 types. When opening a file, a caller must specify either for reading - in which case only snapshots can be begun - or for writing - in which case transactions can also be begun. Any number of opens, in any processes, can be for writing; opening never waits for another open. Only transactions take turns (see Yak file thread, process, machine & crash safety). Snapshots are not blocked by a transaction, and do not block it.
+An API is also provided to open an existing Yak file, also taking in L3, L2, L1 and L0 types. When opening a file, a caller must specify either for reading - in which case only snapshots can be begun - or for writing - in which case transactions can also be begun. 
 
 ## Yak headers
-A Yak file is predominantly made of blocks; uniformly sized chunks of data from which streams are composed. Ahead of these blocks is a header, which enables each layer to store the necessary meta-information required for the layer to operate. When a Yak file is created, each layer passes the size that it needs for its own meta information down through the layers and receives back a "header slot". Layer 1, having now received the necessary information to create the header section creates the Yak file and begins by writing a header section that is sized to hold all the layers' headers.
+A Yak file is predominantly made of blocks; uniformly sized chunks of data from which streams are composed. Ahead of these blocks is a header, which enables each layer to store the necessary meta-information required for the layer to operate. When a Yak file is created, each layer passes the size that it needs for its own meta information down through the layers and receives back a "header slot" in return. Layer 1, at bottom of this chain and having now received the necessary information to create the header section creates the Yak file and begins by writing space for two headers section that is sized to hold all the layers' headers.
 
-When a layer needs to read its own meta-information, stored in the header, it asks its layer below to ** FIX ME **
+The header is repeated to enable L2 and L3 to support transactional changes to the file (one being the current header and the other being the next header to be). 
 
-* **Finding a section.** A layer finds its section ID by asking the layer below for the first section above it. It answers the same question for the layer above by asking the layer below for the section after its own.
-* **Reading.** L1 reads a header slot once and passes a copy of it up through the layers, and each layer reads its own section from that copy. All the sections a layer stack works from therefore come from the same slot and the same version, even if a commit happens in between. This is used when a Yak file is opened, and when a read transaction begins.
-* **Writing.** A layer stages its section for the next commit by passing it down through the layers below to L1. Nothing is written to the file until L1 publishes the staged sections together in the next header slot (see Header slots in L1).
+What these sections contain is up to each layer; L1 transparently manages the two header slots, the version and the checksum. In a normal Yak file that uses the layers defined by the YakDefault type, the layout is as follows:
 
-Passing the sections through each layer also lets a layer take them over. A layer that does not use the layer below for storage - such as an L3 that stores each stream as a real file (see Layer composition opportunities) - ends the chain and stores the sections of the layers above it itself.
+| Offset | Size (bytes) | Field                 | Contents                                                                                                                                                              |
+| ------ | ------------ | --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 0      | 7            | Magic                 | `89 59 41 4B 0D 0A 1A` (`\x89YAK\r\n\x1A`), copying PNG file header tricks to catch common transfer errors                                                            |
+| 7      | 1            | Header layout version | `1`                                                                                                                                                                   |
+| 8      | 8            | Version               | Little-endian u64. The valid slot with the highest version is live                                                                                                    |
+| 16     | ...          | L1 section            | length \| L1 identifier \| L1 format version                                                                                                                          |
+| ...    | ...          | L2 section            | length \| L2 identifier \| L2 format version \| block size shift \| total blocks \| free list head \| pending list head \| encryption flag \| [encryption parameters] |
+| ...    | ...          | L3 section            | length \| L3 identifier \| L3 format version \| Streams stream descriptor                                                                                             |
+| ...    | ...          | L4 section            | length \| L4 identifier \| L4 format version \| root directory stream index                                                                                           |
+| ...    | ...          | (padding)             | Zeros, up to offset 4092                                                                                                                                              |
+| 4092   | 4            | Checksum              | CRC32C over bytes 0-4091                                                                                                                                              |
 
-What these sections contain is up to each layer; L1 transparently manages the two header slots, the sequence number and the checksum. L0 has no header section, since it knows nothing about the file's format. In a normal Yak file that uses the layers defined by the YakDefault type, the layout is as follows:
+**** NEW DESIGN DOWN TO HERE ****
 
-```
-Magic: File magic header | header layout version | slot size | data offset
-Slot (twice, A and B):
-  Sequence: sequence number | slot length
-  L1: length | L1 identifier | L1 version
-  L2: length | L2 identifier | L2 version | block size shift | total blocks | free list head | pending list head | encryption flag | [additional encryption parameters]
-  L3: length | L3 identifier | L3 version | Streams stream descriptor
-  L4: length | L4 identifier | L4 version | root directory stream index
-  Checksum: CRC32C of the slot
-```
+** CLEAN TO HERE **
 
-The magic section is written once, when the file is created, and never changes. The `slot size` is fixed at creation, and each slot starts at a file offset aligned to 4 KiB and is padded to a whole number of 4 KiB units, so that on common file systems the two slots never share a file system block (see Header slots in L1). The `data offset` records where L1's data region, and so block data, begins in the file (immediately after slot B).
+The magic section is written once, when the file is created, and never changes. The `header slot size` is fixed at creation, and each slot starts at a file offset aligned to 4 KiB and is padded to a whole number of 4 KiB units, so that on common file systems the two slots never share a file system block (see Header slots in L1). The `data offset` records where L1's data region, and so block data, begins in the file (immediately after slot B).
 
 When a Yak file is opened, L1 (as it opens the file) checks the file magic header and the header layout version to ensure it can read the headers. This ensures that:
 
 * This is indeed a Yak file, and
 * The layout of the headers follows a form that the code can read (in this version it's "two slots of a fixed size follow the magic section, and each layer's section within a slot is preceded by a length")
 
-Assuming that it can, L1 reads both slots, discards any whose checksum fails, and selects the one with the highest sequence number. It then passes a copy of that slot up through the layers, and each layer reads its own section from it to initialise.
+Assuming that it can, L1 reads both slots, discards any whose checksum fails, and selects the one with the highest version. It then passes a copy of that slot up through the layers, and each layer reads its own section from it to initialise.
 
 If all layers have found a header they are capable of handling, the file has successfully opened. If the file is opened for writing, L2 then shortens the file if it is longer than the committed version's `total blocks` (see L2), which removes anything a crash left behind.
 
@@ -878,10 +876,10 @@ When a block is released, it will often be in the middle of the underlying file 
 
 The free list is stored in the free blocks themselves, as a chain of *trunk* blocks. Each trunk block holds the index of the next trunk (4 bytes) followed by fixed-size free extents:
 
-| Field  | Size (bytes) | Notes                                             |
-| ------ | ------------ | ------------------------------------------------- |
-| Start  | 4            | Little-endian u32; index of the first free block  |
-| Length | 4            | Little-endian u32; number of free blocks          |
+| Field  | Size (bytes) | Notes                                            |
+| ------ | ------------ | ------------------------------------------------ |
+| Start  | 4            | Little-endian u32; index of the first free block |
+| Length | 4            | Little-endian u32; number of free blocks         |
 
 With 4 KiB blocks a trunk holds (4096 - 4) / 8 = 511 extents, with 4 bytes left over. L2 has a "free list head" block index in its header section, which points to the first trunk (using 0xFFFFFFFF when there is no free block available). Pending-list trunks are laid out the same way, with a tag added to each extent (see Pending blocks), so both kinds of trunk are read and followed the same way:
 
@@ -914,11 +912,11 @@ A block released by a commit cannot go straight back on the free list. Readers h
 
 L2 therefore keeps a *pending list*, whose head is in L2's header section. It is laid out exactly like the free list (see Reusing blocks), except that each extent is preceded by a *tag*: the version created by the commit that released it.
 
-| Field  | Size (bytes) | Notes                                                                 |
-| ------ | ------------ | --------------------------------------------------------------------- |
+| Field  | Size (bytes) | Notes                                                                         |
+| ------ | ------------ | ----------------------------------------------------------------------------- |
 | Tag    | 8            | Little-endian u64; the version created by the commit that released the extent |
-| Start  | 4            | Little-endian u32; as in the free list                                |
-| Length | 4            | Little-endian u32; as in the free list                                |
+| Start  | 4            | Little-endian u32; as in the free list                                        |
+| Length | 4            | Little-endian u32; as in the free list                                        |
 
 With 4 KiB blocks a pending trunk holds (4096 - 4) / 16 = 255 entries, with 12 bytes left over. Moving an entry to the free list just drops its tag.
 
@@ -1052,7 +1050,7 @@ A process crash loses nothing at any level, since the operating system already h
 
 ### Header slots
 
-L1 owns the two header slots and the magic section before them (see Opening and creating a Yak file). Each layer stages its header section for the next commit, through the layers below it (see Opening and creating a Yak file); L1 assembles the slot from the staged sections, the next sequence number and a CRC32C checksum over the whole slot, and writes it to the slot that is not live.
+L1 owns the two header slots and the magic section before them (see Opening and creating a Yak file). Each layer stages its header section for the next commit, through the layers below it (see Opening and creating a Yak file); L1 assembles the slot from the staged sections, the next version and a CRC32C checksum over the whole slot, and writes it to the slot that is not live.
 
 L1 does not rely on the storage writing a slot atomically: a slot that was only partly written fails its checksum and is ignored, and the other slot is used. That is what makes a torn header write safe.
 
@@ -1075,7 +1073,7 @@ The lock region starts at the *lock base*, 2^62, a constant defined in one place
 
 Opening a Yak file, for reading or for writing, takes no lock, so opening never waits. Beginning a transaction takes the writer lock exclusive, waiting for it or failing at once, according to the options (see Beginning a transaction). `commit_and_continue()` keeps it. Snapshots therefore never conflict with a transaction, and only one transaction exists at a time.
 
-Versions are 64-bit sequence numbers, and lock base + 1 + *v* must stay below the largest offset that can be locked (2^63 - 1 on POSIX), which leaves room for about 4.6 × 10^18 versions. A commit that would exceed it fails rather than corrupting anything.
+Versions are 64-bit numbers, and lock base + 1 + *v* must stay below the largest offset that can be locked (2^63 - 1 on POSIX), which leaves room for about 4.6 × 10^18 versions. A commit that would exceed it fails rather than corrupting anything.
 
 ### Reader registry
 
@@ -1198,7 +1196,7 @@ With atomic commits, a Yak file does not need verifying after a crash: it opens 
 
 `verify()` is implemented as a chain across the four upper layers (L4 -> L3 -> L2 -> L1; L0 has no invariants of its own to check), each layer checking its own invariants and passing claimed resource lists down. With transactions, verification checks a committed version, and additionally checks:
 
-* That both header slots can be read, and reports which is live and the sequence number of each.
+* That both header slots can be read, and reports which is live and the version of each.
 * That no block is both reachable from the committed version and on the free list.
 * That no block appears on both the free list and the pending list.
 * That every block of the file below `total blocks` is reachable from the committed version, on the free list, or on the pending list. A block that is none of these has leaked; leaked blocks are reported, and reclaimed by compacting the file.

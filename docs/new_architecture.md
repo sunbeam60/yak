@@ -383,8 +383,6 @@ Yak uses byte range locks to coordinate which snapshots are the oldest across th
 
 When snapshot 41 is complete, Yak checks for the next-oldest snapshot, which is 45. It locks byte 2^61+1+45 and then unlocks byte 2^61+2+41 and it thereby signals that all blocks between version 41 and version 44 can be actually freed.
 
-
-
 ## Opening and creating a Yak file
 
 An API is provided to create a new Yak file. This takes in a L3 type, a L2 type, a L1 type and a L0 type, which Yak uses to open the file and initialise the file for writing. A new file that is created is automatically opened for writing, with L1 holding the writer lock through L0 while it initialises the file. The new file is created with version 1, an empty root directory, and both header slots written so that the file is valid from the start.
@@ -392,17 +390,15 @@ An API is provided to create a new Yak file. This takes in a L3 type, a L2 type,
 An API is also provided to open an existing Yak file, also taking in L3, L2, L1 and L0 types. When opening a file, a caller must specify either for reading - in which case only snapshots can be begun - or for writing - in which case transactions can also be begun. 
 
 ## Yak headers
-A Yak file is predominantly made of blocks; uniformly sized chunks of data from which streams are composed. Ahead of these blocks is a header, which enables each layer to store the necessary meta-information required for the layer to operate. When a Yak file is created, each layer passes the size that it needs for its own meta information down through the layers and receives back a "header slot" in return. Layer 1, at bottom of this chain and having now received the necessary information to create the header section creates the Yak file and begins by writing space for two headers section that is sized to hold all the layers' headers.
-
-The header is repeated to enable L2 and L3 to support transactional changes to the file (one being the current header and the other being the next header to be). 
+A Yak file is predominantly made of blocks; uniformly sized chunks of data from which streams are composed. Ahead of these blocks is a header, which enables each layer to store the necessary meta-information required for the layer to operate. When a Yak file is created, each layer passes the size that it needs for its own meta information down through the layers and receives back a "header slot" in return. Layer 1, at bottom of this chain and having now received the necessary information to create the header section, creates the Yak file and begins by writing space for two headers section that is sized to hold all the layers' headers. Two identical headers are written, one after another and aligned to 4 KiB, to support transactions.
 
 What these sections contain is up to each layer; L1 transparently manages the two header slots, the version and the checksum. In a normal Yak file that uses the layers defined by the YakDefault type, the layout is as follows:
 
 | Offset | Size (bytes) | Field                 | Contents                                                                                                                                                              |
 | ------ | ------------ | --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 0      | 7            | Magic                 | `89 59 41 4B 0D 0A 1A` (`\x89YAK\r\n\x1A`), copying PNG file header tricks to catch common transfer errors                                                            |
-| 7      | 1            | Header layout version | `1`                                                                                                                                                                   |
-| 8      | 8            | Version               | Little-endian u64. The valid slot with the highest version is live                                                                                                    |
+| 7      | 1            | Header layout version | Always `1` for now - reserved for future format changes                                                                                                               |
+| 8      | 8            | Version               | Unsigned 8 byte integer. The valid slot with the highest version is live                                                                                              |
 | 16     | ...          | L1 section            | length \| L1 identifier \| L1 format version                                                                                                                          |
 | ...    | ...          | L2 section            | length \| L2 identifier \| L2 format version \| block size shift \| total blocks \| free list head \| pending list head \| encryption flag \| [encryption parameters] |
 | ...    | ...          | L3 section            | length \| L3 identifier \| L3 format version \| Streams stream descriptor                                                                                             |
@@ -410,22 +406,9 @@ What these sections contain is up to each layer; L1 transparently manages the tw
 | ...    | ...          | (padding)             | Zeros, up to offset 4092                                                                                                                                              |
 | 4092   | 4            | Checksum              | CRC32C over bytes 0-4091                                                                                                                                              |
 
-**** NEW DESIGN DOWN TO HERE ****
+When a Yak file is opened, L1 (as it opens the file) reads the first 8 KiB of the file and checks that at least one header shows the magic bytes (a crashed commit may have screwed up one of the headers) and chooses the highest version header as the "current one".
 
-** CLEAN TO HERE **
-
-The magic section is written once, when the file is created, and never changes. The `header slot size` is fixed at creation, and each slot starts at a file offset aligned to 4 KiB and is padded to a whole number of 4 KiB units, so that on common file systems the two slots never share a file system block (see Header slots in L1). The `data offset` records where L1's data region, and so block data, begins in the file (immediately after slot B).
-
-When a Yak file is opened, L1 (as it opens the file) checks the file magic header and the header layout version to ensure it can read the headers. This ensures that:
-
-* This is indeed a Yak file, and
-* The layout of the headers follows a form that the code can read (in this version it's "two slots of a fixed size follow the magic section, and each layer's section within a slot is preceded by a length")
-
-Assuming that it can, L1 reads both slots, discards any whose checksum fails, and selects the one with the highest version. It then passes a copy of that slot up through the layers, and each layer reads its own section from it to initialise.
-
-If all layers have found a header they are capable of handling, the file has successfully opened. If the file is opened for writing, L2 then shortens the file if it is longer than the committed version's `total blocks` (see L2), which removes anything a crash left behind.
-
-Files created with header layout version 1 (before transaction support) have a single header that is updated in place. Such files can be read, and are converted to layout version 2 by compacting them with the command line Yak tool, which writes a new file (see Compacting a Yak file).
+It then verifies that the header layout format is something it can read, checks the CRC value (discarding the header if the checksum does not match) and then reads all the header blocks. Of course, at this point L1 doesn't know anything about the other layer headers other than their size. The layer headers are passed up through the layers who each read their own block and take the neccessary actions to set themselves up layer by layer. Provided that all layers report success upwards, the file has successfully opened. In particular, L2 looks at the block size and the total number of blocks expected in the file, which it uses to calculate the expected size of the file. If the file is longer than it should be, which will occur if a transaction crashed or was rolled back, it will be truncated to the expected size. 
 
 ## L4: The public API
 
@@ -433,28 +416,29 @@ L4 deals with organising a filing system on top of L3. Where L3 deals with strea
 
 L4's public API is similar to a file system API and pertains to:
 
+* Beginning, committing (optionally continuing) and rolling back transactions,
+* Beginning, refreshing and closing snapshots,
 * Creating, renaming and deleting a named stream,
 * Creating, renaming and deleting a directory,
 * Iterating over all streams inside of a Yak directory, including the root directory,
 * Understanding the length of a Yak stream
 * Reading from a stream, based on current head position,
 * Positioning the read/write head inside of a stream,
-* Writing to a stream, based on current head position (possibly enlarging the stream)
-* Closing the Yak stream,
-* Beginning, committing (optionally continuing) and rolling back transactions,
-* Beginning, refreshing and closing snapshots.
+* Writing to a stream, based on current head position (possibly enlarging the stream),
+* Closing the Yak stream.
 
-Every operation in this list is made through a transaction. Operations that change names - creating, renaming and deleting streams and directories - can only be made through a write transaction. They take effect in the transaction's working version immediately and become part of a version when the transaction commits. Name changes check for clashes against the working version, so a name created earlier in the transaction cannot be created again. A rename, which is a delete followed by an add, is therefore atomic on disk: after a crash the stream has either its old name or its new one.
+Operations that make changes, like changing names, modifying stream contents, creating and deleting streams can only be made through a write transaction. They take effect in the transaction's working version immediately (e.g. creating a new stream by name is visible from the perspective of the transaction immediately after the call has been made) and become durable in the Yak file when the transaction commits (i.e. only become visible to later snapshots & transactions after they've been committed).
 
-Operations that read names - listing a directory, opening a stream, asking for a stream's length or version - read the version their transaction sees. Through a write transaction that is the working version: a stream created in the transaction is listed straight away and can be opened, and a deleted one is no longer listed. Through a read transaction it is the transaction's committed version, so listings and contents always come from the same version.
+Operations that read - listing a directory, opening a stream, asking for a stream's length or version etc - can be executed both from a transaction (where the transaction's changes are visible) or a snapshot (where only transactions committed before the snapshot was created are visible).
 
-### Stream handles
+### Stream Readers & Writers
+A Reader can be opened from a snapshot and a transaction, given a stream name. It manages a head position, which determines where reads happen. The head can be moved like a regular file handle, but it cannot be moved beyond the end of the stream. If a Reader is opened from a transaction, it cannot be opened on a stream that already has a Writer opened.
 
-A stream handle that's returned has no public information, but L4 locates the internal information it needs to handle streams. A stream handle in L4 internally manages a head position, which determines where reads and writes occur from, like reading and writing to a regular file.
+A Writer can be opened from a transaction, given a stream name. It has a head position like a Reader, which determines where reads and writes happen from and to. The head can be moved like a regular handle, but like Readers it cannot be moved beyond the end of the stream. If writing pushes the head beyond the end of the stream, the stream lengths. A Writer cannot be opened on a stream that already has a Reader opened in the same transaction. In the same transaction, anything written to a stream will be readable by other Readers and Writers opened after the original Writer is closed.
 
-A stream handle can either be opened for reading or writing, and belongs to the transaction it was opened in. When a new stream handle is created, it is opened for writing. Only a write transaction can open handles for writing.
+**** NEW DESIGN DOWN TO HERE ****
 
-A handle opened in a write transaction reads the working version, so it sees the transaction's own uncommitted changes; this is what lets a caller write part of a stream, seek back and read it, before committing. A handle opened in a read transaction reads that transaction's committed version and never sees uncommitted changes.
+** CLEAN TO HERE **
 
 ### A filesystem from streams
 
@@ -462,7 +446,7 @@ Two types of streams exist inside of a Yak file: Directory streams and streams.
 
 Streams contain the data that a caller has written to the Yak file, with no padding, nothing added, nothing taken away.
 
-Directory streams are used to provide an addressing system for the streams. It associates stream identifiers with a name, using a "stream entry" structure, e.g.
+Directory streams are used to provide an addressing system for the streams. It associates stream identifiers (which are given and used by L3) with a name, using a "stream entry" structure, e.g.
 
 | Stream entry no. | Stream identifier | Name              |
 | ---------------- | ----------------- | ----------------- |
@@ -481,7 +465,7 @@ Directory streams hold stream identifiers, never block indices. When a data stre
 
 #### Stream entry management
 
-Stream entries in the directory streams are serialized compactly. Since the length of their names vary, they are encoded as follows:
+Stream entries in the directory streams are serialized compactly (i.e. no gaps between entries). Since the length of their names vary, they are encoded as follows:
 
 ```ASCII
 | stream identifier (4 bytes) | length (2 bytes) | name (1-65,522 bytes) ........ |

@@ -402,7 +402,7 @@ What these sections contain is up to each layer; L1 transparently manages the tw
 | 16     | ...          | L1 section            | length \| L1 identifier \| L1 format version                                                                                                                          |
 | ...    | ...          | L2 section            | length \| L2 identifier \| L2 format version \| block size shift \| total blocks \| free list head \| pending list head \| encryption flag \| [encryption parameters] |
 | ...    | ...          | L3 section            | length \| L3 identifier \| L3 format version \| Streams stream descriptor                                                                                             |
-| ...    | ...          | L4 section            | length \| L4 identifier \| L4 format version \| root directory stream index                                                                                           |
+| ...    | ...          | L4 section            | length \| L4 identifier \| L4 format version \| root directory stream index \| stream name hash seed                                                                  |
 | ...    | ...          | (padding)             | Zeros, up to offset 4092                                                                                                                                              |
 | 4092   | 4            | Checksum              | CRC32C over bytes 0-4091                                                                                                                                              |
 
@@ -436,74 +436,92 @@ A Reader can be opened from a snapshot and a transaction, given a stream name. I
 
 A Writer can be opened from a transaction, given a stream name. It has a head position like a Reader, which determines where reads and writes happen from and to. The head can be moved like a regular handle, but like Readers it cannot be moved beyond the end of the stream. If writing pushes the head beyond the end of the stream, the stream lengths. A Writer cannot be opened on a stream that already has a Reader opened in the same transaction. In the same transaction, anything written to a stream will be readable by other Readers and Writers opened after the original Writer is closed.
 
-**** NEW DESIGN DOWN TO HERE ****
-
-** CLEAN TO HERE **
-
 ### A filesystem from streams
 
-Two types of streams exist inside of a Yak file: Directory streams and streams.
+Two types of streams exist inside of a Yak file: Directory streams and streams. They are from the perspective of L3 exactly the same ("it's all data") but L4 uses directory streams to find and track regular streams.
 
 Streams contain the data that a caller has written to the Yak file, with no padding, nothing added, nothing taken away.
 
-Directory streams are used to provide an addressing system for the streams. It associates stream identifiers (which are given and used by L3) with a name, using a "stream entry" structure, e.g.
+Directory streams are used to provide an addressing system for the streams. It associates stream identifiers (which are given and used by L3) with a name, e.g.
 
-| Stream entry no. | Stream identifier | Name              |
-| ---------------- | ----------------- | ----------------- |
-| 0                | 43                | image.png         |
-| 1                | 101               | another_image.png |
-| 2                | 36                | textures/         |
-| 3                | 930               | an empty folder/  |
+| Stream identifier | Name              |
+| ----------------- | ----------------- |
+| 43                | image.png         |
+| 101               | another_image.png |
+| 36                | textures/         |
+| 930               | an empty folder/  |
 
 When a stream entry ends with "/" the stream identifier points to another directory stream. If a stream entry does not end with a "/", the identifier points to a data stream.
 
-When a new Yak file is created, it immediately creates a directory stream for the root directory and stores the index for this stream in the L4 header.
+When a new Yak file is created, it immediately creates a directory stream for the root directory and stores the index for this stream in the L4 header (together with a hash seed, which is used when hashing stream names).
 
-When an existing Yak file is opened, it reads the root directory stream index number from the header so it can locate the root directory listing.
+When an existing Yak file is opened, it reads the root directory stream index number from the header so it can locate the root directory listing. From there it can navigate to all other directory streams and, from each directory stream, out to all data streams.
 
-Directory streams hold stream identifiers, never block indices. When a data stream's blocks move to new locations in a commit, its stream identifier stays the same, so no directory changes. Only creating, renaming and deleting names change a directory stream. This is what stops a change to a stream's contents from rippling up through the directory tree.
+It's important to recognise that the stream identifier is the identifier returned by L3 - it's a block-number-independent unique identifier for streams, maintained opaquely by L3.
 
 #### Stream entry management
+Since stream names (whether for a user data stream or a directory stream) can vary in length, compactly and efficiently storing the stream name mappings is a mini-version of the overall problem that Yak is trying to solve (i.e. "how to store, change and remove uneven length elements without fragmentation").
 
-Stream entries in the directory streams are serialized compactly (i.e. no gaps between entries). Since the length of their names vary, they are encoded as follows:
+Stream entry management is solving for:
+- Lookup speed; how do we rapidly find the stream identifier given a name.
+- Minimizing block changes; since Yak uses Copy-on-Write (COW) it is relatively expensive the first time a block is changed in a transaction and relatively cheaply to make further changes to the same block.
+- Compactness; how do we use as little space as possible to solve for the other goals.
+
+Directory streams are carved into "pages" and are always a multiple of pages long (minimum 1). Each page is exactly the same length as a block in L2 so that if a directory stream takes 3 pages, it always uses 3 blocks in L2.
+
+In its smallest form, a directory stream is a single page called a "leaf page". As the directory stream grows larger than a single page can hold, so called "inner pages" slot in above the leaf pages, in a classic B+ tree layout.
+
+A leaf page uses a slotted layout:
+- At the start of a page is a header that holds information about the page contents
+- Then follows a set of stream entries, each holding the hash of the stream name, the index of the stream it represents and an offset pointing to the name of the stream at the back end of the page.
+- From the rear of the page - all the way at the end of the page - follows the names of the stream. These accrue in the other direction, towards the centre of the page.
 
 ```ASCII
-| stream identifier (4 bytes) | length (2 bytes) | name (1-65,522 bytes) ........ |
+         ┌───────────────────────────────────────────┐                                  
+         │                                           │                                  
+         │   entries go towards centre               │          titles go towards centre
+         │   ├─────────────►                         │                  ◄──────────────┤
+┌────────┼───────────────────────────────────────────┼─────────────────────────────────┐
+│┌───────┴──┐┌───┐┌───┐┌───┐                         ▼────────────┐┌──────┐┌──────────┐│
+││Start: 44 ││01a││b38││ff2│                         │            ││      ││          ││
+││Count: 3  ││15 ││110││48 │        free space       │texture2.png││sp.yml││report.txt││
+││Frag:  0  ││67 ││58 ││44 │                         │            ││      ││          ││
+│└──────────┘└─┬─┘└─┬─┘└─┬─┘                         ▲────────────┘▲──────┘▲──────────┘│
+└──────────────┼────┼────┼───────────────────────────┼─────────────┼───────┼───────────┘
+               │    │    │                           │             │       │            
+               │    │    └───────────────────────────┘             │       │            
+               │    │                                              │       │            
+               │    └──────────────────────────────────────────────┘       │            
+               │                                                           │            
+               └───────────────────────────────────────────────────────────┘            
 ```
+When a caller wishes to create a named stream it first finds space for a slot (consuming free space from the left towards the centre) and then the name (consuming free space from the right towards the centre). If there's space for both of them, the entry is added. If not, the leaf page is split into two, where half the lower slots (lower by hash) go into one and the other, upper half, go into another leaf page.
 
-Following all the name/stream ID entries is a so called "Name Table". The purpose of this table is to facilitate fast O(log n) searching for a named stream. Of course, in a directory with 5 streams, this is rather overkill, but in a directory with 50,000 streams it drastically cuts down the time required to locate the right stream.
-
-At the very, very end of the directory stream is a 4 byte value that indicates the offset of the Name Table. When Yak needs to locate a stream by name, it jumps to the end (less 4 bytes) of the directory stream, reads the offset of the Name Table, jumps to that offset and reads the name table itself.
-
-The Name Table consists of pairs of string hashes and offsets and it is sorted by string hashes. With the hash of the name the caller is searching for, Yak does a binary search to find the one or more hashes that match the hash of the name the caller is attempting to open. If one or more identical hashes have been found in the Name Table, Yak jumps to these entries, compares the length of the string (for early rejection), then does a string compare for the caller requested name. If there's a match, L4 now has the Stream ID and can proceed to open this stream.
+If an entry is the middle is deleted - e.g. in the example above if the b38 entry pointing to sp.yml is deleted, the slot is freed and the fragmentation (frag) is increased by the size of the name. The frag number thus keeps track of the amount of free space available in holes. Before a leaf page is split, the frag number is checked; if there's enough "holes" in the layout, the page is compacted (that is, all slots are shifted as far left as possible and all names are shifted as far right as possible) and the new entry is added. The leaf page is only split into two if there isn't enough "frag" space inside the page.
 
 ```ASCII
-[Stream entries]* | [Name Table Entry]* | Offset of Name Table
+         ┌───────────────────────────────────────────┐                                  
+         │                                           │                                  
+         │   entries go towards centre               │          titles go towards centre
+         │   ├─────────────►                         │                  ◄──────────────┤
+┌────────┼───────────────────────────────────────────┼─────────────────────────────────┐
+│┌───────┴──┐┌───┐     ┌───┐                         ▼────────────┐        ┌──────────┐│
+││Start: 44 ││01a│     │ff2│                         │            │        │          ││
+││Count: 3  ││15 │     │48 │        free space       │texture2.png│        │report.txt││
+││Frag:  6  ││67 │     │44 │                         │            │        │          ││
+│└──────────┘└─┬─┘     └─┬─┘                         ▲────────────┘        ▲──────────┘│
+└──────────────┼─────────┼───────────────────────────┼─────────────────────┼───────────┘
+               │         │                           │                     │            
+               │         └───────────────────────────┘                     │            
+               │                                                           │            
+               │                                                           │            
+               │                                                           │            
+               └───────────────────────────────────────────────────────────┘            
 ```
 
-When we insert a new Stream entry, we copy the Name Table, write the new Stream entry at the current end of the Stream entries (overwriting the existing Name Table), then insert the new Name table entry into the Name Table (keeping this table always sorted by hash) and then write the offset of the Name Table. This is a quick operation.
+When new leaf pages are added in a directory stream, a page is dedicated to tracking the leaf pages. This so called "inner page" has the same header as a leaf page, but instead of slots and stream names, it has a set of small, different slots that indicate which hash range can be found in the leaf pages below. Futher inner pages may end up being above, forming a tree of pages enabling rapid searching in the stream directory.
 
-When we delete a Stream entry, we "pull upwards" the remainders of streams by copying chunk by chunk forwards in the stream, then remove the hash/offset pair from the Name Table, write out the refreshed name table and finish by writing the offset of the name table. This can be a slow operation.
-
-If an entry is renamed, it is deleted and re-added.
-
-With copy-on-write, these are ordinary writes to the directory stream and need no special handling to be crash safe. Their cost differs, though: an insert touches only the blocks at the end of the directory stream, while a delete rewrites every block after the deleted entry, all of which become dirty blocks in the write transaction. Within one transaction the cost is paid once, because blocks already copied are private and are written in place by later deletes. Applications that delete many names should do so within a single transaction.
-
-### Detecting changes
-
-Every stream and every directory has a *version*: the version of the Yak file in which it last changed. `stream_version(path)` and `dir_version(path)` return it, and `version()` on a transaction or snapshot returns the version that transaction or snapshot sees. All of them return the same `Version` type, an ordered number, so a caller can ask both whether something has changed (the versions differ) and whether it has changed since a given version (its version is greater).
-
-A stream's version is stamped when the stream is created, when its contents change (written or shortened), and when it is renamed. Reserving space does not change it, since the contents stay the same. Stamping renames means that a different stream cannot arrive at a name without the version at that name moving forward: a stream created there has the version it was created in, and a stream renamed there has the version of the rename. A directory is a stream too, so its version is stamped in the same way: when it is created or renamed, and when entries in it are created, renamed or deleted. It reflects changes to its own entries only, not to the streams and directories below it.
-
-Versions are read from the version the transaction or snapshot sees. In a snapshot, they come from the snapshot's committed version. In a transaction, a stream or directory that the transaction has changed reports the version the transaction will commit as (the committed version plus one), which is exactly what snapshots will see once it commits; after `commit_and_continue()`, later changes report the version after that. Two changes made in the same transaction share a version and cannot be told apart, which only the transaction's own thread could observe.
-
-Typical uses:
-
-* A reader process holding a snapshot refreshes it and compares the versions of the streams it has loaded, reloading only those that changed.
-* A caller reads its inputs in a snapshot, does slow work without holding a transaction, then begins a transaction and checks that the inputs' versions are unchanged before writing the result, retrying if they are not.
-* An application caches data derived from a stream, such as decoded images or parsed configuration, keyed by the stream's version.
-
-Reading a version reads one stream descriptor, which is far cheaper than reading the stream. Directory listings do not include versions, because that would read one descriptor per entry.
+The first page in a directory stream is always the root page. If the directory is small enough, the root page is also the only page. If the directory has a lot of streams in it, the directory stream will be bigger and the root page will point to other pages, which possibly points to other pages. 
 
 ## L3 : Streams
 
@@ -512,6 +530,10 @@ L3 deals with linking blocks together from L2 and presenting them as identified 
 ### L3 API
 
 L3's API, which is used by L4, should solely concern itself with:
+
+**** NEW DESIGN DOWN TO HERE ****
+
+** CLEAN TO HERE **
 
 * Creating a new stream (returns a stream identifier).
 * Verifying that a stream exists, by identifier.
